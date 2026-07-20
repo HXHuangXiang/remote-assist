@@ -54,8 +54,13 @@ bool Capture::InitDXGI() {
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) {
         return false;
     }
+    // EnumOutputs 是 IDXGIAdapter 的方法,需要先枚举适配器再枚举输出。
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if (FAILED(fac->EnumAdapters1(0, &adapter))) {
+        return false;
+    }
     Microsoft::WRL::ComPtr<IDXGIOutput> out0;
-    if (FAILED(fac->EnumOutputs(0, &out0))) {
+    if (FAILED(adapter->EnumOutputs(0, &out0))) {
         return false;
     }
     if (FAILED(out0.As(&output_))) {

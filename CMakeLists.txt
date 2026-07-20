@@ -12,10 +12,11 @@ endif()
 # 预处理宏:Windows 10+、Unicode、精简 Windows 头、关闭 httplib 的 OpenSSL 支持。
 add_compile_definitions(
     UNICODE _UNICODE
-    NOMINMAX WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
     _WIN32_WINNT=0x0A00 WINVER=0x0A00
-    _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS
-    CPPHTTPLIB_OPENSSL_SUPPORT=0
+    _CRT_SECURE_NO_WARNINGS
+    _CRT_NONSTDC_NO_WARNINGS
 )
 
 include_directories(

@@ -129,9 +129,9 @@ bool EncoderMf::Init(int width, int height, int fps, int bitrateBps) {
     MFT_REGISTER_TYPE_INFO outInfo = {MFMediaType_Video, MFVideoFormat_H264};
     IMFActivate** acts = nullptr;
     UINT32 count = 0;
-    HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNC,
-        &inInfo, &outInfo, &acts, &count);
+   HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT,
+       &inInfo, &outInfo, &acts, &count);
     if (FAILED(hr) || count == 0) {
         log::Error("MFTEnumEx H.264 encoder not found");
         return false;
@@ -155,10 +155,10 @@ bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps)
         return false;
     }
     inMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    inMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    MFSetAttributeSize(inMt.Get(), width, height);
-    MFSetAttributeRatio(inMt.Get(), fps, 1);
-    inMt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+   inMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    MFSetAttributeSize(inMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
+    MFSetAttributeRatio(inMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
+   inMt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     if (FAILED(enc_->SetInputType(0, inMt.Get(), 0))) {
         log::Error("SetInputType failed");
         return false;
@@ -169,26 +169,20 @@ bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps)
         return false;
     }
     outMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    outMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-    MFSetAttributeSize(outMt.Get(), width, height);
-    MFSetAttributeRatio(outMt.Get(), fps, 1);
-    outMt->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(bitrateBps));
+   outMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    MFSetAttributeSize(outMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
+    MFSetAttributeRatio(outMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
+   outMt->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(bitrateBps));
     if (FAILED(enc_->SetOutputType(0, outMt.Get(), 0))) {
         log::Error("SetOutputType failed");
         return false;
     }
 
-    // 尽力配置码率与首帧关键帧(支持 ICodecAPI 的编码器)。
-    ComPtr<ICodecAPI> codec;
-    if (SUCCEEDED(enc_.As(&codec))) {
-        VARIANT v;
-        VariantInit(&v);
-        v.vt = VT_UI4;
-        v.ulVal = static_cast<UINT32>(bitrateBps);
-        codec->SetValue(CODECAPI_AVEncCommonMeanBitRate, &v);
-        v.ulVal = 0;
-        codec->SetValue(CODECAPI_AVEncCommonRateControlMode, &v);  // 0 = CBR
-        VariantClear(&v);
+    // 尽力配置码率与码控模式(通过 MFT 属性存储设置 codec 参数,避免引入 ICodecAPI/strmif.h)。
+    ComPtr<IMFAttributes> attrs;
+    if (SUCCEEDED(enc_->GetAttributes(&attrs))) {
+        attrs->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, static_cast<UINT32>(bitrateBps));
+        attrs->SetUINT32(CODECAPI_AVEncCommonRateControlMode, 0);  // 0 = CBR
     }
 
     const DWORD nv12Size = static_cast<DWORD>(width * height * 3 / 2);

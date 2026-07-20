@@ -1,5 +1,7 @@
 #pragma once
 
+// 确保不引入 OpenSSL(我们的 WebSocket 走 HTTP 明文,#ifdef 会把 =0 也视为已定义)。
+#undef CPPHTTPLIB_OPENSSL_SUPPORT
 #include <httplib.h>
 
 #include <atomic>
@@ -58,4 +60,3 @@ private:
 };
 
 }  // namespace remote_assist
-
