@@ -32,7 +32,7 @@ void Capture::ReleaseAll() {
         mem_dc_ = nullptr;
     }
     if (gdi_dc_) {
-        ReleaseDC(nullptr, gdi_dc_);
+        DeleteDC(gdi_dc_);
         gdi_dc_ = nullptr;
     }
     bits_ = nullptr;
@@ -166,19 +166,22 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
         return false;
     }
 
+    // 用 CreateDCW 创建自有显示 DC(比 GetDC(nullptr) 更稳定,不会被系统回收)。
+    if (!gdi_dc_) {
+        gdi_dc_ = CreateDCW(L"DISPLAY", nullptr, nullptr, nullptr);
+        if (diagCount % 300 == 1) log::Info("CaptureGDI: CreateDCW display=" + std::to_string(gdi_dc_ != nullptr));
+        if (!gdi_dc_) {
+            gdi_dc_ = GetDC(nullptr);
+            if (diagCount % 300 == 1) log::Info("CaptureGDI: GetDC fallback=" + std::to_string(gdi_dc_ != nullptr));
+        }
+    }
     if (!mem_dc_) {
-        gdi_dc_ = GetDC(nullptr);
-        if (diagCount % 300 == 1) log::Info("CaptureGDI: GetDC=" + std::to_string(gdi_dc_ != nullptr));
         mem_dc_ = CreateCompatibleDC(gdi_dc_);
         if (diagCount % 300 == 1) log::Info("CaptureGDI: CreateCompatibleDC=" + std::to_string(mem_dc_ != nullptr));
-        if (!mem_dc_) {
-            if (diagCount % 300 == 1) log::Error("CaptureGDI: CreateCompatibleDC failed");
-            return false;
-        }
+        if (!mem_dc_) return false;
     }
 
     if (!bmp_ || width_ != w || height_ != h) {
-        if (diagCount % 300 == 1) log::Info("CaptureGDI: creating DIB " + std::to_string(w) + "x" + std::to_string(h));
         if (bmp_) {
             SelectObject(mem_dc_, old_bmp_);
             DeleteObject(bmp_);
@@ -187,7 +190,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h;  // top-down,行序与 BGRA 直读一致
+        bi.bmiHeader.biHeight = -h;
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
@@ -201,10 +204,20 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
         height_ = h;
     }
 
-    // CAPTUREBLT(0x40000000)包含分层窗口,某些显卡驱动下 SRCCOPY 单独可能失败。
+    // BitBlt 主路径;失败则用 GetDIBits 回退(BitBlt 在某些桌面/驱动下返回 INVALID_HANDLE)。
     if (!BitBlt(mem_dc_, 0, 0, w, h, gdi_dc_, 0, 0, SRCCOPY)) {
-        if (diagCount % 300 == 1) log::Error("CaptureGDI: BitBlt failed err=" + std::to_string(GetLastError()));
-        return false;
+        if (diagCount % 300 == 1) log::Warn("CaptureGDI: BitBlt err=" + std::to_string(GetLastError()) + ", trying GetDIBits");
+        BITMAPINFO bi2{};
+        bi2.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi2.bmiHeader.biWidth = w;
+        bi2.bmiHeader.biHeight = -h;
+        bi2.bmiHeader.biPlanes = 1;
+        bi2.bmiHeader.biBitCount = 32;
+        bi2.bmiHeader.biCompression = BI_RGB;
+        if (GetDIBits(gdi_dc_, bmp_, 0, h, bits_, &bi2, DIB_RGB_COLORS) == 0) {
+            if (diagCount % 300 == 1) log::Error("CaptureGDI: GetDIBits also failed");
+            return false;
+        }
     }
 
     out.width = w;
