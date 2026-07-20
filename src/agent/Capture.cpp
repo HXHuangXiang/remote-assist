@@ -1,0 +1,197 @@
+#include "agent/Capture.h"
+
+#include "common/Log.h"
+
+#include <cstring>
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "gdi32.lib")
+
+namespace remote_assist {
+
+Capture::~Capture() {
+    ReleaseAll();
+}
+
+void Capture::ReleaseAll() {
+    staging_.Reset();
+    dup_.Reset();
+    output_.Reset();
+    ctx_.Reset();
+    d3d_.Reset();
+    if (bmp_) {
+        if (mem_dc_) {
+            SelectObject(mem_dc_, old_bmp_);
+        }
+        DeleteObject(bmp_);
+        bmp_ = nullptr;
+    }
+    if (mem_dc_) {
+        DeleteDC(mem_dc_);
+        mem_dc_ = nullptr;
+    }
+    if (gdi_dc_) {
+        ReleaseDC(nullptr, gdi_dc_);
+        gdi_dc_ = nullptr;
+    }
+    bits_ = nullptr;
+}
+
+bool Capture::Init() {
+    if (InitDXGI()) {
+        use_gdi_ = false;
+        log::Info("capture: DXGI path ready");
+        return true;
+    }
+    log::Warn("capture: DXGI init failed, fallback to GDI");
+    use_gdi_ = true;
+    return true;
+}
+
+bool Capture::InitDXGI() {
+    Microsoft::WRL::ComPtr<IDXGIFactory1> fac;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IDXGIOutput> out0;
+    if (FAILED(fac->EnumOutputs(0, &out0))) {
+        return false;
+    }
+    if (FAILED(out0.As(&output_))) {
+        return false;
+    }
+
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+            D3D11_SDK_VERSION, &d3d_, &fl, &ctx_))) {
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                D3D11_SDK_VERSION, &d3d_, &fl, &ctx_))) {
+            return false;
+        }
+    }
+
+    if (FAILED(output_->DuplicateOutput(d3d_.Get(), &dup_))) {
+        return false;
+    }
+    return true;
+}
+
+bool Capture::CaptureFrame(CapturedFrame& out) {
+    if (use_gdi_) {
+        return CaptureGDI(out);
+    }
+    if (CaptureDXGI(out)) {
+        return true;
+    }
+    // DXGI 失败(常见于进入锁屏桌面),临时切 GDI。
+    return CaptureGDI(out);
+}
+
+bool Capture::CaptureDXGI(CapturedFrame& out) {
+    if (!dup_) {
+        return false;
+    }
+    DXGI_OUTDUPL_FRAME_INFO fi{};
+    Microsoft::WRL::ComPtr<IDXGIResource> res;
+    HRESULT hr = dup_->AcquireNextFrame(50, &fi, &res);
+    if (FAILED(hr)) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+    if (FAILED(res.As(&tex))) {
+        dup_->ReleaseFrame();
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    tex->GetDesc(&desc);
+
+    if (!staging_) {
+        D3D11_TEXTURE2D_DESC s = desc;
+        s.Usage = D3D11_USAGE_STAGING;
+        s.BindFlags = 0;
+        s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        s.MiscFlags = 0;
+        if (FAILED(d3d_->CreateTexture2D(&s, nullptr, &staging_))) {
+            dup_->ReleaseFrame();
+            return false;
+        }
+    }
+
+    ctx_->CopyResource(staging_.Get(), tex.Get());
+    dup_->ReleaseFrame();
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(ctx_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
+    const int w = static_cast<int>(desc.Width);
+    const int h = static_cast<int>(desc.Height);
+    out.width = w;
+    out.height = h;
+    out.data.resize(static_cast<size_t>(w) * h * 4);
+    const auto* src = static_cast<const uint8_t*>(mapped.pData);
+    for (int y = 0; y < h; ++y) {
+        std::memcpy(out.data.data() + static_cast<size_t>(y) * w * 4,
+                    src + static_cast<size_t>(y) * mapped.RowPitch,
+                    static_cast<size_t>(w) * 4);
+    }
+    ctx_->Unmap(staging_.Get(), 0);
+
+    width_ = w;
+    height_ = h;
+    return true;
+}
+
+bool Capture::CaptureGDI(CapturedFrame& out) {
+    const int w = GetSystemMetrics(SM_CXSCREEN);
+    const int h = GetSystemMetrics(SM_CYSCREEN);
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+
+    if (!mem_dc_) {
+        gdi_dc_ = GetDC(nullptr);
+        mem_dc_ = CreateCompatibleDC(gdi_dc_);
+        if (!mem_dc_) {
+            return false;
+        }
+    }
+
+    if (!bmp_ || width_ != w || height_ != h) {
+        if (bmp_) {
+            SelectObject(mem_dc_, old_bmp_);
+            DeleteObject(bmp_);
+            bmp_ = nullptr;
+        }
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;  // top-down,行序与 BGRA 直读一致
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        bmp_ = CreateDIBSection(mem_dc_, &bi, DIB_RGB_COLORS, &bits_, nullptr, 0);
+        if (!bmp_) {
+            return false;
+        }
+        old_bmp_ = static_cast<HBITMAP>(SelectObject(mem_dc_, bmp_));
+        width_ = w;
+        height_ = h;
+    }
+
+    if (!BitBlt(mem_dc_, 0, 0, w, h, gdi_dc_, 0, 0, SRCCOPY)) {
+        return false;
+    }
+
+    out.width = w;
+    out.height = h;
+    out.data.assign(static_cast<uint8_t*>(bits_),
+                    static_cast<uint8_t*>(bits_) + static_cast<size_t>(w) * h * 4);
+    return true;
+}
+
+}  // namespace remote_assist
