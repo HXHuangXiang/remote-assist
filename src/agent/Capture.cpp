@@ -167,7 +167,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
     }
 
     if (!mem_dc_) {
-        gdi_dc_ = GetDC(nullptr);
+        gdi_dc_ = GetDC(GetDesktopWindow());
         if (diagCount % 300 == 1) log::Info("CaptureGDI: GetDC=" + std::to_string(gdi_dc_ != nullptr));
         mem_dc_ = CreateCompatibleDC(gdi_dc_);
         if (diagCount % 300 == 1) log::Info("CaptureGDI: CreateCompatibleDC=" + std::to_string(mem_dc_ != nullptr));
@@ -202,7 +202,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
     }
 
     // CAPTUREBLT(0x40000000)包含分层窗口,某些显卡驱动下 SRCCOPY 单独可能失败。
-    if (!BitBlt(mem_dc_, 0, 0, w, h, gdi_dc_, 0, 0, SRCCOPY | 0x40000000)) {
+    if (!BitBlt(mem_dc_, 0, 0, w, h, gdi_dc_, 0, 0, SRCCOPY)) {
         if (diagCount % 300 == 1) log::Error("CaptureGDI: BitBlt failed err=" + std::to_string(GetLastError()));
         return false;
     }
