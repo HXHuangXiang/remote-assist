@@ -1,5 +1,6 @@
 # 构建产物
 build/
+dist/
 out/
 x64/
 *.user
@@ -14,4 +15,3 @@ x64/
 config.json
 *.log
 logs/
-

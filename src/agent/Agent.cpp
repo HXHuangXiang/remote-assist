@@ -8,6 +8,8 @@
 #include <objbase.h>
 #include <shlwapi.h>
 
+#include <mfapi.h>
+
 #include <chrono>
 #include <string>
 
@@ -62,6 +64,10 @@ int Agent::Run() {
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
+    // Media Foundation 必须调用 MFStartup 后才能使用 MF API(MFTEnumEx/MFCreateMediaType 等),
+    // 否则编码器协商会静默失败(SetInputType/SetOutputType 返回错误)。
+    MFStartup(MF_VERSION);
+
     cfg_ = LoadOrCreateConfig();
     log::Info("agent config port=" + std::to_string(cfg_.port) +
               " fps=" + std::to_string(cfg_.fps));
@@ -92,6 +98,7 @@ int Agent::Run() {
     }
 
     Stop();
+    MFShutdown();
     CoUninitialize();
     log::Info("agent exit");
     return 0;
