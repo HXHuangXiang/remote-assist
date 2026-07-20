@@ -152,8 +152,42 @@ bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps)
     using Microsoft::WRL::ComPtr;
     // MF 编码器必须先设输出类型(H.264),再设输入类型(NV12)。
     // 优先用编码器自身支持的输出类型(GetOutputAvailableType),避免 MF_E_INVALIDTYPE。
+    ComPtr<IMFMediaType> inMt;
+    bool inFound = false;
+    for (DWORD i = 0; i < 32; ++i) {
+        ComPtr<IMFMediaType> candidate;
+        HRESULT hrt = enc_->GetInputAvailableType(0, i, &candidate);
+        if (hrt != S_OK) break;
+        GUID sub = GUID_NULL;
+        candidate->GetGUID(MF_MT_SUBTYPE, &sub);
+        if (sub == MFVideoFormat_NV12 || sub == MFVideoFormat_RGB32 ||
+            sub == MFVideoFormat_RGB24 || sub == MFVideoFormat_YUY2) {
+            MFCreateMediaType(&inMt);
+            candidate->CopyAllItems(inMt.Get());
+            inFound = true;
+            log::Info("input type idx=" + std::to_string(i) + " accepted");
+            break;
+        }
+    }
+    if (!inFound) {
+        MFCreateMediaType(&inMt);
+        inMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        inMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+        log::Warn("no NV12 input from encoder, using custom");
+    }
+    // 设置帧尺寸、帧率、隔行模式(码率不走媒体类型属性,改用 CODECAPI)。
+    MFSetAttributeSize(inMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
+    MFSetAttributeRatio(inMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
+    inMt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    HRESULT hr = enc_->SetInputType(0, inMt.Get(), 0);
+    if (FAILED(hr)) {
+        log::Error("SetInputType failed hr=" + std::to_string(hr));
+        return false;
+    }
+
+    // Step 2: enumerate output types after input is set.
     ComPtr<IMFMediaType> outMt;
-    bool found = false;
+    bool outFound = false;
     for (DWORD i = 0; i < 32; ++i) {
         ComPtr<IMFMediaType> candidate;
         HRESULT hrt = enc_->GetOutputAvailableType(0, i, &candidate);
@@ -163,39 +197,23 @@ bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps)
         if (sub == MFVideoFormat_H264) {
             MFCreateMediaType(&outMt);
             candidate->CopyAllItems(outMt.Get());
-            found = true;
-            log::Info("found H.264 output type idx=" + std::to_string(i));
+            outFound = true;
+            log::Info("output type idx=" + std::to_string(i) + " is H.264");
             break;
         }
     }
-    if (!found) {
+    if (!outFound) {
         MFCreateMediaType(&outMt);
         outMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         outMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        log::Warn("no H.264 output type from encoder, using custom");
+        log::Warn("no H.264 output from encoder, using custom");
     }
-    // 设置帧尺寸、帧率、隔行模式(码率不走媒体类型属性,改用 CODECAPI)。
     MFSetAttributeSize(outMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
     MFSetAttributeRatio(outMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
     outMt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    HRESULT hr = enc_->SetOutputType(0, outMt.Get(), 0);
+    hr = enc_->SetOutputType(0, outMt.Get(), 0);
     if (FAILED(hr)) {
         log::Error("SetOutputType failed hr=" + std::to_string(hr));
-        return false;
-    }
-
-    ComPtr<IMFMediaType> inMt;
-    if (FAILED(MFCreateMediaType(&inMt))) {
-        return false;
-    }
-    inMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    inMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    MFSetAttributeSize(inMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
-    MFSetAttributeRatio(inMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
-    inMt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    hr = enc_->SetInputType(0, inMt.Get(), 0);
-    if (FAILED(hr)) {
-        log::Error("SetInputType failed hr=" + std::to_string(hr));
         return false;
     }
 
