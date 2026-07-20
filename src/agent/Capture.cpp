@@ -201,8 +201,9 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
         height_ = h;
     }
 
-    if (!BitBlt(mem_dc_, 0, 0, w, h, gdi_dc_, 0, 0, SRCCOPY)) {
-        if (diagCount % 300 == 1) log::Error("CaptureGDI: BitBlt failed");
+    // CAPTUREBLT(0x40000000)包含分层窗口,某些显卡驱动下 SRCCOPY 单独可能失败。
+    if (!BitBlt(mem_dc_, 0, 0, w, h, gdi_dc_, 0, 0, SRCCOPY | 0x40000000)) {
+        if (diagCount % 300 == 1) log::Error("CaptureGDI: BitBlt failed err=" + std::to_string(GetLastError()));
         return false;
     }
 
