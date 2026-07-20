@@ -167,7 +167,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
     }
 
     if (!mem_dc_) {
-        gdi_dc_ = GetDC(GetDesktopWindow());
+        gdi_dc_ = GetDC(nullptr);
         if (diagCount % 300 == 1) log::Info("CaptureGDI: GetDC=" + std::to_string(gdi_dc_ != nullptr));
         mem_dc_ = CreateCompatibleDC(gdi_dc_);
         if (diagCount % 300 == 1) log::Info("CaptureGDI: CreateCompatibleDC=" + std::to_string(mem_dc_ != nullptr));
