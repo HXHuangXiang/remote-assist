@@ -11,19 +11,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Debug env
-        shell: cmd
-        run: |
-          echo ---vswhere---
-          "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          echo ---cmake---
-          cmake --version
-          echo ---cl---
-          where cl
-          echo ---env VCINSTALLDIR---
-          echo %VCINSTALLDIR%
-      - name: Configure (CMake + VS2022 x64)
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - name: Configure (CMake + VS18 x64)
+        run: cmake -S . -B build -G "Visual Studio 18 2026" -A x64
       - name: Build (Release)
         run: cmake --build build --config Release --parallel
       - name: Package
