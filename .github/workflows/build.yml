@@ -10,13 +10,11 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up MSVC dev command
-        uses: ilammy/msvc-dev-command@v1
-        with:
-          arch: x64
-      - name: Configure (CMake + VS2022 x64)
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+     - uses: actions/checkout@v4
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+     - name: Configure (CMake + VS2022 x64)
+       run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
       - name: Build (Release)
         run: cmake --build build --config Release --parallel
       - name: Package
@@ -30,4 +28,3 @@ jobs:
         with:
           name: RemoteAssist-windows
           path: RemoteAssist.zip
-
