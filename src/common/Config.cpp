@@ -2,10 +2,10 @@
 
 #include "common/Log.h"
 
+#include <windows.h>
 #include <bcrypt.h>
 #include <knownfolders.h>
 #include <shlobj.h>
-#include <windows.h>
 
 #include <nlohmann/json.hpp>
 
