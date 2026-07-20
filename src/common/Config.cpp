@@ -50,7 +50,6 @@ std::string Sha256Hex(const std::string& saltHex, const std::string& token) {
         return {};
     }
     uint8_t hash[32] = {};
-    ULONG outLen = 0;
     // BCryptHash 的参数数量在不同 SDK 版本有差异(8 或 9 参数),
     // 改用稳定的 CreateHash/HashData/FinishHash 三步 API(Vista 起签名固定)。
     BCRYPT_HASH_HANDLE hHash = nullptr;

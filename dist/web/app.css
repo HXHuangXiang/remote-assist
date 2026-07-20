@@ -1,0 +1,8 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+#bar { display: flex; gap: 8px; align-items: center; padding: 8px; background: #1a1a1a; }
+#pw { width: 200px; padding: 4px 6px; background: #222; color: #eee; border: 1px solid #444; }
+#connect { padding: 4px 12px; cursor: pointer; }
+#screen { width: 100%; height: calc(100vh - 44px); background: #000; display: block; outline: none; image-rendering: auto; }
+#log { position: fixed; bottom: 0; right: 0; max-height: 40px; overflow: hidden; font-size: 12px; padding: 4px 8px; opacity: 0.6; pointer-events: none; }
+
