@@ -150,31 +150,34 @@ bool EncoderMf::Init(int width, int height, int fps, int bitrateBps) {
 
 bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps) {
     using Microsoft::WRL::ComPtr;
-    ComPtr<IMFMediaType> inMt;
-    if (FAILED(MFCreateMediaType(&inMt))) {
-        return false;
-    }
-    inMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-   inMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    MFSetAttributeSize(inMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
-    MFSetAttributeRatio(inMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
-   inMt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    if (FAILED(enc_->SetInputType(0, inMt.Get(), 0))) {
-        log::Error("SetInputType failed");
-        return false;
-    }
-
+    // MF 编码器必须先设输出类型(H.264),再设输入类型(NV12)。
     ComPtr<IMFMediaType> outMt;
     if (FAILED(MFCreateMediaType(&outMt))) {
         return false;
     }
     outMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-   outMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    outMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
     MFSetAttributeSize(outMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
     MFSetAttributeRatio(outMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
-   outMt->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(bitrateBps));
-    if (FAILED(enc_->SetOutputType(0, outMt.Get(), 0))) {
-        log::Error("SetOutputType failed");
+    outMt->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(bitrateBps));
+    HRESULT hr = enc_->SetOutputType(0, outMt.Get(), 0);
+    if (FAILED(hr)) {
+        log::Error("SetOutputType failed hr=" + std::to_string(hr));
+        return false;
+    }
+
+    ComPtr<IMFMediaType> inMt;
+    if (FAILED(MFCreateMediaType(&inMt))) {
+        return false;
+    }
+    inMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    inMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    MFSetAttributeSize(inMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
+    MFSetAttributeRatio(inMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
+    inMt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    hr = enc_->SetInputType(0, inMt.Get(), 0);
+    if (FAILED(hr)) {
+        log::Error("SetInputType failed hr=" + std::to_string(hr));
         return false;
     }
 
