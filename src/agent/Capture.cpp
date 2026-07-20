@@ -154,19 +154,31 @@ bool Capture::CaptureDXGI(CapturedFrame& out) {
 bool Capture::CaptureGDI(CapturedFrame& out) {
     const int w = GetSystemMetrics(SM_CXSCREEN);
     const int h = GetSystemMetrics(SM_CYSCREEN);
+    static int diagCount = 0;
+    if (++diagCount % 300 == 1) {
+        log::Info("CaptureGDI diag: w=" + std::to_string(w) + " h=" + std::to_string(h) +
+                   " gdi_dc=" + std::to_string(gdi_dc_ != nullptr) +
+                   " mem_dc=" + std::to_string(mem_dc_ != nullptr) +
+                   " bmp=" + std::to_string(bmp_ != nullptr));
+    }
     if (w <= 0 || h <= 0) {
+        if (diagCount % 300 == 1) log::Error("CaptureGDI: screen metrics 0");
         return false;
     }
 
     if (!mem_dc_) {
         gdi_dc_ = GetDC(nullptr);
+        if (diagCount % 300 == 1) log::Info("CaptureGDI: GetDC=" + std::to_string(gdi_dc_ != nullptr));
         mem_dc_ = CreateCompatibleDC(gdi_dc_);
+        if (diagCount % 300 == 1) log::Info("CaptureGDI: CreateCompatibleDC=" + std::to_string(mem_dc_ != nullptr));
         if (!mem_dc_) {
+            if (diagCount % 300 == 1) log::Error("CaptureGDI: CreateCompatibleDC failed");
             return false;
         }
     }
 
     if (!bmp_ || width_ != w || height_ != h) {
+        if (diagCount % 300 == 1) log::Info("CaptureGDI: creating DIB " + std::to_string(w) + "x" + std::to_string(h));
         if (bmp_) {
             SelectObject(mem_dc_, old_bmp_);
             DeleteObject(bmp_);
@@ -181,6 +193,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
         bi.bmiHeader.biCompression = BI_RGB;
         bmp_ = CreateDIBSection(mem_dc_, &bi, DIB_RGB_COLORS, &bits_, nullptr, 0);
         if (!bmp_) {
+            if (diagCount % 300 == 1) log::Error("CaptureGDI: CreateDIBSection failed");
             return false;
         }
         old_bmp_ = static_cast<HBITMAP>(SelectObject(mem_dc_, bmp_));
@@ -189,6 +202,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
     }
 
     if (!BitBlt(mem_dc_, 0, 0, w, h, gdi_dc_, 0, 0, SRCCOPY)) {
+        if (diagCount % 300 == 1) log::Error("CaptureGDI: BitBlt failed");
         return false;
     }
 
