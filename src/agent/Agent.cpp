@@ -129,6 +129,10 @@ void Agent::CaptureLoop() {
 
         CapturedFrame frame;
         if (!capture_.CaptureFrame(frame)) {
+            static int failCount = 0;
+            if (++failCount % 300 == 1) {  // 每 10s(30fps*300)打一次,避免刷屏
+                log::Warn("capture frame failed, count=" + std::to_string(failCount));
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
             continue;
         }
