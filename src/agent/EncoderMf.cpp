@@ -156,7 +156,7 @@ bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps)
     bool found = false;
     for (DWORD i = 0; i < 32; ++i) {
         ComPtr<IMFMediaType> candidate;
-        HRESULT hrt = enc_->GetOutputAvailableType(0, i, 0, &candidate);
+        HRESULT hrt = enc_->GetOutputAvailableType(0, i, &candidate);
         if (hrt != S_OK) break;
         GUID sub = GUID_NULL;
         candidate->GetGUID(MF_MT_SUBTYPE, &sub);
