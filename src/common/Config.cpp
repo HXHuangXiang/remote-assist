@@ -51,9 +51,17 @@ std::string Sha256Hex(const std::string& saltHex, const std::string& token) {
     }
     uint8_t hash[32] = {};
     ULONG outLen = 0;
-    const NTSTATUS st = BCryptHash(hAlg, nullptr, 0, input.data(),
-                                   static_cast<ULONG>(input.size()),
-                                   hash, sizeof(hash), &outLen);
+    // BCryptHash 的参数数量在不同 SDK 版本有差异(8 或 9 参数),
+    // 改用稳定的 CreateHash/HashData/FinishHash 三步 API(Vista 起签名固定)。
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    NTSTATUS st = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+    if (st == 0) {
+        st = BCryptHashData(hHash, input.data(), static_cast<ULONG>(input.size()), 0);
+        if (st == 0) {
+            st = BCryptFinishHash(hHash, hash, sizeof(hash), 0);
+        }
+        BCryptDestroyHash(hHash);
+    }
     BCryptCloseAlgorithmProvider(hAlg, 0);
     if (st != 0) {
         return {};
