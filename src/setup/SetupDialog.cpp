@@ -18,6 +18,7 @@ enum {
     IDC_SVC_UNINSTALL,
     IDC_SVC_START,
     IDC_SVC_STOP,
+    IDC_RUN_AGENT,
     IDC_EXIT,
     IDC_PORT_EDIT
 };
@@ -56,13 +57,14 @@ static bool ServiceRunning() {
 
 static bool InstallService() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
-    if (!scm) return false;
+    if (!scm) { log::Error("OpenSCManager failed err=" + std::to_string(GetLastError())); return false; }
     std::wstring binPath = L""" + ExePath() + L"" --service";
     SC_HANDLE svc = CreateServiceW(scm, L"remote-assist", L"RemoteAssist",
         SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
         SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
         binPath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
     if (svc) { CloseServiceHandle(svc); CloseServiceHandle(scm); return true; }
+    log::Error("CreateService failed err=" + std::to_string(GetLastError()));
     CloseServiceHandle(scm);
     return false;
 }
@@ -86,9 +88,10 @@ static bool StartServiceS() {
     SC_HANDLE svc = OpenServiceW(scm, L"remote-assist", SERVICE_START);
     if (!svc) { CloseServiceHandle(scm); return false; }
     bool ok = StartServiceW(svc, 0, nullptr);
+    DWORD err = GetLastError();
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
-    return ok || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING;
+    return ok || err == ERROR_SERVICE_ALREADY_RUNNING;
 }
 
 static bool StopServiceS() {
@@ -112,7 +115,7 @@ static void UpdateStatus() {
     } else {
         s = L"服务已安装但未运行";
     }
-    SetWindowTextW(GetDlgItem(g_hwnd, IDC_STATUS), s.c_str());
+    SetDlgItemTextW(g_hwnd, IDC_STATUS, s.c_str());
 
     BOOL installed = ServiceExists();
     BOOL running = ServiceRunning();
@@ -123,7 +126,6 @@ static void UpdateStatus() {
 }
 
 static void CreateControls(HWND hwnd) {
-    // 字体
     HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
 
@@ -134,21 +136,24 @@ static void CreateControls(HWND hwnd) {
         return hw;
     };
 
-    mk(0, L"STATIC", L"密码:", 20, 20, 60, 20, 0);
-    mk(IDC_PW_EDIT, L"EDIT", L"", 80, 18, 200, 24, ES_AUTOHSCROLL | WS_BORDER);
-    mk(IDC_PW_SAVE, L"BUTTON", L"保存密码", 300, 17, 90, 26, BS_PUSHBUTTON);
+    mk(0, L"STATIC", L"密码:", 20, 20, 50, 20, 0);
+    mk(IDC_PW_EDIT, L"EDIT", L"", 70, 18, 180, 24, ES_AUTOHSCROLL | WS_BORDER);
+    mk(IDC_PW_SAVE, L"BUTTON", L"保存密码", 260, 17, 90, 26, BS_PUSHBUTTON);
 
-    mk(0, L"STATIC", L"端口:", 20, 60, 60, 20, 0);
-    mk(IDC_PORT_EDIT, L"EDIT", L"7980", 80, 58, 80, 24, ES_NUMBER | WS_BORDER);
+    mk(0, L"STATIC", L"端口:", 20, 55, 50, 20, 0);
+    mk(IDC_PORT_EDIT, L"EDIT", L"7980", 70, 53, 60, 24, ES_NUMBER | WS_BORDER);
 
-    mk(0, L"STATIC", L"状态:", 20, 100, 60, 20, 0);
-    mk(IDC_STATUS, L"STATIC", L"...", 80, 100, 310, 20, 0);
+    mk(0, L"STATIC", L"状态:", 20, 90, 50, 20, 0);
+    mk(IDC_STATUS, L"STATIC", L"...", 70, 90, 280, 20, 0);
 
-    mk(IDC_SVC_INSTALL, L"BUTTON", L"安装并启动服务", 20, 140, 160, 32, BS_PUSHBUTTON);
-    mk(IDC_SVC_UNINSTALL, L"BUTTON", L"卸载服务", 200, 140, 100, 32, BS_PUSHBUTTON);
-    mk(IDC_SVC_START, L"BUTTON", L"启动服务", 20, 185, 120, 32, BS_PUSHBUTTON);
-    mk(IDC_SVC_STOP, L"BUTTON", L"停止服务", 150, 185, 120, 32, BS_PUSHBUTTON);
-    mk(IDC_EXIT, L"BUTTON", L"退出", 310, 185, 80, 32, BS_PUSHBUTTON);
+    mk(IDC_RUN_AGENT, L"BUTTON", L"直接运行(非服务)", 20, 125, 160, 32, BS_PUSHBUTTON);
+    mk(IDC_SVC_INSTALL, L"BUTTON", L"安装并启动服务", 200, 125, 150, 32, BS_PUSHBUTTON);
+
+    mk(IDC_SVC_START, L"BUTTON", L"启动服务", 20, 170, 110, 32, BS_PUSHBUTTON);
+    mk(IDC_SVC_STOP, L"BUTTON", L"停止服务", 140, 170, 110, 32, BS_PUSHBUTTON);
+    mk(IDC_SVC_UNINSTALL, L"BUTTON", L"卸载服务", 260, 170, 90, 32, BS_PUSHBUTTON);
+
+    mk(IDC_EXIT, L"BUTTON", L"退出", 320, 210, 80, 30, BS_PUSHBUTTON);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -156,14 +161,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         g_hwnd = hwnd;
         CreateControls(hwnd);
-        // 加载配置,填入密码(如果有初始密码)和端口
         g_cfg = LoadOrCreateConfig();
         if (!g_cfg.initialPassword.empty()) {
-            SetWindowTextA(GetDlgItem(hwnd, IDC_PW_EDIT), g_cfg.initialPassword.c_str());
-        } else {
-            SetWindowTextA(GetDlgItem(hwnd, IDC_PW_EDIT), "");
+            SetDlgItemTextA(hwnd, IDC_PW_EDIT, g_cfg.initialPassword.c_str());
         }
-        SetWindowTextA(GetDlgItem(hwnd, IDC_PORT_EDIT), std::to_string(g_cfg.port).c_str());
+        SetDlgItemTextA(hwnd, IDC_PORT_EDIT, std::to_string(g_cfg.port).c_str());
         UpdateStatus();
         return 0;
 
@@ -171,48 +173,53 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case IDC_PW_SAVE: {
             char pw[256] = {};
-            GetWindowTextA(GetDlgItem(hwnd, IDC_PW_EDIT), pw, sizeof(pw));
+            GetDlgItemTextA(hwnd, IDC_PW_EDIT, pw, sizeof(pw));
             if (pw[0]) {
                 SetPassword(g_cfg, pw);
                 MessageBoxW(hwnd, L"密码已保存", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+            } else {
+                MessageBoxW(hwnd, L"请输入密码", L"RemoteAssist", MB_OK | MB_ICONWARNING);
             }
             break;
         }
-        case IDC_SVC_INSTALL:
-            // 保存密码和端口到配置
-            {
-                char pw[256] = {};
-                GetWindowTextA(GetDlgItem(hwnd, IDC_PW_EDIT), pw, sizeof(pw));
-                if (pw[0]) SetPassword(g_cfg, pw);
-                char portStr[16] = {};
-                GetWindowTextA(GetDlgItem(hwnd, IDC_PORT_EDIT), portStr, sizeof(portStr));
-                if (portStr[0]) { g_cfg.port = atoi(portStr); SaveConfig(g_cfg); }
-            }
+        case IDC_SVC_INSTALL: {
+            // 先保存配置
+            char pw[256] = {};
+            GetDlgItemTextA(hwnd, IDC_PW_EDIT, pw, sizeof(pw));
+            if (pw[0]) SetPassword(g_cfg, pw);
+            char portStr[16] = {};
+            GetDlgItemTextA(hwnd, IDC_PORT_EDIT, portStr, sizeof(portStr));
+            if (portStr[0]) { g_cfg.port = atoi(portStr); SaveConfig(g_cfg); }
             if (InstallService()) {
+                MessageBoxW(hwnd, L"服务安装成功,正在启动...", L"RemoteAssist", MB_OK);
                 StartServiceS();
-                Sleep(1000);
-                if (ServiceRunning()) {
-                    wchar_t msg[256];
-                    swprintf_s(msg, 256, L"服务安装并启动成功!浏览器打开 http://localhost:%d 访问。", g_cfg.port);
-                    MessageBoxW(hwnd, msg, L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
-                } else {
-                    wchar_t msg[256];
-                    swprintf_s(msg, 256, L"服务已安装但启动失败(错误码 %d)。请查看 exe 目录下 logs/ 的日志。", (int)GetLastError());
-                    MessageBoxW(hwnd, msg, L"RemoteAssist", MB_OK | MB_ICONWARNING);
-                }
-                UpdateStatus();
+                MessageBoxW(hwnd, L"服务已启动,浏览器访问 http://本机IP:7980", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             } else {
-                wchar_t msg[256];
-                swprintf_s(msg, 256, L"安装服务失败(错误码 %d)。请右键 exe 以管理员身份运行。", (int)GetLastError());
-                MessageBoxW(hwnd, msg, L"RemoteAssist", MB_OK | MB_ICONWARNING);
+                DWORD err = GetLastError();
+                wchar_t buf[256];
+                swprintf_s(buf, L"安装失败(错误码 %u),请以管理员身份运行", err);
+                MessageBoxW(hwnd, buf, L"RemoteAssist", MB_OK | MB_ICONERROR);
             }
+            UpdateStatus();
             break;
+        }
         case IDC_SVC_UNINSTALL:
-            UninstallService();
+            if (UninstallService()) {
+                MessageBoxW(hwnd, L"服务已卸载", L"RemoteAssist", MB_OK);
+            } else {
+                MessageBoxW(hwnd, L"卸载失败,请以管理员身份运行", L"RemoteAssist", MB_OK | MB_ICONERROR);
+            }
             UpdateStatus();
             break;
         case IDC_SVC_START:
-            StartServiceS();
+            if (StartServiceS()) {
+                MessageBoxW(hwnd, L"服务已启动", L"RemoteAssist", MB_OK);
+            } else {
+                DWORD err = GetLastError();
+                wchar_t buf[256];
+                swprintf_s(buf, L"启动失败(错误码 %u)", err);
+                MessageBoxW(hwnd, buf, L"RemoteAssist", MB_OK | MB_ICONERROR);
+            }
             Sleep(500);
             UpdateStatus();
             break;
@@ -220,6 +227,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             StopServiceS();
             Sleep(500);
             UpdateStatus();
+            break;
+        case IDC_RUN_AGENT:
+            // 直接启动 agent 进程(非服务模式)
+            {
+                std::wstring exe = ExePath();
+                std::wstring cmd = L""" + exe + L"" --agent";
+                STARTUPINFOW si = {};
+                si.cb = sizeof(si);
+                PROCESS_INFORMATION pi = {};
+                if (CreateProcessW(nullptr, const_cast<LPWSTR>(cmd.c_str()),
+                        nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                    MessageBoxW(hwnd, L"Agent 已启动,浏览器访问 http://本机IP:7980", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBoxW(hwnd, L"启动 agent 失败", L"RemoteAssist", MB_OK | MB_ICONERROR);
+                }
+            }
             break;
         case IDC_EXIT:
             PostQuitMessage(0);
@@ -235,6 +260,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int RunSetupDialog(HINSTANCE hInst) {
+    // 初始化日志(exe 同目录下的 logs/ 子目录)
+    log::Init(LogDir());
+    log::Info("setup dialog starting");
+
     const wchar_t* cls = L"RemoteAssistSetup";
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -249,11 +278,17 @@ int RunSetupDialog(HINSTANCE hInst) {
         (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 420, 280, nullptr, nullptr, hInst, nullptr);
 
+    if (!hwnd) {
+        log::Error("CreateWindowEx failed err=" + std::to_string(GetLastError()));
+        return 1;
+    }
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    log::Info("setup dialog exit");
     return 0;
 }
 
