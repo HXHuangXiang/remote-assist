@@ -195,34 +195,20 @@ bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps)
         }
     }
 
-    // Step 1: 设输出类型(优先用 GetOutputAvailableType 找到的,否则用最小自构造)
+    // Step 1: 设输出类型 -- 直接用 GetOutputAvailableType 返回的类型 AS-IS,
+    // 不修改帧尺寸/帧率/隔行模式(编码器不接受被修改的类型,帧尺寸由输入端决定)。
     if (!outFound) {
         MFCreateMediaType(&outMt);
         outMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         outMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
         log::Warn("no H.264 output type from enumeration, using custom minimal");
     }
-    MFSetAttributeSize(outMt.Get(), MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
-    MFSetAttributeRatio(outMt.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
-    outMt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     HRESULT hr = enc_->SetOutputType(0, outMt.Get(), 0);
     if (FAILED(hr)) {
         log::Error("SetOutputType failed hr=" + std::to_string(hr));
-        // 回退:尝试不设帧尺寸/帧率/隔行模式的最小类型
-        ComPtr<IMFMediaType> minOut;
-        MFCreateMediaType(&minOut);
-        minOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        minOut->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        hr = enc_->SetOutputType(0, minOut.Get(), 0);
-        if (FAILED(hr)) {
-            log::Error("SetOutputType(minimal) also failed hr=" + std::to_string(hr));
-            return false;
-        }
-        log::Info("SetOutputType(minimal) OK");
-        outMt = minOut;
-    } else {
-        log::Info("SetOutputType(full) OK");
+        return false;
     }
+    log::Info("SetOutputType OK (AS-IS from enumeration)");
 
     // Step 2: 枚举输入类型(输出已设)
     log::Info("=== Enumerating input types (output set) ===");
