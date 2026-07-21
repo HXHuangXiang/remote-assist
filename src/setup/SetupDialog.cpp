@@ -58,7 +58,7 @@ static bool ServiceRunning() {
 static bool InstallService() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (!scm) { log::Error("OpenSCManager failed err=" + std::to_string(GetLastError())); return false; }
-    std::wstring binPath = L""" + ExePath() + L"" --service";
+    std::wstring binPath = L"\"" + ExePath() + L"\" --service";
     SC_HANDLE svc = CreateServiceW(scm, L"remote-assist", L"RemoteAssist",
         SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
         SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
@@ -232,7 +232,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 直接启动 agent 进程(非服务模式)
             {
                 std::wstring exe = ExePath();
-                std::wstring cmd = L""" + exe + L"" --agent";
+                std::wstring cmd = L"\"" + exe + L"\" --agent";
                 STARTUPINFOW si = {};
                 si.cb = sizeof(si);
                 PROCESS_INFORMATION pi = {};
