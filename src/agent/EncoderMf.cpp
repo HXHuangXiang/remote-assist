@@ -188,27 +188,28 @@ bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps)
         candidate->GetGUID(MF_MT_SUBTYPE, &sub);
         log::Info("output[" + std::to_string(i) + "] sub=" + guid_to_str(sub));
         if (!outFound && sub == MFVideoFormat_H264) {
-            MFCreateMediaType(&outMt);
-            candidate->CopyAllItems(outMt.Get());
+            outMt = candidate;
             outFound = true;
             log::Info("output[" + std::to_string(i) + "] selected as H.264");
         }
     }
 
-    // Step 1: 设输出类型 -- 直接用 GetOutputAvailableType 返回的类型 AS-IS,
-    // 不修改帧尺寸/帧率/隔行模式(编码器不接受被修改的类型,帧尺寸由输入端决定)。
+    // Step 1: 设输出类型 -- 直接传 GetOutputAvailableType 返回的指针(不 CopyAllItems,避免丢属性)。
     if (!outFound) {
         MFCreateMediaType(&outMt);
         outMt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         outMt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
         log::Warn("no H.264 output type from enumeration, using custom minimal");
     }
+    // 先用 MFT_SET_TYPE_TEST_FLAG(0x1) 测试类型是否可接受,再正式设置。
+    HRESULT testHr = enc_->SetOutputType(0, outMt.Get(), 1);
+    log::Info("SetOutputType TEST hr=" + std::to_string(testHr));
     HRESULT hr = enc_->SetOutputType(0, outMt.Get(), 0);
     if (FAILED(hr)) {
         log::Error("SetOutputType failed hr=" + std::to_string(hr));
         return false;
     }
-    log::Info("SetOutputType OK (AS-IS from enumeration)");
+    log::Info("SetOutputType OK");
 
     // Step 2: 枚举输入类型(输出已设)
     log::Info("=== Enumerating input types (output set) ===");
@@ -224,8 +225,7 @@ bool EncoderMf::ConfigureEncoder(int width, int height, int fps, int bitrateBps)
         if (sub == MFVideoFormat_NV12 || sub == MFVideoFormat_RGB32 ||
             sub == MFVideoFormat_RGB24 || sub == MFVideoFormat_YUY2 ||
             sub == MFVideoFormat_IYUV || sub == MFVideoFormat_I420) {
-            MFCreateMediaType(&inMt);
-            candidate->CopyAllItems(inMt.Get());
+            inMt = candidate;
             inFound = true;
             log::Info("input[" + std::to_string(i) + "] accepted");
             break;
