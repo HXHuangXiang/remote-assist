@@ -56,6 +56,7 @@ function setupCfg(c) {
 }
 
 function populateMonitors(list) {
+  monSel.onchange = null;
   monSel.innerHTML = '';
   const all = document.createElement('option');
   all.value = '-1'; all.textContent = '全部屏幕';
@@ -65,6 +66,7 @@ function populateMonitors(list) {
     o.value = m.index; o.textContent = m.name + ' (' + m.w + 'x' + m.h + ')';
     monSel.appendChild(o);
   });
+  monSel.onchange = function() { send({t:'monitor', index: parseInt(monSel.value)}); };
 }
 
 function handleBinary(data) {
