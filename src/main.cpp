@@ -6,6 +6,7 @@
 #include "agent/Agent.h"
 #include "common/Log.h"
 #include "service/ServiceHost.h"
+#include "setup/SetupDialog.h"
 #include "tray/TrayApp.h"
 
 namespace {
@@ -31,8 +32,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
         remote_assist::TrayApp tray;
         return tray.Run();
     }
-    // 无参数(用户双击):直接进入托盘。service 需通过 sc 安装为 LocalSystem 后才会拉起 agent。
-    remote_assist::TrayApp tray;
-    return tray.Run();
+    // 无参数(用户双击):弹出配置窗口,设密码/安装服务。
+    return remote_assist::RunSetupDialog(GetModuleHandle(nullptr));
 }
-

@@ -90,17 +90,11 @@ std::string GenReadablePassword() {
 }  // namespace
 
 std::wstring ConfigDir() {
-    wchar_t* programData = nullptr;
-    std::wstring dir;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, 0, nullptr, &programData)) &&
-        programData) {
-        dir = programData;
-        dir += L"\\RemoteAssist";
-        CoTaskMemFree(programData);
-    }
-    if (dir.empty()) {
-        dir = L"C:\\ProgramData\\RemoteAssist";
-    }
+    wchar_t buf[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    std::wstring exe = buf;
+    size_t pos = exe.find_last_of(L"\\/");
+    std::wstring dir = (pos != std::wstring::npos) ? exe.substr(0, pos) : exe;
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir;
 }
@@ -176,6 +170,23 @@ bool VerifyPassword(const Config& cfg, const std::string& token) {
         return false;
     }
     return Sha256Hex(cfg.salt, token) == cfg.passwordHash;
+}
+
+void SaveConfig(const Config& cfg) {
+    nlohmann::json j;
+    j["port"] = cfg.port;
+    j["password_hash"] = cfg.passwordHash;
+    j["salt"] = cfg.salt;
+    j["bitrate"] = cfg.bitrate;
+    j["fps"] = cfg.fps;
+    std::ofstream f(ConfigFilePath(), std::ios::binary);
+    if (f) f << j.dump(2);
+}
+
+void SetPassword(Config& cfg, const std::string& password) {
+    if (cfg.salt.empty()) cfg.salt = GenRandomHex(16);
+    cfg.passwordHash = Sha256Hex(cfg.salt, password);
+    SaveConfig(cfg);
 }
 
 }  // namespace remote_assist

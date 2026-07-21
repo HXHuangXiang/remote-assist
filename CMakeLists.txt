@@ -31,6 +31,7 @@ set(SOURCES
     src/service/ProcessLauncher.cpp
     src/service/ServiceHost.cpp
     src/agent/DesktopAccess.cpp
+    src/setup/SetupDialog.cpp
     src/agent/Capture.cpp
     src/agent/EncoderMf.cpp
     src/agent/Input.cpp
