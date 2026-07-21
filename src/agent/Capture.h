@@ -38,6 +38,7 @@ public:
 
     // 多显示器:枚举显示器列表。-1=全部(虚拟屏幕),>=0=指定显示器。
     void EnumMonitors();
+    static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM);
     const std::vector<MonitorInfo>& Monitors() const { return monitors_; }
     void SetMonitor(int index) { selectedMonitor_ = index; }
 

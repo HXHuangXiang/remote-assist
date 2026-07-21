@@ -11,13 +11,13 @@
 namespace remote_assist {
 
 // EnumDisplayMonitors 回调:收集每个显示器信息。
-static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT lprcMonitor, LPARAM dwData) {
+BOOL CALLBACK Capture::MonitorEnumProc(HMONITOR hMon, HDC, LPRECT lprcMonitor, LPARAM dwData) {
     auto* self = reinterpret_cast<Capture*>(dwData);
     MONITORINFOEXW mi;
     mi.cbSize = sizeof(mi);
     if (GetMonitorInfoW(hMon, &mi)) {
         MonitorInfo m;
-        m.index = static_cast<int>(self->Monitors().size());
+        m.index = static_cast<int>(self->monitors_.size());
         // 显示器名称:取设备名前 20 字符。
         char name[64] = {};
         WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, sizeof(name), nullptr, nullptr);
@@ -30,7 +30,7 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT lprcMonitor, LPA
         m.w = lprcMonitor->right - lprcMonitor->left;
         m.h = lprcMonitor->bottom - lprcMonitor->top;
         // 通过 friend 或 public 接口添加 —— 用 const_cast 绕过 const(回调设计如此)。
-        const_cast<Capture*>(self)->monitors_.push_back(m);
+        self->monitors_.push_back(m);
     }
     return TRUE;
 }
