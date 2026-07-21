@@ -86,7 +86,7 @@ bool EncoderMf::Encode(const uint8_t* bgra, std::vector<EncodedChunk>& out) {
 
     // 设 JPEG 质量。
     if (props) {
-        PROPBAG2 bag = {}; bag.pstrName = L"ImageQuality";
+        PROPBAG2 bag = {}; WCHAR qn[] = L"ImageQuality"; bag.pstrName = qn;
         VARIANT v; VariantInit(&v); v.vt = VT_R4; v.fltVal = (FLOAT)quality_ / 100.0f;
         props->Write(1, &bag, &v); VariantClear(&v);
     }
