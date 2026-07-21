@@ -8,13 +8,15 @@
 </head>
 <body>
 <div id="bar">
-  <input id="pw" type="text" placeholder="访问密码" autocomplete="off">
+  <input id="pw" type="text" placeholder="访问密码" autocomplete="off" value="123456">
   <button id="connect">连接</button>
+  <select id="monitor"></select>
   <span id="status">未连接</span>
 </div>
-<canvas id="screen" tabindex="0"></canvas>
+<div id="screen-wrap">
+  <canvas id="screen" tabindex="0"></canvas>
+</div>
 <div id="log"></div>
 <script src="app.js"></script>
 </body>
 </html>
-

@@ -7,19 +7,24 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace remote_assist {
 
-// 一帧采集结果。当前统一输出 BGRA(每像素 4 字节,BGRA 字节序),
-// 由 EncoderMf 内部转 NV12 后送 H.264 编码。
 struct CapturedFrame {
     int width = 0;
     int height = 0;
-    std::vector<uint8_t> data;  // width*height*4 字节 BGRA
+    std::vector<uint8_t> data;
 };
 
-// 屏幕采集:主路径 DXGI Desktop Duplication;失败(锁屏桌面等)回退 GDI BitBlt。
+// 显示器信息(矩形坐标相对于虚拟屏幕原点)。
+struct MonitorInfo {
+    int index = 0;
+    std::string name;
+    int x = 0, y = 0, w = 0, h = 0;
+};
+
 class Capture {
 public:
     Capture() = default;
@@ -29,9 +34,12 @@ public:
     Capture& operator=(const Capture&) = delete;
 
     bool Init();
-
-    // 采集一帧。无变化或失败返回 false(调用方可决定跳过/重试)。
     bool CaptureFrame(CapturedFrame& out);
+
+    // 多显示器:枚举显示器列表。-1=全部(虚拟屏幕),>=0=指定显示器。
+    void EnumMonitors();
+    const std::vector<MonitorInfo>& Monitors() const { return monitors_; }
+    void SetMonitor(int index) { selectedMonitor_ = index; }
 
 private:
     bool InitDXGI();
@@ -53,10 +61,16 @@ private:
     HBITMAP old_bmp_ = nullptr;
     void* bits_ = nullptr;
 
+    int dibW_ = 0;   // DIB 宽(虚拟屏幕宽)
+    int dibH_ = 0;   // DIB 高(虚拟屏幕高)
+
+    // 多显示器
+    std::vector<MonitorInfo> monitors_;
+    int selectedMonitor_ = -1;  // -1=全部
+
     int width_ = 0;
     int height_ = 0;
     bool use_gdi_ = false;
 };
 
 }  // namespace remote_assist
-

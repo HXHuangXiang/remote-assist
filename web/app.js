@@ -1,12 +1,18 @@
 'use strict';
 let ws = null, cfg = null, authed = false;
-let canvas, ctx, logEl, statusEl, pwEl;
+let canvas, ctx, logEl, statusEl, pwEl, monSel;
 
-function log(msg) {
-  logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg;
-  console.log(msg);
-}
+function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
+
+function fitCanvas() {
+  if (!canvas.width || !canvas.height) return;
+  const wrap = document.getElementById('screen-wrap');
+  const cr = canvas.width / canvas.height;
+  const wr = wrap.clientWidth / wrap.clientHeight;
+  if (wr > cr) { canvas.style.height = wrap.clientHeight + 'px'; canvas.style.width = (wrap.clientHeight * cr) + 'px'; }
+  else { canvas.style.width = wrap.clientWidth + 'px'; canvas.style.height = (wrap.clientWidth / cr) + 'px'; }
+}
 
 function connect() {
   const host = location.hostname || '127.0.0.1';
@@ -20,12 +26,9 @@ function connect() {
   ws.onopen = function() { ws.send(JSON.stringify({t:'auth', token: pwEl.value || ''})); };
   ws.onmessage = function(ev) {
     if (typeof ev.data === 'string') {
-      let m;
-      try { m = JSON.parse(ev.data); } catch(e) { return; }
+      let m; try { m = JSON.parse(ev.data); } catch(e) { return; }
       handleText(m);
-    } else {
-      handleBinary(new Uint8Array(ev.data));
-    }
+    } else { handleBinary(new Uint8Array(ev.data)); }
   };
   ws.onclose = function() { log('disconnected'); setStatus('未连接'); authed = false; };
   ws.onerror = function() { log('ws error'); };
@@ -39,14 +42,29 @@ function handleText(m) {
     if (m.ok && canvas) canvas.focus();
     return;
   }
-  if (m.t === 'cfg') { setupDecoder(m); return; }
+  if (m.t === 'cfg') { setupCfg(m); return; }
+  if (m.t === 'monitors') { populateMonitors(m.list); return; }
   if (m.t === 'error') { log('error: ' + (m.msg || '')); return; }
 }
 
-function setupDecoder(c) {
+function setupCfg(c) {
   cfg = c;
-  canvas.width = c.w; canvas.height = c.h;
-  log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps);
+    canvas.width = c.w; canvas.height = c.h;
+    fitCanvas();
+    if (c.monitors) populateMonitors(c.monitors);
+    log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps);
+}
+
+function populateMonitors(list) {
+  monSel.innerHTML = '';
+  const all = document.createElement('option');
+  all.value = '-1'; all.textContent = '全部屏幕';
+  monSel.appendChild(all);
+  (list || []).forEach(function(m) {
+    const o = document.createElement('option');
+    o.value = m.index; o.textContent = m.name + ' (' + m.w + 'x' + m.h + ')';
+    monSel.appendChild(o);
+  });
 }
 
 function handleBinary(data) {
@@ -54,28 +72,17 @@ function handleBinary(data) {
   const blob = new Blob([data], { type: 'image/jpeg' });
   const url = URL.createObjectURL(blob);
   const img = new Image();
-  img.onload = function() {
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    URL.revokeObjectURL(url);
-  };
+  img.onload = function() { ctx.drawImage(img, 0, 0, canvas.width, canvas.height); URL.revokeObjectURL(url); };
   img.onerror = function() { URL.revokeObjectURL(url); };
   img.src = url;
 }
 
-function send(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN && authed) {
-    ws.send(JSON.stringify(obj));
-  }
-}
-function btnName(b) {
-  if (b === 1) return 'middle';
-  if (b === 2) return 'right';
-  return 'left';
-}
+function send(obj) { if (ws && ws.readyState === WebSocket.OPEN && authed) ws.send(JSON.stringify(obj)); }
+function btnName(b) { return b === 1 ? 'middle' : b === 2 ? 'right' : 'left'; }
 
 const codeToSc = {
   Escape:0x01, Digit1:0x02, Digit2:0x03, Digit3:0x04, Digit4:0x05, Digit5:0x06, Digit6:0x07,
-  Digit7:0x08, Digit8:0x09, Digit9:0x0A, Digit0:0x0B, Minus:0x0C, Equal:0x0D, Backspace:0x14, Tab:0x0F,
+  Digit7:0x08, Digit8:0x09, Digit9:0x0A, Digit0:0x0B, Minus:0x0C, Equal:0x0D, Backspace:0x0E, Tab:0x0F,
   KeyQ:0x10, KeyW:0x11, KeyE:0x12, KeyR:0x13, KeyT:0x14, KeyY:0x15, KeyU:0x16, KeyI:0x17, KeyO:0x18,
   KeyP:0x19, BracketLeft:0x1A, BracketRight:0x1B, Enter:0x1C, ControlLeft:0x1D, KeyA:0x1E, KeyS:0x1F,
   KeyD:0x20, KeyF:0x21, KeyG:0x22, KeyH:0x23, KeyJ:0x24, KeyK:0x25, KeyL:0x26, Semicolon:0x27,
@@ -100,9 +107,11 @@ window.addEventListener('DOMContentLoaded', function() {
   logEl = document.getElementById('log');
   statusEl = document.getElementById('status');
   pwEl = document.getElementById('pw');
+  monSel = document.getElementById('monitor');
   document.getElementById('connect').addEventListener('click', connect);
   pwEl.addEventListener('keydown', function(e) { if (e.key === 'Enter') connect(); });
-
+  monSel.addEventListener('change', function() { send({t:'monitor', index: parseInt(monSel.value)}); });
+  window.addEventListener('resize', fitCanvas);
   window.addEventListener('keydown', function(e) {
     if (!authed) return;
     const sc = codeToSc[e.code];

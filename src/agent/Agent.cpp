@@ -8,7 +8,6 @@
 #include <objbase.h>
 #include <shlwapi.h>
 
-#include <mfapi.h>
 
 #include <chrono>
 #include <string>
@@ -64,9 +63,6 @@ int Agent::Run() {
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-    // Media Foundation 必须调用 MFStartup 后才能使用 MF API(MFTEnumEx/MFCreateMediaType 等),
-    // 否则编码器协商会静默失败(SetInputType/SetOutputType 返回错误)。
-    MFStartup(MF_VERSION);
 
     cfg_ = LoadOrCreateConfig();
     log::Info("agent config port=" + std::to_string(cfg_.port) +
@@ -98,7 +94,6 @@ int Agent::Run() {
     }
 
     Stop();
-    MFShutdown();
     CoUninitialize();
     log::Info("agent exit");
     return 0;
@@ -177,10 +172,15 @@ void Agent::CaptureLoop() {
 std::string Agent::MakeCfgJson() const {
     nlohmann::json j;
     j["t"] = "cfg";
-    j["codec"] = encoder_ ? encoder_->CodecString() : std::string("avc3.42E01E");
+    j["codec"] = encoder_ ? encoder_->CodecString() : std::string("jpeg");
     j["w"] = deskWidth_;
     j["h"] = deskHeight_;
     j["fps"] = cfg_.fps;
+    auto mons = nlohmann::json::array();
+    for (const auto& m : capture_.Monitors()) {
+        mons.push_back({{"index", m.index}, {"name", m.name}, {"w", m.w}, {"h", m.h}});
+    }
+    j["monitors"] = mons;
     return j.dump();
 }
 
@@ -208,6 +208,12 @@ void Agent::OnMessage(const std::string& msg) {
     } else if (t == "wheel") {
         const int delta = j.value("delta", 0);
         Input::SendWheel(delta);
+    } else if (t == "monitor") {
+        const int idx = j.value("index", -1);
+        capture_.SetMonitor(idx);
+        log::Info("monitor switched to idx=" + std::to_string(idx));
+        deskWidth_ = 0;
+        deskHeight_ = 0;
     }
 }
 

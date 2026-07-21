@@ -48,7 +48,7 @@ target_link_libraries(RemoteAssist PRIVATE
     ws2_32
     ole32 oleaut32
     d3d11 dxgi dxguid
-    mfplat mfreadwrite mfuuid strmiids
+    windowscodecs
     shlwapi
 )
 
