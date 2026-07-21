@@ -189,12 +189,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (portStr[0]) { g_cfg.port = atoi(portStr); SaveConfig(g_cfg); }
             }
             if (InstallService()) {
-                MessageBoxW(hwnd, L"服务安装成功,正在启动...", L"RemoteAssist", MB_OK);
                 StartServiceS();
+                Sleep(1000);
+                if (ServiceRunning()) {
+                    wchar_t msg[256];
+                    swprintf_s(msg, 256, L"服务安装并启动成功!浏览器打开 http://localhost:%d 访问。", g_cfg.port);
+                    MessageBoxW(hwnd, msg, L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    wchar_t msg[256];
+                    swprintf_s(msg, 256, L"服务已安装但启动失败(错误码 %d)。请查看 exe 目录下 logs/ 的日志。", (int)GetLastError());
+                    MessageBoxW(hwnd, msg, L"RemoteAssist", MB_OK | MB_ICONWARNING);
+                }
+                UpdateStatus();
             } else {
-                MessageBoxW(hwnd, L"安装失败,请以管理员身份运行", L"RemoteAssist", MB_OK | MB_ICONWARNING);
+                wchar_t msg[256];
+                swprintf_s(msg, 256, L"安装服务失败(错误码 %d)。请右键 exe 以管理员身份运行。", (int)GetLastError());
+                MessageBoxW(hwnd, msg, L"RemoteAssist", MB_OK | MB_ICONWARNING);
             }
-            UpdateStatus();
             break;
         case IDC_SVC_UNINSTALL:
             UninstallService();

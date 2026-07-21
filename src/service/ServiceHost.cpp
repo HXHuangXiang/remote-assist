@@ -48,6 +48,9 @@ void ServiceWorker() {
     log::Init(LogDir());
     log::Info("service worker start");
 
+    // 先报告 RUNNING,避免 SCM 超时报 1053。
+    ReportState(SERVICE_RUNNING);
+
     auto cfg = LoadOrCreateConfig();
     log::Info("config port=" + std::to_string(cfg.port) +
               " fps=" + std::to_string(cfg.fps) +
@@ -57,8 +60,6 @@ void ServiceWorker() {
     // agent 内部会重新 OpenInputDesktop 跟随当前桌面(锁屏/解锁切换)。
     LaunchAgentInConsoleSession(g_state.exePath);
     LaunchTrayInConsoleSession(g_state.exePath);
-
-    ReportState(SERVICE_RUNNING);
 
     // MVP 监控循环:每 5 秒检查停止请求;agent 自然死亡由后续迭代加重启。
     while (!g_state.stopRequested.load()) {
@@ -99,4 +100,3 @@ int RunAsService() {
 }
 
 }  // namespace remote_assist
-
