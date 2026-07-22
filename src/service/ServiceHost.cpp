@@ -6,6 +6,7 @@
 #include "service/ProcessLauncher.h"
 
 #include <windows.h>
+#include <sddl.h>
 #include <wtsapi32.h>
 
 #include <atomic>
@@ -20,6 +21,10 @@ constexpr DWORD kMonitorIntervalMs = 2000;
 constexpr DWORD kAgentStopTimeoutMs = 8000;
 constexpr DWORD kTrayStopTimeoutMs = 1000;
 constexpr DWORD kServiceStopMarginMs = 2000;
+// Service 创建的全局事件只允许 LocalSystem/管理员修改；交互式用户仅可同步等待
+// readyEvent，供配置窗口展示状态。这样普通本地进程不能伪造就绪或随意停止 Agent。
+constexpr wchar_t kAgentEventSddl[] =
+    L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)";
 
 struct ServiceState {
     SERVICE_STATUS status{};
@@ -128,6 +133,26 @@ bool IsNamedMutexHeld(const wchar_t* name) {
 }
 
 void StopChild(HANDLE& process, const char* role, DWORD timeoutMs);
+
+HANDLE CreateProtectedAgentEvent(const wchar_t* name) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            kAgentEventSddl, SDDL_REVISION_1, &descriptor, nullptr)) {
+        log::Error("agent event security descriptor creation failed: " +
+                   std::to_string(GetLastError()));
+        return nullptr;
+    }
+    SECURITY_ATTRIBUTES attributes{};
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = descriptor;
+    const HANDLE event = CreateEventW(&attributes, TRUE, FALSE, name);
+    const DWORD error = event ? ERROR_SUCCESS : GetLastError();
+    LocalFree(descriptor);
+    if (!event) {
+        log::Error("CreateEvent(agent) failed: " + std::to_string(error));
+    }
+    return event;
+}
 
 void EnsureAgent() {
     if (g_state.stopRequested.load()) {
@@ -264,17 +289,15 @@ void ServiceWorker() {
               " fps=" + std::to_string(cfg.fps) +
               " bitrate=" + std::to_string(cfg.bitrate));
 
-    g_state.agentStopEvent = CreateEventW(nullptr, TRUE, FALSE,
-                                          runtime::kAgentStopEventName);
+    g_state.agentStopEvent = CreateProtectedAgentEvent(runtime::kAgentStopEventName);
     if (!g_state.agentStopEvent) {
-        log::Error("CreateEvent(agent stop) failed: " + std::to_string(GetLastError()));
+        log::Error("CreateEvent(agent stop) failed");
     } else {
         ResetEvent(g_state.agentStopEvent);
     }
-    g_state.agentReadyEvent = CreateEventW(nullptr, TRUE, FALSE,
-                                           runtime::kAgentReadyEventName);
+    g_state.agentReadyEvent = CreateProtectedAgentEvent(runtime::kAgentReadyEventName);
     if (!g_state.agentReadyEvent) {
-        log::Warn("CreateEvent(agent ready) failed: " + std::to_string(GetLastError()));
+        log::Warn("CreateEvent(agent ready) failed");
     } else {
         ResetEvent(g_state.agentReadyEvent);
     }
