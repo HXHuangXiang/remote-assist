@@ -16,9 +16,6 @@ namespace remote_assist {
 
 namespace {
 
-constexpr int kMaxStreamWidth = 1920;
-constexpr int kMaxStreamHeight = 1080;
-
 // 每行错开采样相位，避免固定列的细小变化一直漏检。采样比例约为 1/16，
 // 相比完整 4K 帧的缩放/复制开销可忽略。
 uint64_t FingerprintBgraRegion(const uint8_t* source, size_t sourceStrideBytes,
@@ -116,6 +113,28 @@ void Capture::EnumMonitors() {
     monitors_.clear();
     EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(this));
     log::Info("enumerated " + std::to_string(monitors_.size()) + " monitor(s)");
+}
+
+void Capture::SetMaxOutputSize(int width, int height) {
+    // NV12 要求偶数宽高；所有自适应档位都满足此条件，但在此处归一化以确保后续
+    // CopyRegionToFrame 和 H.264 编码器的契约不被调用方破坏。
+    width = std::max(2, width & ~1);
+    height = std::max(2, height & ~1);
+    if (maxOutputWidth_ == width && maxOutputHeight_ == height) {
+        return;
+    }
+    maxOutputWidth_ = width;
+    maxOutputHeight_ = height;
+    // 下次缩放会按新的目标尺寸重建坐标表；立即清理无用表可避免长期切换档位时
+    // 留下不再使用的大分配。
+    scaleMapSourceWidth_ = 0;
+    scaleMapSourceHeight_ = 0;
+    scaleMapOutputWidth_ = 0;
+    scaleMapOutputHeight_ = 0;
+    scaleMapX_.clear();
+    scaleMapY_.clear();
+    log::Info("capture output cap set to " + std::to_string(maxOutputWidth_) + "x" +
+              std::to_string(maxOutputHeight_));
 }
 
 bool Capture::Init() {
@@ -294,7 +313,7 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     // 未缩放且 NV12 兼容的偶数尺寸可直接借用 staging 映射。原实现会先完整复制
     // 到 CapturedFrame::data，再由编码器读取一次；此路径每帧省去约一张 BGRA 图像
     // 的 CPU 内存带宽（1080p 约 8 MB）。
-    const bool canDirectMap = w <= kMaxStreamWidth && h <= kMaxStreamHeight &&
+    const bool canDirectMap = w <= maxOutputWidth_ && h <= maxOutputHeight_ &&
         (w & 1) == 0 && (h & 1) == 0;
     if (canDirectMap) {
         out.width = w;
@@ -392,8 +411,8 @@ void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                                 int x, int y, int width, int height,
                                 CapturedFrame& out) {
     const double scale = std::min(1.0, std::min(
-        static_cast<double>(kMaxStreamWidth) / width,
-        static_cast<double>(kMaxStreamHeight) / height));
+        static_cast<double>(maxOutputWidth_) / width,
+        static_cast<double>(maxOutputHeight_) / height));
     // NV12/H.264 需要偶数宽高。统一在采集输出处向下取偶数，JPEG 回退也使用
     // 相同尺寸，避免浏览器在编码器切换时发生坐标和画布尺寸跳变。
     int outputWidth = std::max(1, static_cast<int>(width * scale));

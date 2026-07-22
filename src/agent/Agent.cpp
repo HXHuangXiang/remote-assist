@@ -68,6 +68,23 @@ struct CaptureLoopStats {
     uint64_t encodeTimeMs = 0;
 };
 
+// 输出上限按网络状态逐级调整。Capture 会始终保持原始宽高比，因此超宽屏、4:3
+// 等非 16:9 桌面也不会被拉伸；实际尺寸仍通过 cfg 消息通知浏览器。
+struct StreamResolutionCap {
+    int width;
+    int height;
+};
+
+constexpr StreamResolutionCap kStreamResolutionCaps[] = {
+    {1920, 1080},
+    {1600, 900},
+    {1280, 720},
+    {960, 540},
+    {640, 360},
+};
+constexpr int kStreamResolutionCapCount =
+    static_cast<int>(sizeof(kStreamResolutionCaps) / sizeof(kStreamResolutionCaps[0]));
+
 // 直接映射的 DXGI staging texture 只在“本轮采集 -> 本轮编码”之间有效。这个 guard
 // 保证初始化失败、异常返回或未来新增的 continue 分支都不会遗留 Map 状态。
 class CapturedFrameLease {
@@ -347,9 +364,26 @@ void Agent::CaptureLoop() {
     int adaptiveFps = cfg_.fps;
     int adaptiveBitrate = cfg_.bitrate;
     bool adaptiveBitrateAvailable = true;
+    int adaptiveResolutionTier = 0;
+    int congestionWindows = 0;
+    int healthyResolutionWindows = 0;
     // 采集结果在相邻帧间复用容量。1920x1080 的 BGRA 帧约 8MB，若每轮都创建
     // 局部 CapturedFrame 会触发持续的大块堆分配和释放，直接放大卡顿。
     CapturedFrame frame;
+
+    auto setResolutionTier = [&](int tier) {
+        tier = std::clamp(tier, 0, kStreamResolutionCapCount - 1);
+        if (tier == adaptiveResolutionTier) {
+            return;
+        }
+        const StreamResolutionCap previous = kStreamResolutionCaps[adaptiveResolutionTier];
+        adaptiveResolutionTier = tier;
+        const StreamResolutionCap current = kStreamResolutionCaps[adaptiveResolutionTier];
+        capture_.SetMaxOutputSize(current.width, current.height);
+        log::Info("adaptive stream cap " + std::to_string(previous.width) + "x" +
+                  std::to_string(previous.height) + " -> " +
+                  std::to_string(current.width) + "x" + std::to_string(current.height));
+    };
 
     auto logMetricsIfDue = [&](std::chrono::steady_clock::time_point now) {
         if (now < nextMetricsLog) {
@@ -412,7 +446,10 @@ void Agent::CaptureLoop() {
                       " send_fail=" + std::to_string(sendFailures) +
                       " h264_resync=" + std::to_string(h264Resyncs) +
                       " stream_fps=" + std::to_string(adaptiveFps) +
-                      " stream_bitrate=" + std::to_string(adaptiveBitrate));
+                      " stream_bitrate=" + std::to_string(adaptiveBitrate) +
+                      " stream_cap=" +
+                      std::to_string(kStreamResolutionCaps[adaptiveResolutionTier].width) + "x" +
+                      std::to_string(kStreamResolutionCaps[adaptiveResolutionTier].height));
         }
         metrics = {};
         broadcasterStatsBase = broadcasterStats;
@@ -443,6 +480,8 @@ void Agent::CaptureLoop() {
             (ackSamples != 0 && averageAckMs >= 120);
         const bool healthy = ackSamples >= 4 && averageAckMs <= 65 && ackTimeouts == 0 &&
             h264Resyncs == 0 && sendFailures == 0;
+        const bool severeCongestion = ackTimeouts != 0 || h264Resyncs != 0 ||
+            sendFailures != 0;
         int nextFps = adaptiveFps;
         int nextBitrate = adaptiveBitrate;
         const int minimumBitrate = std::min(cfg_.bitrate,
@@ -457,6 +496,30 @@ void Agent::CaptureLoop() {
             nextBitrate = std::min(cfg_.bitrate,
                 adaptiveBitrate + std::max(100'000, cfg_.bitrate / 20));
         }
+
+        if (congested) {
+            healthyResolutionWindows = 0;
+            ++congestionWindows;
+            // 帧率与码率先立即退避；持续两秒或发生超时/重同步时才切换分辨率，
+            // 避免短暂的浏览器卡顿反复重建 H.264 MFT。
+            if ((severeCongestion || congestionWindows >= 2) &&
+                adaptiveResolutionTier + 1 < kStreamResolutionCapCount) {
+                setResolutionTier(adaptiveResolutionTier + 1);
+                congestionWindows = 0;
+            }
+        } else if (healthy) {
+            congestionWindows = 0;
+            ++healthyResolutionWindows;
+            // 恢复分辨率比恢复 FPS/码率更保守，连续健康五秒才上调一档。
+            if (healthyResolutionWindows >= 5 && adaptiveResolutionTier > 0) {
+                setResolutionTier(adaptiveResolutionTier - 1);
+                healthyResolutionWindows = 0;
+            }
+        } else {
+            congestionWindows = 0;
+            healthyResolutionWindows = 0;
+        }
+
         if (nextFps != adaptiveFps) {
             log::Info("adaptive stream fps " + std::to_string(adaptiveFps) + " -> " +
                       std::to_string(nextFps) + " ack_avg_ms=" +
@@ -525,6 +588,11 @@ void Agent::CaptureLoop() {
                 adaptiveFps = cfg_.fps;
                 streamFps_.store(adaptiveFps);
             }
+            if (adaptiveResolutionTier != 0) {
+                setResolutionTier(0);
+            }
+            congestionWindows = 0;
+            healthyResolutionWindows = 0;
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }

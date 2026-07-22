@@ -75,6 +75,9 @@ public:
         selectedMonitor_ = (index >= -1 && index < static_cast<int>(monitors_.size())) ? index : -1;
     }
     int SelectedMonitor() const { return selectedMonitor_.load(); }
+    // 仅由采集线程调用。慢链路时降低输出上限可同时缩短缩放、编码和网络发送时间；
+    // 源画面宽高均未超过上限时仍保持原始分辨率。
+    void SetMaxOutputSize(int width, int height);
     // GDI 包含锁屏、DXGI 失效与全部多屏合成路径，采集成本显著高于 DXGI。
     // 仅由采集线程调用，因此无需额外同步。
     bool IsUsingGdi() const { return use_gdi_; }
@@ -126,6 +129,8 @@ private:
 
     int width_ = 0;
     int height_ = 0;
+    int maxOutputWidth_ = 1920;
+    int maxOutputHeight_ = 1080;
     bool use_gdi_ = false;
 
     // 缩放时的相对源坐标表。分辨率稳定时重复使用，避免每帧按像素执行整数除法。

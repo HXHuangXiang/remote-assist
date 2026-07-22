@@ -30,5 +30,5 @@
 
 ## 配置文件
 
-exe 同目录的 config.json:port、password_hash、salt、password_iterations、bitrate、fps；日志位于 exe 同目录 logs/，按 service.log、agent.log、tray.log、setup.log 分开写入，避免多进程抢写同一日志。agent 在有控制端时每 10 秒记录捕获、编码、发送和帧确认统计，用于定位卡顿；fps 与 bitrate 是配置上限，Agent 会根据浏览器 ACK 端到端延迟、发送失败与 H.264 重同步状态在 5 FPS 到该上限间自适应降低帧率，并在 MFT 支持时同步下调码率，避免慢网络不断堆积增量帧。新配置使用 PBKDF2-SHA256(210000 次)保存密码哈希；缺少 password_iterations 的历史配置继续按 SHA-256(salt + token) 校验，避免升级后密码失效。
+exe 同目录的 config.json:port、password_hash、salt、password_iterations、bitrate、fps；日志位于 exe 同目录 logs/，按 service.log、agent.log、tray.log、setup.log 分开写入，避免多进程抢写同一日志。agent 在有控制端时每 10 秒记录捕获、编码、发送和帧确认统计，用于定位卡顿；fps 与 bitrate 是配置上限，Agent 会根据浏览器 ACK 端到端延迟、发送失败与 H.264 重同步状态在 5 FPS 到该上限间自适应降低帧率，并在 MFT 支持时同步下调码率；若拥塞持续，则按 1080p、900p、720p、540p、360p 的输出上限逐级缩小画面，网络恢复后再保守提升，避免慢网络不断堆积增量帧。新配置使用 PBKDF2-SHA256(210000 次)保存密码哈希；缺少 password_iterations 的历史配置继续按 SHA-256(salt + token) 校验，避免升级后密码失效。
 首次启动生成随机密码与 salt,计算哈希并写回;同时把明文密码写入 .initial-password,供 tray 进程读取展示后删除。首次配置窗口若把随机密码改为自定义密码，会原子更新该一次性提示；后续常规改密会删除残留提示，避免托盘展示旧密码。
