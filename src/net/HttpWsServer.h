@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -54,7 +55,7 @@ public:
     FrameQueueResult BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId,
                                      bool isKeyFrame, uint64_t timestampUs, bool h264);
     void BroadcastText(const std::string& msg);
-    // 浏览器在帧真正绘制（或主动丢弃过期帧）后确认，服务端才会发下一帧。
+    // 浏览器在帧真正绘制（或主动丢弃过期帧）后确认，服务端释放对应的发送窗口。
     void AcknowledgeFrame(uint64_t frameId);
     BroadcasterStats SnapshotStats() const;
     int Count();
@@ -75,9 +76,13 @@ private:
     uint64_t pendingTimestampUs_ = 0;
     bool pendingKeyFrame_ = true;
     uint64_t nextFrameId_ = 1;
-    uint64_t inFlightFrameId_ = 0;
-    std::chrono::steady_clock::time_point inFlightSince_{};
-    bool frameInFlight_ = false;
+    struct InFlightFrame {
+        uint64_t id = 0;
+        std::chrono::steady_clock::time_point sentAt{};
+    };
+    // 两帧窗口允许网络写入、WebCodecs 解码和下一帧传输重叠，避免每帧都完整
+    // 等待一轮浏览器 ACK；仍是严格有界队列，慢客户端不会无限积压。
+    std::deque<InFlightFrame> inFlightFrames_;
     bool stopping_ = false;
     std::thread senderThread_;
 

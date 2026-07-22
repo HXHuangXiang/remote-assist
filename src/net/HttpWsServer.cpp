@@ -14,6 +14,7 @@ namespace {
 // 浏览器收到 WebSocket 二进制帧后还要经历图片解码和 canvas 绘制。仅靠 TCP
 // 写成功无法说明用户已经看到新画面；超时兜底避免旧浏览器或异常连接永久停流。
 constexpr auto kFrameAckTimeout = std::chrono::seconds(1);
+constexpr size_t kMaxFramesInFlight = 2;
 
 // WebSocket handler 可能因为第三方回调、内存分配等异常提前离开。连接一旦已
 // 注册到 broadcaster，就必须在所有退出路径移除，避免发送线程持有悬空指针。
@@ -82,9 +83,7 @@ void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
         pendingStreamId_ = 0;
         pendingTimestampUs_ = 0;
         pendingKeyFrame_ = true;
-        frameInFlight_ = false;
-        inFlightFrameId_ = 0;
-        inFlightSince_ = {};
+        inFlightFrames_.clear();
         frameCv_.notify_all();
     }
 }
@@ -136,10 +135,10 @@ void WsBroadcaster::AcknowledgeFrame(uint64_t frameId) {
         return;
     }
     std::lock_guard<std::mutex> lk(frameMu_);
-    if (frameInFlight_ && inFlightFrameId_ == frameId) {
-        frameInFlight_ = false;
-        inFlightFrameId_ = 0;
-        inFlightSince_ = {};
+    const auto it = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
+        [frameId](const InFlightFrame& frame) { return frame.id == frameId; });
+    if (it != inFlightFrames_.end()) {
+        inFlightFrames_.erase(it);
         acknowledgedFrames_.fetch_add(1, std::memory_order_relaxed);
         frameCv_.notify_one();
     }
@@ -174,9 +173,7 @@ void WsBroadcaster::Stop() {
         pendingStreamId_ = 0;
         pendingTimestampUs_ = 0;
         pendingKeyFrame_ = true;
-        frameInFlight_ = false;
-        inFlightFrameId_ = 0;
-        inFlightSince_ = {};
+        inFlightFrames_.clear();
     }
     frameCv_.notify_all();
     if (senderThread_.joinable()) {
@@ -197,7 +194,7 @@ void WsBroadcaster::SendLoop() {
                 if (stopping_) {
                     return;
                 }
-                if (!frameInFlight_ && !pendingFrame_.empty()) {
+                if (inFlightFrames_.size() < kMaxFramesInFlight && !pendingFrame_.empty()) {
                     frame.swap(pendingFrame_);
                     streamId = pendingStreamId_;
                     pendingStreamId_ = 0;
@@ -206,31 +203,32 @@ void WsBroadcaster::SendLoop() {
                     timestampUs = pendingTimestampUs_;
                     pendingTimestampUs_ = 0;
                     frameId = nextFrameId_++;
-                    frameInFlight_ = true;
-                    inFlightFrameId_ = frameId;
-                    inFlightSince_ = std::chrono::steady_clock::now();
+                    inFlightFrames_.push_back({frameId, std::chrono::steady_clock::now()});
                     break;
                 }
-                if (frameInFlight_) {
-                    const auto deadline = inFlightSince_ + kFrameAckTimeout;
+                if (!inFlightFrames_.empty()) {
+                    const auto deadline = inFlightFrames_.front().sentAt + kFrameAckTimeout;
                     if (frameCv_.wait_until(lk, deadline, [this] {
-                            return stopping_ || !frameInFlight_;
+                            return stopping_ ||
+                                (inFlightFrames_.size() < kMaxFramesInFlight &&
+                                 !pendingFrame_.empty());
                         })) {
                         continue;
                     }
-                    // 连接可能已半开，或者控制端页面在图片解码中崩溃。允许使用
-                    // 最新待发送帧继续尝试，且帧 id 单调递增避免迟到确认误释放新帧。
-                    if (frameInFlight_) {
-                        log::Warn("frame ack timed out, replacing in-flight frame");
+                    // 连接可能已半开，或者控制端页面在图片解码中崩溃。释放最早
+                    // 超时帧的一个窗口配额；迟到确认按 id 匹配，不会影响新帧。
+                    if (!inFlightFrames_.empty() &&
+                        std::chrono::steady_clock::now() >=
+                            inFlightFrames_.front().sentAt + kFrameAckTimeout) {
+                        log::Warn("frame ack timed out, releasing one in-flight slot");
                         ackTimeouts_.fetch_add(1, std::memory_order_relaxed);
-                        frameInFlight_ = false;
-                        inFlightFrameId_ = 0;
-                        inFlightSince_ = {};
+                        inFlightFrames_.pop_front();
                     }
                     continue;
                 }
                 frameCv_.wait(lk, [this] {
-                    return stopping_ || frameInFlight_ || !pendingFrame_.empty();
+                    return stopping_ ||
+                        (inFlightFrames_.size() < kMaxFramesInFlight && !pendingFrame_.empty());
                 });
             }
         }
@@ -254,10 +252,10 @@ void WsBroadcaster::SendLoop() {
         if (!sent) {
             sendFailures_.fetch_add(1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> frameLock(frameMu_);
-            if (frameInFlight_ && inFlightFrameId_ == frameId) {
-                frameInFlight_ = false;
-                inFlightFrameId_ = 0;
-                inFlightSince_ = {};
+            const auto it = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
+                [frameId](const InFlightFrame& inFlight) { return inFlight.id == frameId; });
+            if (it != inFlightFrames_.end()) {
+                inFlightFrames_.erase(it);
                 frameCv_.notify_one();
             }
         }
