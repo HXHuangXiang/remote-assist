@@ -6,6 +6,7 @@
 #include "service/ProcessLauncher.h"
 
 #include <windows.h>
+#include <wtsapi32.h>
 
 #include <atomic>
 #include <string>
@@ -28,6 +29,8 @@ struct ServiceState {
     HANDLE trayProcess = nullptr;
     HANDLE agentStopEvent = nullptr;
     HANDLE childJob = nullptr;
+    DWORD agentSessionId = WTS_INVALID_SESSION_ID;
+    DWORD traySessionId = WTS_INVALID_SESSION_ID;
 };
 ServiceState g_state;
 
@@ -95,28 +98,70 @@ void AddChildToJob(HANDLE process, const char* role) {
 }
 
 void EnsureAgent() {
-    if (IsChildRunning(g_state.agentProcess, "agent")) {
+    if (g_state.stopRequested.load()) {
+        return;
+    }
+    const DWORD targetSessionId = FindActiveInteractiveSessionId();
+    const bool agentRunning = IsChildRunning(g_state.agentProcess, "agent");
+    if (agentRunning && (targetSessionId == WTS_INVALID_SESSION_ID ||
+                         g_state.agentSessionId == targetSessionId)) {
+        return;
+    }
+    if (agentRunning) {
+        log::Info("active session changed, restarting agent from session=" +
+                  std::to_string(g_state.agentSessionId) + " to session=" +
+                  std::to_string(targetSessionId));
+        if (g_state.agentStopEvent) {
+            SetEvent(g_state.agentStopEvent);
+        }
+        StopChild(g_state.agentProcess, "agent", kAgentStopTimeoutMs);
+    }
+    g_state.agentSessionId = WTS_INVALID_SESSION_ID;
+    if (targetSessionId == WTS_INVALID_SESSION_ID) {
         return;
     }
     if (!g_state.agentStopEvent) {
         return;
     }
+    ResetEvent(g_state.agentStopEvent);
 
     HANDLE process = nullptr;
     if (LaunchAgentInConsoleSession(g_state.exePath, &process)) {
         g_state.agentProcess = process;
+        DWORD childSessionId = targetSessionId;
+        ProcessIdToSessionId(GetProcessId(process), &childSessionId);
+        g_state.agentSessionId = childSessionId;
         AddChildToJob(process, "agent");
     }
 }
 
 void EnsureTray() {
-    if (IsChildRunning(g_state.trayProcess, "tray")) {
+    if (g_state.stopRequested.load()) {
+        return;
+    }
+    const DWORD targetSessionId = FindActiveInteractiveSessionId();
+    const bool trayRunning = IsChildRunning(g_state.trayProcess, "tray");
+    if (trayRunning && (targetSessionId == WTS_INVALID_SESSION_ID ||
+                        g_state.traySessionId == targetSessionId)) {
+        return;
+    }
+    if (trayRunning) {
+        log::Info("active session changed, restarting tray from session=" +
+                  std::to_string(g_state.traySessionId) + " to session=" +
+                  std::to_string(targetSessionId));
+        StopChild(g_state.trayProcess, "tray", kTrayStopTimeoutMs);
+    }
+    g_state.traySessionId = WTS_INVALID_SESSION_ID;
+    if (targetSessionId == WTS_INVALID_SESSION_ID) {
         return;
     }
 
     HANDLE process = nullptr;
     if (LaunchTrayInConsoleSession(g_state.exePath, &process)) {
         g_state.trayProcess = process;
+        DWORD childSessionId = targetSessionId;
+        ProcessIdToSessionId(GetProcessId(process), &childSessionId);
+        g_state.traySessionId = childSessionId;
         AddChildToJob(process, "tray");
     }
 }
@@ -190,6 +235,8 @@ void ServiceWorker() {
     }
     StopChild(g_state.agentProcess, "agent", kAgentStopTimeoutMs);
     StopChild(g_state.trayProcess, "tray", kTrayStopTimeoutMs);
+    g_state.agentSessionId = WTS_INVALID_SESSION_ID;
+    g_state.traySessionId = WTS_INVALID_SESSION_ID;
     if (g_state.childJob) {
         CloseHandle(g_state.childJob);
         g_state.childJob = nullptr;
