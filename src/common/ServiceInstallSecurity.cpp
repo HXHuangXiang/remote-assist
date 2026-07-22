@@ -69,7 +69,9 @@ bool CreateKnownSid(WELL_KNOWN_SID_TYPE type, std::array<BYTE, SECURITY_MAX_SID_
     return true;
 }
 
-bool IsWellKnownSid(PSID sid, WELL_KNOWN_SID_TYPE type) {
+// 避免与 Windows SDK 的全局 IsWellKnownSid 同名。这里需要的是“该 SID 是否等于
+// 指定已知 SID”，而不是 SDK API 的“它是否属于任何已知 SID”语义。
+bool IsExpectedWellKnownSid(PSID sid, WELL_KNOWN_SID_TYPE type) {
     if (!sid || !IsValidSid(sid)) {
         return false;
     }
@@ -122,14 +124,14 @@ public:
         if (!sid || !IsValidSid(sid)) {
             return false;
         }
-        if (IsWellKnownSid(sid, WinLocalSystemSid) ||
-            IsWellKnownSid(sid, WinBuiltinAdministratorsSid)) {
+        if (IsExpectedWellKnownSid(sid, WinLocalSystemSid) ||
+            IsExpectedWellKnownSid(sid, WinBuiltinAdministratorsSid)) {
             return true;
         }
         // 允许当前已提升的管理员帐户自身拥有安装目录。管理员本身已经具备提升
         // 权限，不属于本检查要阻止的“普通帐户可改写高权限服务”情形。
         return currentUserIsAdministrator_ && !userSid_.empty() &&
-            EqualSid(sid, userSid_.data()) != FALSE;
+            EqualSid(sid, reinterpret_cast<PSID>(const_cast<BYTE*>(userSid_.data()))) != FALSE;
     }
 
 private:
