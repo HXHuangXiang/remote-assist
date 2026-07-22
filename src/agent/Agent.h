@@ -50,6 +50,9 @@ private:
     std::atomic<int> deskWidth_{0};
     std::atomic<int> deskHeight_{0};
     std::atomic<bool> frameResetRequested_{false};
+    // 断连回调由 WebSocket 工作线程触发；质量参数只能由采集线程操作，因此用该标志
+    // 请求其在下一轮恢复用户配置上限。
+    std::atomic<bool> qualityResetRequested_{false};
     // 每次编码尺寸变化时递增。控制端据此丢弃异步解码完成的旧尺寸画面。
     std::atomic<uint64_t> streamId_{0};
     // MakeCfgJson 可在 WebSocket 线程调用，不能直接读取 capture 线程持有的编码器。

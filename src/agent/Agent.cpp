@@ -391,6 +391,46 @@ void Agent::CaptureLoop() {
                   std::to_string(current.width) + "x" + std::to_string(current.height));
     };
 
+    // 自适应码率是按“当前控制端”的链路质量得出的。控制端断开后若直接保留低码率，
+    // 下一台网络正常的电脑会长时间看到低质量画面；空闲期重置不影响正在播放的流。
+    auto restoreBitrateForNextController = [&] {
+        if (adaptiveBitrate == cfg_.bitrate) {
+            return;
+        }
+        const int previousBitrate = adaptiveBitrate;
+        bool reinitializeEncoder = false;
+        if (encoder_ && encoder_->IsH264()) {
+            if (!adaptiveBitrateAvailable || !encoder_->UpdateBitrate(cfg_.bitrate)) {
+                // 当前 MFT 无法把运行期码率升回配置上限时，在没有控制端的安全窗口
+                // 丢弃它；下一张画面会用配置码率重建编码器。
+                reinitializeEncoder = true;
+                adaptiveBitrateAvailable = true;
+            }
+        }
+        adaptiveBitrate = cfg_.bitrate;
+        if (reinitializeEncoder) {
+            encoder_->Release();
+            encoder_.reset();
+            encoderReady_ = false;
+            log::Info("adaptive bitrate reset will reinitialize H.264 encoder");
+        }
+        log::Info("adaptive stream bitrate reset " + std::to_string(previousBitrate) + " -> " +
+                  std::to_string(adaptiveBitrate));
+    };
+
+    auto restoreQualityForNextController = [&] {
+        if (adaptiveFps != cfg_.fps) {
+            adaptiveFps = cfg_.fps;
+            streamFps_.store(adaptiveFps);
+        }
+        restoreBitrateForNextController();
+        if (adaptiveResolutionTier != 0) {
+            setResolutionTier(0);
+        }
+        congestionWindows = 0;
+        healthyResolutionWindows = 0;
+    };
+
     auto logMetricsIfDue = [&](std::chrono::steady_clock::time_point now) {
         if (now < nextMetricsLog) {
             return;
@@ -590,19 +630,16 @@ void Agent::CaptureLoop() {
             // 编码器仍会保留上一控制端的参考帧；新控制端绝不能从 delta 帧接续。
             streamKeyFrameRequired_ = true;
             lastFrameSent_ = {};
-            if (adaptiveFps != cfg_.fps) {
-                adaptiveFps = cfg_.fps;
-                streamFps_.store(adaptiveFps);
-            }
-            if (adaptiveResolutionTier != 0) {
-                setResolutionTier(0);
-            }
-            congestionWindows = 0;
-            healthyResolutionWindows = 0;
+            restoreQualityForNextController();
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
 
+        // 控制端可能在 CaptureLoop 看到“零客户端”前就快速重连；断连回调仍会请求
+        // 在采集线程安全地恢复上一位控制者留下的自适应质量状态。
+        if (qualityResetRequested_.exchange(false)) {
+            restoreQualityForNextController();
+        }
         if (frameResetRequested_.exchange(false)) {
             firstFrame_ = true;
             streamKeyFrameRequired_ = true;
@@ -891,8 +928,9 @@ void Agent::OnControllerDisconnected() {
     // 线程已经绑定了对应 desktop，可直接释放远端残留的按下状态。
     Input::ReleaseAll();
     // 即使控制端快速重连，以 CaptureLoop 未观察到“零客户端”为例，也要确保
-    // 下一帧从 IDR 开始。
+    // 下一帧从 IDR 开始，并恢复下一位控制者的质量上限。
     frameResetRequested_.store(true);
+    qualityResetRequested_.store(true);
 }
 
 }  // namespace remote_assist
