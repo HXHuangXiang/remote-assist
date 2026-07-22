@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
@@ -31,6 +32,96 @@ constexpr int kMinBitrate = 100'000;
 constexpr int kMaxBitrate = 50'000'000;
 constexpr int kPasswordIterations = 210'000;
 constexpr int kMaxPasswordIterations = 1'000'000;
+constexpr DWORD kConfigLockTimeoutMs = 5000;
+constexpr DWORD kConfigLockRetryMs = 50;
+
+std::atomic<uint64_t> g_tempFileSequence{0};
+
+// service 在 Session 0，配置窗口/托盘在交互会话，单靠进程内 mutex 无法避免两边
+// 同时创建首份配置或覆盖对方刚保存的端口/密码。以 exe 同目录的锁文件建立跨会话
+// 排他锁；锁句柄关闭时系统会自动释放，即使调用进程崩溃也不会永久阻塞后续修复。
+class ConfigFileLock {
+public:
+    ConfigFileLock() = default;
+    ~ConfigFileLock() {
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+        }
+    }
+
+    ConfigFileLock(const ConfigFileLock&) = delete;
+    ConfigFileLock& operator=(const ConfigFileLock&) = delete;
+
+    bool Acquire() {
+        const std::wstring dir = ConfigDir();
+        if (dir.empty()) {
+            return false;
+        }
+        const std::wstring lockPath = dir + L"\\.config.lock";
+        const ULONGLONG deadline = GetTickCount64() + kConfigLockTimeoutMs;
+        for (;;) {
+            handle_ = CreateFileW(lockPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+            if (handle_ != INVALID_HANDLE_VALUE) {
+                return true;
+            }
+            const DWORD error = GetLastError();
+            if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) {
+                return false;
+            }
+            if (GetTickCount64() >= deadline) {
+                SetLastError(ERROR_TIMEOUT);
+                return false;
+            }
+            Sleep(kConfigLockRetryMs);
+        }
+    }
+
+private:
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+
+std::wstring MakeUniqueTempPath(const std::wstring& targetPath) {
+    const uint64_t sequence = g_tempFileSequence.fetch_add(1, std::memory_order_relaxed);
+    return targetPath + L"." + std::to_wstring(GetCurrentProcessId()) + L"." +
+        std::to_wstring(GetTickCount64()) + L"." + std::to_wstring(sequence) + L".tmp";
+}
+
+bool WriteUtf8FileAndFlush(const std::wstring& path, const std::string& contents) {
+    if (contents.size() > MAXDWORD) {
+        SetLastError(ERROR_FILE_TOO_LARGE);
+        return false;
+    }
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    bool ok = true;
+    size_t written = 0;
+    while (written < contents.size()) {
+        const DWORD remaining = static_cast<DWORD>(std::min<size_t>(
+            contents.size() - written, MAXDWORD));
+        DWORD chunkWritten = 0;
+        if (!WriteFile(file, contents.data() + written, remaining, &chunkWritten, nullptr) ||
+            chunkWritten == 0) {
+            ok = false;
+            break;
+        }
+        written += chunkWritten;
+    }
+    if (ok && !FlushFileBuffers(file)) {
+        ok = false;
+    }
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(file);
+    if (!ok) {
+        DeleteFileW(path.c_str());
+        SetLastError(error);
+    }
+    return ok;
+}
 
 int HexValue(char ch) {
     if (ch >= '0' && ch <= '9') return ch - '0';
@@ -167,20 +258,18 @@ bool WriteConfigAtomically(const Config& cfg) {
     if (path.empty()) {
         return false;
     }
-    const std::wstring tempPath = path + L".tmp";
-    {
-        std::ofstream f(tempPath, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            return false;
-        }
-        f << j.dump(2);
-        f.flush();
-        if (!f) {
-            return false;
-        }
+    const std::wstring tempPath = MakeUniqueTempPath(path);
+    if (!WriteUtf8FileAndFlush(tempPath, j.dump(2))) {
+        return false;
     }
-    return MoveFileExW(tempPath.c_str(), path.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    if (MoveFileExW(tempPath.c_str(), path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return true;
+    }
+    const DWORD error = GetLastError();
+    DeleteFileW(tempPath.c_str());
+    SetLastError(error);
+    return false;
 }
 
 std::wstring InitialPasswordHintPath() {
@@ -198,19 +287,9 @@ bool WriteInitialPasswordHint(const std::string& password) {
     if (path.empty()) {
         return false;
     }
-    const std::wstring tempPath = path + L".tmp";
-    DeleteFileW(tempPath.c_str());
-    {
-        std::ofstream f(tempPath, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            return false;
-        }
-        f.write(password.data(), static_cast<std::streamsize>(password.size()));
-        f.flush();
-        if (!f) {
-            DeleteFileW(tempPath.c_str());
-            return false;
-        }
+    const std::wstring tempPath = MakeUniqueTempPath(path);
+    if (!WriteUtf8FileAndFlush(tempPath, password)) {
+        return false;
     }
     if (MoveFileExW(tempPath.c_str(), path.c_str(),
                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -268,6 +347,11 @@ std::wstring ConfigFilePath() {
 
 Config LoadOrCreateConfig() {
     Config cfg;
+    ConfigFileLock configLock;
+    if (!configLock.Acquire()) {
+        log::Error("config lock acquisition failed: " + std::to_string(GetLastError()));
+        return cfg;
+    }
     const std::wstring path = ConfigFilePath();
     if (path.empty()) {
         log::Error("config path resolution failed");
@@ -347,6 +431,11 @@ bool VerifyPassword(const Config& cfg, const std::string& token) {
 }
 
 bool SaveConfig(const Config& cfg) {
+    ConfigFileLock configLock;
+    if (!configLock.Acquire()) {
+        log::Error("config lock acquisition failed: " + std::to_string(GetLastError()));
+        return false;
+    }
     if (!IsConfigValid(cfg) || !WriteConfigAtomically(cfg)) {
         log::Error("config save failed");
         return false;
@@ -359,10 +448,16 @@ bool SetPassword(Config& cfg, const std::string& password) {
         log::Warn("password update rejected: empty password");
         return false;
     }
+    ConfigFileLock configLock;
+    if (!configLock.Acquire()) {
+        log::Error("config lock acquisition failed: " + std::to_string(GetLastError()));
+        return false;
+    }
     if (!IsHex(cfg.salt, 32)) cfg.salt = GenRandomHex(16);
     cfg.passwordIterations = kPasswordIterations;
     cfg.passwordHash = Pbkdf2Sha256Hex(cfg.salt, password, cfg.passwordIterations);
-    if (!SaveConfig(cfg)) {
+    if (!IsConfigValid(cfg) || !WriteConfigAtomically(cfg)) {
+        log::Error("config save failed");
         return false;
     }
 
