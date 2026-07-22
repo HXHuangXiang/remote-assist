@@ -238,6 +238,14 @@ void WsBroadcaster::AcknowledgeFrame(uint64_t frameId) {
     const auto it = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
         [frameId](const InFlightFrame& frame) { return frame.id == frameId; });
     if (it != inFlightFrames_.end()) {
+        // 二进制负载尚在 send 调用中时，先保留 ACK。发送线程会在真正完成写入
+        // 后处理它，避免把写入耗时算进浏览器端 ACK 延迟，也避免 ACK 丢失导致
+        // 后续白白等一个完整超时窗口。
+        if (!it->writeCompleted) {
+            it->ackedDuringWrite = true;
+            frameCv_.notify_all();
+            return;
+        }
         const auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - it->sentAt).count();
         inFlightFrames_.erase(it);
@@ -309,13 +317,17 @@ void WsBroadcaster::SendLoop() {
                     return;
                 }
                 const auto now = std::chrono::steady_clock::now();
-                if (!inFlightFrames_.empty() &&
-                    now >= inFlightFrames_.front().sentAt + kFrameAckTimeout) {
+                const auto expired = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
+                    [now](const InFlightFrame& frame) {
+                        return frame.writeCompleted &&
+                            now >= frame.sentAt + kFrameAckTimeout;
+                    });
+                if (expired != inFlightFrames_.end()) {
                     // 即使持续有 cursor 消息，也必须按时释放超时帧窗口；否则高频
                     // 指针移动会让 H.264 信用窗口永久卡在满载状态。
                     log::Warn("frame ack timed out, releasing one in-flight slot");
                     ackTimeouts_.fetch_add(1, std::memory_order_relaxed);
-                    inFlightFrames_.pop_front();
+                    inFlightFrames_.erase(expired);
                     continue;
                 }
                 if (!pendingText_.empty()) {
@@ -341,7 +353,10 @@ void WsBroadcaster::SendLoop() {
                     timestampUs = pendingTimestampUs_;
                     pendingTimestampUs_ = 0;
                     frameId = nextFrameId_++;
-                    inFlightFrames_.push_back({frameId, now});
+                    // 先预留窗口，二进制负载成功写入后才将 writeCompleted 置为
+                    // true 并记录 sentAt。这样网络 send 阻塞不会侵蚀浏览器的
+                    // 解码/绘制 ACK 时间预算。
+                    inFlightFrames_.push_back({frameId});
                     preferReplaceableText_ = true;
                     sendingFrame = true;
                     break;
@@ -353,7 +368,20 @@ void WsBroadcaster::SendLoop() {
                     break;
                 }
                 if (!inFlightFrames_.empty()) {
-                    const auto deadline = inFlightFrames_.front().sentAt + kFrameAckTimeout;
+                    const auto sent = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
+                        [](const InFlightFrame& frame) { return frame.writeCompleted; });
+                    if (sent == inFlightFrames_.end()) {
+                        // 正常情况下发送线程不会在还有写入中帧时重新进入调度循环；
+                        // 保留此分支用于关闭/未来改造场景，避免用默认时间点立即超时。
+                        frameCv_.wait(lk, [this] {
+                            return stopping_ || std::any_of(inFlightFrames_.begin(),
+                                inFlightFrames_.end(), [](const InFlightFrame& frame) {
+                                    return frame.writeCompleted;
+                                });
+                        });
+                        continue;
+                    }
+                    const auto deadline = sent->sentAt + kFrameAckTimeout;
                     if (frameCv_.wait_until(lk, deadline, [this] {
                         return stopping_ ||
                             !pendingText_.empty() || !pendingReplaceableText_.empty() ||
@@ -394,8 +422,32 @@ void WsBroadcaster::SendLoop() {
             }
         }
         if (sent && sendingFrame) {
+            const auto writeCompletedAt = std::chrono::steady_clock::now();
+            bool acknowledgedDuringWrite = false;
+            {
+                std::lock_guard<std::mutex> frameLock(frameMu_);
+                const auto it = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
+                    [frameId](const InFlightFrame& inFlight) {
+                        return inFlight.id == frameId;
+                    });
+                if (it != inFlightFrames_.end()) {
+                    if (it->ackedDuringWrite) {
+                        // 浏览器已经确认该帧；它的真实延迟不应被发送线程的写入
+                        // 时长污染，因此只累计确认次数，不纳入 ACK 时延均值。
+                        inFlightFrames_.erase(it);
+                        acknowledgedDuringWrite = true;
+                    } else {
+                        it->writeCompleted = true;
+                        it->sentAt = writeCompletedAt;
+                    }
+                    frameCv_.notify_all();
+                }
+            }
             sentFrames_.fetch_add(1, std::memory_order_relaxed);
             sentBytes_.fetch_add(static_cast<uint64_t>(frame.size()), std::memory_order_relaxed);
+            if (acknowledgedDuringWrite) {
+                acknowledgedFrames_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         if (!sent) {
             sendFailures_.fetch_add(1, std::memory_order_relaxed);

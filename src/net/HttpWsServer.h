@@ -97,6 +97,13 @@ private:
     uint64_t nextFrameId_ = 1;
     struct InFlightFrame {
         uint64_t id = 0;
+        // 发送线程选中帧后会先占用一个窗口，避免并发 ACK 与下一帧调度出现
+        // “还未登记就收到 ACK”的竞态。只有二进制负载写入 socket 返回后才开始
+        // ACK 超时计时；网络写入本身较慢不能被误判为浏览器解码/绘制缓慢。
+        bool writeCompleted = false;
+        // 极低延迟本机链路上，浏览器的 ACK 可能在发送线程重新取得 frameMu_
+        // 前到达。保留该状态，随后由发送线程一次性确认并回收窗口。
+        bool ackedDuringWrite = false;
         std::chrono::steady_clock::time_point sentAt{};
     };
     // 两帧窗口允许网络写入、WebCodecs 解码和下一帧传输重叠，避免每帧都完整
