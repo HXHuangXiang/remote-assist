@@ -143,7 +143,7 @@ void TrayApp::RemoveIcon() {
 }
 
 int TrayApp::Run() {
-    log::Init(LogDir());
+    log::Init(LogDir(), L"tray.log");
     log::Info("tray starting");
 
     instanceMutex_ = CreateMutexW(nullptr, FALSE, runtime::kTrayMutexName);

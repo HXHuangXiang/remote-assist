@@ -45,11 +45,11 @@ if errorlevel 1 goto :service_error
 
 echo.
 echo 安装完成。服务以 LocalSystem 启动，会拉起 agent 与托盘。
-echo 配置与日志位于 RemoteAssist.exe 同目录。
+echo 配置位于 RemoteAssist.exe 同目录；日志位于同级 logs\，按 service、agent、tray、setup 分文件保存。
 pause
 exit /b 0
 
 :service_error
-echo 服务操作失败。请确认以管理员身份运行，并检查 logs\remote-assist.log。
+echo 服务操作失败。请确认以管理员身份运行，并检查 logs\service.log。
 pause
 exit /b 1

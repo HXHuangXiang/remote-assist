@@ -84,7 +84,7 @@ std::string Agent::WebDirFromExe() {
 }
 
 int Agent::Run(bool serviceManaged) {
-    log::Init(LogDir());
+    log::Init(LogDir(), L"agent.log");
     log::Info("agent starting");
 
     instanceMutex_ = CreateMutexW(nullptr, FALSE, runtime::kAgentMutexName);

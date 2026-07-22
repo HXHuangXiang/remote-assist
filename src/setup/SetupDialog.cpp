@@ -581,7 +581,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int RunSetupDialog(HINSTANCE hInst) {
-    log::Init(LogDir());
+    log::Init(LogDir(), L"setup.log");
     log::Info("setup dialog starting");
 
     g_wmTaskbarRestart = RegisterWindowMessageW(L"TaskbarCreated");

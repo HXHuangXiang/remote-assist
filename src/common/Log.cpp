@@ -13,6 +13,7 @@ namespace remote_assist::log {
 namespace {
 
 std::wstring g_dir;
+std::wstring g_fileName = L"remote-assist.log";
 std::mutex g_mu;
 constexpr ULONGLONG kMaxLogBytes = 5ULL * 1024 * 1024;
 constexpr int kLogBackupCount = 3;
@@ -54,8 +55,9 @@ void RotateLogIfNeeded(const std::wstring& path) {
 
 }  // namespace
 
-void Init(const std::wstring& dir) {
+void Init(const std::wstring& dir, const wchar_t* fileName) {
     g_dir = dir;
+    g_fileName = (fileName && *fileName) ? fileName : L"remote-assist.log";
     if (!g_dir.empty()) {
         CreateDirectoryW(g_dir.c_str(), nullptr);
     }
@@ -66,7 +68,7 @@ void Write(const char* level, const std::string& msg) {
     std::string line = "[" + Timestamp() + "] [" + level + "] " + msg + "\n";
     OutputDebugStringA(line.c_str());
     if (!g_dir.empty()) {
-        const std::wstring path = g_dir + L"\\remote-assist.log";
+        const std::wstring path = g_dir + L"\\" + g_fileName;
         RotateLogIfNeeded(path);
         std::ofstream of(path, std::ios::app);
         if (of) {

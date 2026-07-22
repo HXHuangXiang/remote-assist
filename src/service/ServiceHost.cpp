@@ -154,7 +154,7 @@ bool CreateChildJob() {
 }
 
 void ServiceWorker() {
-    log::Init(LogDir());
+    log::Init(LogDir(), L"service.log");
     log::Info("service worker start");
 
     // 先报告 RUNNING,避免 SCM 超时报 1053。
@@ -221,6 +221,9 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
 }  // namespace
 
 int RunAsService() {
+    // StartServiceCtrlDispatcherW 本身失败时 ServiceWorker 尚未运行，也要有
+    // 可定位的日志文件。
+    log::Init(LogDir(), L"service.log");
     SERVICE_TABLE_ENTRYW table[] = {
         { const_cast<LPWSTR>(runtime::kServiceName), ServiceMain },
         { nullptr, nullptr }
