@@ -261,7 +261,7 @@ void Agent::CaptureLoop() {
                       std::to_string(metrics.encodeAttempts) +
                       " encode_fail=" + std::to_string(metrics.encodeFailures) +
                       " encode_avg_ms=" + std::to_string(avgEncodeMs) +
-                      " jpeg_kib=" + std::to_string(metrics.encodedBytes / 1024) +
+                      " encoded_kib=" + std::to_string(metrics.encodedBytes / 1024) +
                       " queued=" + std::to_string(queued) +
                       " replaced=" + std::to_string(replaced) +
                       " sent=" + std::to_string(sent) +
@@ -280,9 +280,12 @@ void Agent::CaptureLoop() {
         const auto t0 = std::chrono::steady_clock::now();
         logMetricsIfDue(t0);
 
-        // 大屏幕降低帧率,平衡编码时间和带宽
+        // JPEG 回退需要 CPU 全帧压缩，大屏时保守限帧；H.264 模式的压缩由 MFT
+        // 承担，不应仅因分辨率达到 1080p 就被无条件锁在 15 FPS，否则既浪费
+        // 硬件能力，也会让编码器的 30 FPS 时间戳和实际采集节奏不一致。
         int effectiveFps = cfg_.fps;
-        if (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080) {
+        if ((!encoder_ || !encoder_->IsH264()) &&
+            (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080)) {
             effectiveFps = std::min(effectiveFps, 15);
         }
         const int targetMs = 1000 / std::max(1, effectiveFps);
