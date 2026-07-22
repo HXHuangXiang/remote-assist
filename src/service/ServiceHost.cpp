@@ -29,8 +29,8 @@ struct ServiceState {
     HANDLE trayProcess = nullptr;
     HANDLE agentStopEvent = nullptr;
     HANDLE childJob = nullptr;
-    DWORD agentSessionId = WTS_INVALID_SESSION_ID;
-    DWORD traySessionId = WTS_INVALID_SESSION_ID;
+    DWORD agentSessionId = kInvalidSessionId;
+    DWORD traySessionId = kInvalidSessionId;
 };
 ServiceState g_state;
 
@@ -97,13 +97,15 @@ void AddChildToJob(HANDLE process, const char* role) {
     }
 }
 
+void StopChild(HANDLE& process, const char* role, DWORD timeoutMs);
+
 void EnsureAgent() {
     if (g_state.stopRequested.load()) {
         return;
     }
     const DWORD targetSessionId = FindActiveInteractiveSessionId();
     const bool agentRunning = IsChildRunning(g_state.agentProcess, "agent");
-    if (agentRunning && (targetSessionId == WTS_INVALID_SESSION_ID ||
+    if (agentRunning && (targetSessionId == kInvalidSessionId ||
                          g_state.agentSessionId == targetSessionId)) {
         return;
     }
@@ -116,8 +118,8 @@ void EnsureAgent() {
         }
         StopChild(g_state.agentProcess, "agent", kAgentStopTimeoutMs);
     }
-    g_state.agentSessionId = WTS_INVALID_SESSION_ID;
-    if (targetSessionId == WTS_INVALID_SESSION_ID) {
+    g_state.agentSessionId = kInvalidSessionId;
+    if (targetSessionId == kInvalidSessionId) {
         return;
     }
     if (!g_state.agentStopEvent) {
@@ -141,7 +143,7 @@ void EnsureTray() {
     }
     const DWORD targetSessionId = FindActiveInteractiveSessionId();
     const bool trayRunning = IsChildRunning(g_state.trayProcess, "tray");
-    if (trayRunning && (targetSessionId == WTS_INVALID_SESSION_ID ||
+    if (trayRunning && (targetSessionId == kInvalidSessionId ||
                         g_state.traySessionId == targetSessionId)) {
         return;
     }
@@ -151,8 +153,8 @@ void EnsureTray() {
                   std::to_string(targetSessionId));
         StopChild(g_state.trayProcess, "tray", kTrayStopTimeoutMs);
     }
-    g_state.traySessionId = WTS_INVALID_SESSION_ID;
-    if (targetSessionId == WTS_INVALID_SESSION_ID) {
+    g_state.traySessionId = kInvalidSessionId;
+    if (targetSessionId == kInvalidSessionId) {
         return;
     }
 
@@ -235,8 +237,8 @@ void ServiceWorker() {
     }
     StopChild(g_state.agentProcess, "agent", kAgentStopTimeoutMs);
     StopChild(g_state.trayProcess, "tray", kTrayStopTimeoutMs);
-    g_state.agentSessionId = WTS_INVALID_SESSION_ID;
-    g_state.traySessionId = WTS_INVALID_SESSION_ID;
+    g_state.agentSessionId = kInvalidSessionId;
+    g_state.traySessionId = kInvalidSessionId;
     if (g_state.childJob) {
         CloseHandle(g_state.childJob);
         g_state.childJob = nullptr;

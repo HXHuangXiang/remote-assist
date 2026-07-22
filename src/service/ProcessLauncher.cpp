@@ -46,7 +46,7 @@ DWORD FindActiveInteractiveSessionId() {
         return consoleSession;
     }
 
-    DWORD fallbackSession = WTS_INVALID_SESSION_ID;
+    DWORD fallbackSession = kInvalidSessionId;
     for (DWORD index = 0; index < sessionCount; ++index) {
         if (sessions[index].State != WTSActive) {
             continue;
@@ -55,12 +55,12 @@ DWORD FindActiveInteractiveSessionId() {
             WTSFreeMemory(sessions);
             return consoleSession;
         }
-        if (fallbackSession == WTS_INVALID_SESSION_ID) {
+        if (fallbackSession == kInvalidSessionId) {
             fallbackSession = sessions[index].SessionId;
         }
     }
     WTSFreeMemory(sessions);
-    return fallbackSession != WTS_INVALID_SESSION_ID ? fallbackSession : consoleSession;
+    return fallbackSession != kInvalidSessionId ? fallbackSession : consoleSession;
 }
 
 bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
@@ -129,7 +129,7 @@ bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
 
 bool LaunchAgentInConsoleSession(const std::wstring& exePath, HANDLE* processOut) {
     const DWORD sid = FindActiveInteractiveSessionId();
-    if (sid == WTS_INVALID_SESSION_ID) {
+    if (sid == kInvalidSessionId) {
         log::Warn("no active interactive session, skip agent launch");
         return false;
     }
@@ -144,7 +144,7 @@ bool LaunchAgentInConsoleSession(const std::wstring& exePath, HANDLE* processOut
 
 bool LaunchTrayInConsoleSession(const std::wstring& exePath, HANDLE* processOut) {
     const DWORD sid = FindActiveInteractiveSessionId();
-    if (sid == WTS_INVALID_SESSION_ID) {
+    if (sid == kInvalidSessionId) {
         return false;
     }
     const DWORD explorerPid = FindProcessInSession(L"explorer.exe", sid);

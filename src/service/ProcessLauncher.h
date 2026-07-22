@@ -6,11 +6,13 @@
 
 namespace remote_assist {
 
+inline constexpr DWORD kInvalidSessionId = 0xFFFFFFFF;
+
 // 在指定会话内查找进程名(如 winlogon.exe / explorer.exe)的 PID;找不到返回 0。
 DWORD FindProcessInSession(const wchar_t* exeName, DWORD sessionId);
 
 // 返回当前实际可交互的会话。优先活动控制台，会话桌面型系统中回退到任一 WTSActive
-// 会话，因而兼容 RDP 登录；没有可用会话时返回 WTS_INVALID_SESSION_ID。
+// 会话，因而兼容 RDP 登录；没有可用会话时返回 kInvalidSessionId。
 DWORD FindActiveInteractiveSessionId();
 
 // 复制 srcPid 的 token,以 TokenPrimary + SecurityIdentification 复制成主令牌,
