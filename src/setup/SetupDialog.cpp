@@ -6,6 +6,7 @@
 #include <shellapi.h>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -341,6 +342,9 @@ static void UpdateStatus() {
     EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_UNINSTALL), installed);
     EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_START), installed && !running);
     EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_STOP), installed && running);
+    // 服务已经接管当前桌面时不再允许额外启动独立 Agent；停止服务后仍可保留
+    // 该调试/临时使用入口，服务再次启动会通过停止事件完成接管。
+    EnableWindow(GetDlgItem(g_hwnd, IDC_RUN_AGENT), !running);
 }
 
 // ---- \u6258\u76d8\u56fe\u6807\u7ba1\u7406 ----
@@ -375,6 +379,20 @@ static void RemoveTrayIcon() {
         DestroyMenu(g_trayMenu);
         g_trayMenu = nullptr;
     }
+}
+
+// 服务接管托盘前，配置窗口必须释放当前会话的 mutex；否则 service 启动的
+// TrayApp 会因重复实例立刻退出，ServiceHost 又会把它误当作崩溃反复拉起。
+static void RelinquishTrayOwnership() {
+    RemoveTrayIcon();
+    if (g_trayMutex) {
+        if (g_ownsTray) {
+            ReleaseMutex(g_trayMutex);
+        }
+        CloseHandle(g_trayMutex);
+        g_trayMutex = nullptr;
+    }
+    g_ownsTray = false;
 }
 
 static void ShowTrayMenu(HWND hwnd) {
@@ -518,6 +536,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 UpdateStatus();
                 break;
             }
+            RelinquishTrayOwnership();
             const ServiceResult start = StartServiceS();
             if (!start.ok) {
                 ShowServiceError(hwnd, L"启动服务", start.error);
@@ -546,6 +565,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case IDC_SVC_START: {
+            RelinquishTrayOwnership();
             const ServiceResult start = StartServiceS();
             if (start.ok) {
                 const bool agentReady = WaitForAgentReady(5000);
@@ -572,10 +592,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_RUN_AGENT: {
             std::wstring exe = ExePath();
             std::wstring cmd = L"\"" + exe + L"\" --agent";
+            std::vector<wchar_t> commandLine(cmd.begin(), cmd.end());
+            commandLine.push_back(L'\0');
             STARTUPINFOW si = {};
             si.cb = sizeof(si);
             PROCESS_INFORMATION pi = {};
-            if (CreateProcessW(nullptr, const_cast<LPWSTR>(cmd.c_str()),
+            if (CreateProcessW(nullptr, commandLine.data(),
                     nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
@@ -620,7 +642,7 @@ int RunSetupDialog(HINSTANCE hInst) {
     log::Init(LogDir(), L"setup.log");
     log::Info("setup dialog starting");
 
-    g_trayMutex = CreateMutexW(nullptr, FALSE, runtime::kTrayMutexName);
+    g_trayMutex = CreateMutexW(nullptr, TRUE, runtime::kTrayMutexName);
     if (!g_trayMutex) {
         log::Warn("setup tray mutex creation failed: " + std::to_string(GetLastError()));
     } else {
@@ -658,6 +680,9 @@ int RunSetupDialog(HINSTANCE hInst) {
     }
     RemoveTrayIcon();
     if (g_trayMutex) {
+        if (g_ownsTray) {
+            ReleaseMutex(g_trayMutex);
+        }
         CloseHandle(g_trayMutex);
         g_trayMutex = nullptr;
     }

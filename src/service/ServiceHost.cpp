@@ -33,6 +33,8 @@ struct ServiceState {
     HANDLE childJob = nullptr;
     DWORD agentSessionId = kInvalidSessionId;
     DWORD traySessionId = kInvalidSessionId;
+    bool externalAgentStopRequested = false;
+    bool externalTrayDetected = false;
 };
 ServiceState g_state;
 
@@ -103,6 +105,28 @@ void AddChildToJob(HANDLE process, const char* role) {
     }
 }
 
+// Agent/Tray 以“初始所有者”方式持有命名 mutex。服务只有在没有自己管理的
+// 子进程时探测它：WAIT_TIMEOUT 代表外部同类进程仍在运行；可立即获取时要先
+// ReleaseMutex，避免服务线程意外把对象永久锁住。
+bool IsNamedMutexHeld(const wchar_t* name) {
+    HANDLE mutex = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, name);
+    if (!mutex) {
+        return false;
+    }
+    const DWORD result = WaitForSingleObject(mutex, 0);
+    if (result == WAIT_TIMEOUT) {
+        CloseHandle(mutex);
+        return true;
+    }
+    if (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED) {
+        ReleaseMutex(mutex);
+    } else {
+        log::Warn("WaitForSingleObject named mutex failed: " + std::to_string(GetLastError()));
+    }
+    CloseHandle(mutex);
+    return false;
+}
+
 void StopChild(HANDLE& process, const char* role, DWORD timeoutMs);
 
 void EnsureAgent() {
@@ -134,6 +158,17 @@ void EnsureAgent() {
     if (!g_state.agentStopEvent) {
         return;
     }
+    if (IsNamedMutexHeld(runtime::kAgentMutexName)) {
+        if (!g_state.externalAgentStopRequested) {
+            // 通过公共停止事件接管从配置窗口直接启动的 Agent。它收到事件后会
+            // 自行释放键鼠状态并退出，下一轮监控再以 service-managed 模式拉起。
+            log::Info("external agent detected, requesting handover to service");
+            SetEvent(g_state.agentStopEvent);
+            g_state.externalAgentStopRequested = true;
+        }
+        return;
+    }
+    g_state.externalAgentStopRequested = false;
     ResetEvent(g_state.agentStopEvent);
 
     HANDLE process = nullptr;
@@ -166,6 +201,14 @@ void EnsureTray() {
     if (targetSessionId == kInvalidSessionId) {
         return;
     }
+    if (IsNamedMutexHeld(runtime::kTrayMutexName)) {
+        if (!g_state.externalTrayDetected) {
+            log::Info("external tray detected, waiting for it to release session ownership");
+            g_state.externalTrayDetected = true;
+        }
+        return;
+    }
+    g_state.externalTrayDetected = false;
 
     HANDLE process = nullptr;
     if (LaunchTrayInConsoleSession(g_state.exePath, &process)) {
@@ -261,6 +304,8 @@ void ServiceWorker() {
     StopChild(g_state.trayProcess, "tray", kTrayStopTimeoutMs);
     g_state.agentSessionId = kInvalidSessionId;
     g_state.traySessionId = kInvalidSessionId;
+    g_state.externalAgentStopRequested = false;
+    g_state.externalTrayDetected = false;
     if (g_state.childJob) {
         CloseHandle(g_state.childJob);
         g_state.childJob = nullptr;

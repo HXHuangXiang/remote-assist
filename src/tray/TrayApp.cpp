@@ -170,7 +170,9 @@ int TrayApp::Run() {
     log::Init(LogDir(), L"tray.log");
     log::Info("tray starting");
 
-    instanceMutex_ = CreateMutexW(nullptr, FALSE, runtime::kTrayMutexName);
+    // 保持 mutex 所有权，供 ServiceHost 在没有受管 tray 子进程时识别外部
+    // 配置窗口/托盘实例，避免无意义地反复创建重复进程。
+    instanceMutex_ = CreateMutexW(nullptr, TRUE, runtime::kTrayMutexName);
     const DWORD mutexError = GetLastError();
     if (!instanceMutex_) {
         log::Error("tray mutex creation failed: " + std::to_string(mutexError));
@@ -198,6 +200,7 @@ int TrayApp::Run() {
     }
 
     RemoveIcon();
+    ReleaseMutex(instanceMutex_);
     CloseHandle(instanceMutex_);
     instanceMutex_ = nullptr;
     log::Info("tray exit");

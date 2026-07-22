@@ -182,7 +182,9 @@ int Agent::Run(bool serviceManaged) {
     log::Init(LogDir(), L"agent.log");
     log::Info("agent starting");
 
-    instanceMutex_ = CreateMutexW(nullptr, FALSE, runtime::kAgentMutexName);
+    // 保持 mutex 的初始所有权，使服务能够可靠地区分“名称仍存在”与“已有
+    // Agent 正在运行”。所有权会在本线程/进程退出时由系统自动释放。
+    instanceMutex_ = CreateMutexW(nullptr, TRUE, runtime::kAgentMutexName);
     const DWORD mutexError = GetLastError();
     if (!instanceMutex_) {
         log::Error("agent mutex creation failed: " + std::to_string(mutexError));
@@ -204,6 +206,15 @@ int Agent::Run(bool serviceManaged) {
             // 就绪状态仅用于诊断；服务停止事件仍是 Agent 的必备生命周期契约。
             log::Warn("agent ready event open failed: " + std::to_string(GetLastError()));
         }
+    } else {
+        // 独立运行的 Agent 也监听同一停止事件。服务安装/启动时可先通知它
+        // 退出并接管，避免两个实例互相争夺端口与全局 mutex。
+        stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, runtime::kAgentStopEventName);
+        if (!stopEvent_) {
+            log::Error("agent stop event creation failed: " + std::to_string(GetLastError()));
+            return 1;
+        }
+        ResetEvent(stopEvent_);
     }
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -573,6 +584,9 @@ std::string Agent::MakeCfgJson() const {
 }
 
 void Agent::OnMessage(const std::string& msg) {
+    if (stop_.load()) {
+        return;
+    }
     const auto j = nlohmann::json::parse(msg, nullptr, false);
     if (!j.is_object()) {
         return;
