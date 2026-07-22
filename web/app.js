@@ -22,6 +22,9 @@ const clientStats = {
   decodeErrors: 0, maxDecodeQueue: 0, maxWsBuffered: 0
 };
 let remoteCursor = { visible:false, x:0, y:0 };
+// 远端指针移动非常频繁。记录上一次实际绘制的边界，只清除箭头附近的小区域，
+// 避免每个 cursor 消息都 clearRect 整张 2K/4K 覆盖 canvas。
+let drawnCursorBounds = null;
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
@@ -135,7 +138,11 @@ function updateRemoteCursor(m) {
 
 function drawRemoteCursor() {
   if (!cursorCanvas || !cursorCtx) return;
-  cursorCtx.clearRect(0, 0, cursorCanvas.width, cursorCanvas.height);
+  if (drawnCursorBounds) {
+    cursorCtx.clearRect(drawnCursorBounds.x, drawnCursorBounds.y,
+      drawnCursorBounds.w, drawnCursorBounds.h);
+    drawnCursorBounds = null;
+  }
   canvas.style.cursor = remoteCursor.visible ? 'none' : 'default';
   if (!remoteCursor.visible || !cursorCanvas.width || !cursorCanvas.height) return;
 
@@ -143,6 +150,16 @@ function drawRemoteCursor() {
   const y = remoteCursor.y * Math.max(0, cursorCanvas.height - 1);
   const size = Math.max(14, Math.min(30,
     Math.round(Math.min(cursorCanvas.width, cursorCanvas.height) / 36)));
+  const lineWidth = Math.max(1, size / 12);
+  // 箭头底端会到 size * 1.12，描边还会向外扩展半个 lineWidth。额外留两像素，
+  // 保证抗锯齿边缘也被擦除，且坐标裁剪由 canvas 自动完成。
+  const padding = Math.ceil(lineWidth / 2) + 2;
+  drawnCursorBounds = {
+    x:x - padding,
+    y:y - padding,
+    w:size + padding * 2,
+    h:Math.ceil(size * 1.12) + padding * 2
+  };
   cursorCtx.save();
   cursorCtx.translate(x, y);
   cursorCtx.lineJoin = 'round';
@@ -158,7 +175,7 @@ function drawRemoteCursor() {
   cursorCtx.closePath();
   cursorCtx.fillStyle = '#fff';
   cursorCtx.strokeStyle = '#000';
-  cursorCtx.lineWidth = Math.max(1, size / 12);
+  cursorCtx.lineWidth = lineWidth;
   cursorCtx.stroke();
   cursorCtx.fill();
   cursorCtx.restore();
