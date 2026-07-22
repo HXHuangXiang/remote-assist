@@ -36,6 +36,9 @@ struct CapturedFrame {
 enum class CaptureResult {
     kFrame,
     kNoChange,
+    // DXGI Desktop Duplication 会因指针位置/形状变化返回上一张桌面图像；当前 MVP
+    // 不单独传输鼠标指针图层，因此无需对相同像素再次回读、编码和发送。
+    kPointerOnly,
     kFailed,
 };
 

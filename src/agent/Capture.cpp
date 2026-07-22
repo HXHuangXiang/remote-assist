@@ -249,6 +249,17 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
         log::Warn("DXGI AcquireNextFrame failed hr=" + std::to_string(hr));
         return CaptureResult::kFailed;
     }
+
+    // Microsoft 文档保证：仅鼠标指针更新时，AccumulatedFrames、
+    // TotalMetadataBufferSize 与 LastPresentTime 均为零。此时返回的资源仍是上一张
+    // 桌面图像；当前控制端仅展示视频帧，重编码它只会占用 CPU/GPU 和网络窗口。
+    const bool pointerOnly = fi.LastPresentTime.QuadPart == 0 &&
+        fi.AccumulatedFrames == 0 && fi.TotalMetadataBufferSize == 0;
+    if (pointerOnly) {
+        dup_->ReleaseFrame();
+        return CaptureResult::kPointerOnly;
+    }
+
     Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
     if (FAILED(res.As(&tex))) { dup_->ReleaseFrame(); return CaptureResult::kFailed; }
 

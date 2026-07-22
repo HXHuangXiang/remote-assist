@@ -57,6 +57,7 @@ struct CaptureLoopStats {
     uint64_t capturedFrames = 0;
     uint64_t directMappedFrames = 0;
     uint64_t noChangeFrames = 0;
+    uint64_t pointerOnlyFrames = 0;
     uint64_t captureFailures = 0;
     uint64_t fingerprintSkipped = 0;
     uint64_t encodeAttempts = 0;
@@ -392,6 +393,7 @@ void Agent::CaptureLoop() {
                       std::to_string(metrics.captureAttempts) +
                       " direct=" + std::to_string(metrics.directMappedFrames) +
                       " unchanged=" + std::to_string(metrics.noChangeFrames) +
+                      " pointer_only=" + std::to_string(metrics.pointerOnlyFrames) +
                       " sampled_skip=" + std::to_string(metrics.fingerprintSkipped) +
                       " capture_fail=" + std::to_string(metrics.captureFailures) +
                       " capture_avg_ms=" + std::to_string(avgCaptureMs) +
@@ -542,8 +544,13 @@ void Agent::CaptureLoop() {
         metrics.captureTimeMs += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - captureStartedAt).count());
-        if (captureResult == CaptureResult::kNoChange) {
-            metrics.noChangeFrames++;
+        if (captureResult == CaptureResult::kNoChange ||
+            captureResult == CaptureResult::kPointerOnly) {
+            if (captureResult == CaptureResult::kPointerOnly) {
+                metrics.pointerOnlyFrames++;
+            } else {
+                metrics.noChangeFrames++;
+            }
             const auto t1 = std::chrono::steady_clock::now();
             const auto used = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
             const int remain = targetMs - static_cast<int>(used);
