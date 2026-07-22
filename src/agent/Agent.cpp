@@ -66,6 +66,7 @@ struct CaptureLoopStats {
     uint64_t encodedBytes = 0;
     uint64_t captureTimeMs = 0;
     uint64_t encodeTimeMs = 0;
+    uint64_t h264CreditWaits = 0;
 };
 
 // 输出上限按网络状态逐级调整。Capture 会始终保持原始宽高比，因此超宽屏、4:3
@@ -386,6 +387,7 @@ void Agent::CaptureLoop() {
     // 真正调用编码器的时间，不包含 DXGI 等待桌面变化的阻塞时间。
     uint64_t adaptiveEncodeAttempts = 0;
     uint64_t adaptiveEncodeTimeMs = 0;
+    uint64_t adaptiveH264CreditWaits = 0;
     uint64_t lastEncodeLoadPercent = 0;
     // 采集结果在相邻帧间复用容量。1920x1080 的 BGRA 帧约 8MB，若每轮都创建
     // 局部 CapturedFrame 会触发持续的大块堆分配和释放，直接放大卡顿。
@@ -497,7 +499,8 @@ void Agent::CaptureLoop() {
             clientMaxWsBufferedBytes_.exchange(0, std::memory_order_relaxed);
         const bool active = metrics.captureAttempts != 0 || queued != 0 || sent != 0 ||
             acknowledged != 0 || ackTimeouts != 0 || sendFailures != 0 || h264Resyncs != 0 ||
-            clientDrawn != 0 || clientDropped != 0 || clientDecodeErrors != 0;
+            metrics.h264CreditWaits != 0 || clientDrawn != 0 || clientDropped != 0 ||
+            clientDecodeErrors != 0;
         if (active) {
             const auto elapsedMs = std::max<int64_t>(1,
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - metricsStartedAt).count());
@@ -524,6 +527,7 @@ void Agent::CaptureLoop() {
                       " encode_fail=" + std::to_string(metrics.encodeFailures) +
                       " encode_avg_ms=" + std::to_string(avgEncodeMs) +
                       " encode_load_pct=" + std::to_string(lastEncodeLoadPercent) +
+                      " h264_credit_wait=" + std::to_string(metrics.h264CreditWaits) +
                       " encoded_kib=" + std::to_string(metrics.encodedBytes / 1024) +
                       " queued=" + std::to_string(queued) +
                       " replaced=" + std::to_string(replaced) +
@@ -570,6 +574,7 @@ void Agent::CaptureLoop() {
                                                   adaptationStatsBase.h264Resyncs);
         const uint64_t sendFailures = CounterDelta(stats.sendFailures,
                                                    adaptationStatsBase.sendFailures);
+        const uint64_t h264CreditWaits = adaptiveH264CreditWaits;
         const uint64_t averageAckMs = ackSamples == 0 ? 0 : ackLatencyUs / ackSamples / 1000;
         const int currentEffectiveFps = effectiveFpsFor(adaptiveFps);
         const uint64_t averageEncodeMs = adaptiveEncodeAttempts == 0 ? 0 :
@@ -582,7 +587,8 @@ void Agent::CaptureLoop() {
             lastEncodeLoadPercent >= 85;
         const bool encoderHealthy = adaptiveEncodeAttempts == 0 ||
             (adaptiveEncodeAttempts >= 2 && lastEncodeLoadPercent <= 55);
-        const bool networkCongested = ackTimeouts != 0 || h264Resyncs != 0 || sendFailures != 0 ||
+        const bool networkCongested = h264CreditWaits != 0 || ackTimeouts != 0 ||
+            h264Resyncs != 0 || sendFailures != 0 ||
             (ackSamples != 0 && averageAckMs >= 120);
         const bool networkHealthy = ackSamples >= 4 && averageAckMs <= 65 && ackTimeouts == 0 &&
             h264Resyncs == 0 && sendFailures == 0;
@@ -639,7 +645,8 @@ void Agent::CaptureLoop() {
                       std::to_string(h264Resyncs) + " encode_avg_ms=" +
                       std::to_string(averageEncodeMs) + " encode_load_pct=" +
                       std::to_string(lastEncodeLoadPercent) + " encoder_overload=" +
-                      (encoderOverloaded ? "true" : "false"));
+                      (encoderOverloaded ? "true" : "false") + " h264_credit_wait=" +
+                      std::to_string(h264CreditWaits));
             adaptiveFps = nextFps;
             streamFps_.store(adaptiveFps);
         }
@@ -657,6 +664,7 @@ void Agent::CaptureLoop() {
         adaptationStatsBase = stats;
         adaptiveEncodeAttempts = 0;
         adaptiveEncodeTimeMs = 0;
+        adaptiveH264CreditWaits = 0;
         nextAdaptation = now + std::chrono::seconds(1);
     };
 
@@ -712,6 +720,18 @@ void Agent::CaptureLoop() {
             firstFrame_ = true;
             streamKeyFrameRequired_ = true;
             lastFrameSent_ = {};
+        }
+
+        // H.264 delta 之间有参考关系。发送槽位已经存在一张尚未发出的 delta 时，
+        // 不再采集/编码下一张；直接跳过输入帧可保持编码器与浏览器的参考链连续，
+        // 比“编码完成后覆盖旧 delta -> 强制 IDR”更低延迟、更少黑屏恢复。首帧和
+        // 请求恢复期间仍放行，使独立 IDR 能及时替换过期画面。
+        if (streamH264_.load() && !streamKeyFrameRequired_ &&
+            !server_.Broadcaster().WaitForH264FrameCredit(
+                std::chrono::milliseconds(std::max(1, targetMs)))) {
+            ++metrics.h264CreditWaits;
+            ++adaptiveH264CreditWaits;
+            continue;
         }
 
         // DXGI 空闲时会阻塞等待桌面变化。等待一个目标帧周期即可在静态画面

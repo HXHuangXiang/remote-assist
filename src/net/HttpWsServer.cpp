@@ -148,6 +148,16 @@ FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
     return replaced ? FrameQueueResult::kReplaced : FrameQueueResult::kQueued;
 }
 
+bool WsBroadcaster::WaitForH264FrameCredit(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(frameMu_);
+    const bool ready = frameCv_.wait_for(lk, timeout, [this] {
+        // 不要求 in-flight 小于窗口上限：允许有一张 H.264 delta 在待发送槽位中，
+        // 这样 ACK、网络写和下一次采集能重叠；但绝不允许第二张 delta 覆盖它。
+        return stopping_ || pendingFrame_.empty();
+    });
+    return ready && !stopping_;
+}
+
 void WsBroadcaster::BroadcastText(const std::string& msg) {
     std::lock_guard<std::mutex> lk(clientMu_);
     if (client_ && client_->is_open()) {
@@ -170,7 +180,9 @@ void WsBroadcaster::AcknowledgeFrame(uint64_t frameId) {
         ackLatencyUs_.fetch_add(static_cast<uint64_t>(std::max<int64_t>(0, latency)),
                                 std::memory_order_relaxed);
         ackLatencySamples_.fetch_add(1, std::memory_order_relaxed);
-        frameCv_.notify_one();
+        // sender 和采集线程都可能在等同一个状态变化。只唤醒一个会导致采集线程
+        // 抢到通知却因 pending 仍存在继续休眠，sender 则要等到 ACK 超时才会继续。
+        frameCv_.notify_all();
     }
 }
 
@@ -264,6 +276,9 @@ void WsBroadcaster::SendLoop() {
                 });
             }
         }
+        // pendingFrame_ 已被取走，采集线程现在可安全编码下一张 delta。必须在
+        // 释放 frameMu_ 后通知，避免它醒来后马上阻塞在同一把锁上。
+        frameCv_.notify_all();
 
         bool sent = false;
         {
@@ -288,7 +303,7 @@ void WsBroadcaster::SendLoop() {
                 [frameId](const InFlightFrame& inFlight) { return inFlight.id == frameId; });
             if (it != inFlightFrames_.end()) {
                 inFlightFrames_.erase(it);
-                frameCv_.notify_one();
+                frameCv_.notify_all();
             }
         }
     }

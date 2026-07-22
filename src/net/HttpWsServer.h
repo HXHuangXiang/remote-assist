@@ -59,6 +59,10 @@ public:
     // streamId 与配置消息对应，用于浏览器丢弃过期图像。
     FrameQueueResult BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId,
                                      bool isKeyFrame, uint64_t timestampUs, bool h264);
+    // H.264 的 delta 帧不能像 JPEG 一样以最新帧覆盖。编码前等待待发送槽位释放，
+    // 可以直接跳过本轮采集输入而不产生缺失的参考帧，避免编码后再触发 IDR 重同步。
+    // 返回 false 表示等待超时或 broadcaster 正在停止。
+    bool WaitForH264FrameCredit(std::chrono::milliseconds timeout);
     void BroadcastText(const std::string& msg);
     // 浏览器在帧真正绘制（或主动丢弃过期帧）后确认，服务端释放对应的发送窗口。
     void AcknowledgeFrame(uint64_t frameId);
