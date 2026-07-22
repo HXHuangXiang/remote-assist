@@ -15,6 +15,8 @@ namespace {
 // 写成功无法说明用户已经看到新画面；超时兜底避免旧浏览器或异常连接永久停流。
 constexpr auto kFrameAckTimeout = std::chrono::seconds(1);
 constexpr size_t kMaxFramesInFlight = 2;
+constexpr auto kAuthThrottleRetention = std::chrono::minutes(10);
+constexpr size_t kMaxAuthThrottleEntries = 64;
 
 // WebSocket handler 可能因为第三方回调、内存分配等异常提前离开。连接一旦已
 // 注册到 broadcaster，就必须在所有退出路径移除，避免发送线程持有悬空指针。
@@ -50,6 +52,29 @@ private:
 };
 
 }  // namespace
+
+// 首帧认证的 scope guard。无论 ws.read、JSON 解析或回调以何种方式提前返回，
+// 都会释放唯一的认证槽位，避免服务永久显示“server busy”。
+class HttpWsServer::AuthAttemptGuard {
+public:
+    explicit AuthAttemptGuard(HttpWsServer& server) : server_(server) {}
+    ~AuthAttemptGuard() {
+        if (active_) {
+            server_.EndAuthAttempt();
+        }
+    }
+
+    void Complete() {
+        if (active_) {
+            server_.EndAuthAttempt();
+            active_ = false;
+        }
+    }
+
+private:
+    HttpWsServer& server_;
+    bool active_ = true;
+};
 
 WsBroadcaster::WsBroadcaster()
     : senderThread_(&WsBroadcaster::SendLoop, this) {}
@@ -279,23 +304,66 @@ void HttpWsServer::SetOnControllerDisconnected(OnControllerDisconnected cb) {
     onControllerDisconnected_ = std::move(cb);
 }
 
-bool HttpWsServer::CanAttemptAuth() {
+bool HttpWsServer::TryBeginAuthAttempt() {
     std::lock_guard<std::mutex> lk(authMu_);
-    return std::chrono::steady_clock::now() >= nextAuthAt_;
+    if (authAttemptInProgress_) {
+        return false;
+    }
+    authAttemptInProgress_ = true;
+    return true;
 }
 
-void HttpWsServer::RecordAuthFailure() {
+void HttpWsServer::EndAuthAttempt() {
     std::lock_guard<std::mutex> lk(authMu_);
-    authFailures_ = std::min(authFailures_ + 1, 6);
-    const int backoffSeconds = 1 << (authFailures_ - 1);
-    nextAuthAt_ = std::chrono::steady_clock::now() +
+    authAttemptInProgress_ = false;
+}
+
+bool HttpWsServer::CanAttemptAuth(const std::string& remoteAddr) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(authMu_);
+    for (auto it = authThrottles_.begin(); it != authThrottles_.end();) {
+        if (now - it->second.lastSeenAt > kAuthThrottleRetention) {
+            it = authThrottles_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    const std::string key = remoteAddr.empty() ? "<unknown>" : remoteAddr;
+    const auto found = authThrottles_.find(key);
+    if (found == authThrottles_.end()) {
+        return true;
+    }
+    found->second.lastSeenAt = now;
+    return now >= found->second.nextAttemptAt;
+}
+
+void HttpWsServer::RecordAuthFailure(const std::string& remoteAddr) {
+    const auto now = std::chrono::steady_clock::now();
+    const std::string key = remoteAddr.empty() ? "<unknown>" : remoteAddr;
+    std::lock_guard<std::mutex> lk(authMu_);
+    if (authThrottles_.size() >= kMaxAuthThrottleEntries &&
+        authThrottles_.find(key) == authThrottles_.end()) {
+        // 来源地址极多时丢弃最旧项而不是无限增长；此次错误仍会被拒绝，
+        // 只是不会为它保留下一次退避状态。
+        auto oldest = std::min_element(authThrottles_.begin(), authThrottles_.end(),
+            [](const auto& left, const auto& right) {
+                return left.second.lastSeenAt < right.second.lastSeenAt;
+            });
+        if (oldest != authThrottles_.end()) {
+            authThrottles_.erase(oldest);
+        }
+    }
+    AuthThrottle& throttle = authThrottles_[key];
+    throttle.failures = std::min(throttle.failures + 1, 6);
+    const int backoffSeconds = 1 << (throttle.failures - 1);
+    throttle.nextAttemptAt = now +
         std::chrono::seconds(backoffSeconds);
+    throttle.lastSeenAt = now;
 }
 
-void HttpWsServer::ResetAuthFailures() {
+void HttpWsServer::ResetAuthFailures(const std::string& remoteAddr) {
     std::lock_guard<std::mutex> lk(authMu_);
-    authFailures_ = 0;
-    nextAuthAt_ = {};
+    authThrottles_.erase(remoteAddr.empty() ? "<unknown>" : remoteAddr);
 }
 
 bool HttpWsServer::Start(const std::string& host, int port) {
@@ -305,7 +373,19 @@ bool HttpWsServer::Start(const std::string& host, int port) {
     svr_.set_payload_max_length(64 * 1024);
     // 发送超时保护发送线程，避免失联浏览器长期占用 socket 写操作。
     svr_.set_write_timeout(2, 0);
-    svr_.WebSocket("/ws", [this](const httplib::Request&, httplib::ws::WebSocket& ws) {
+    svr_.WebSocket("/ws", [this](const httplib::Request& req, httplib::ws::WebSocket& ws) {
+        const std::string remoteAddr = req.remote_addr;
+        if (broadcaster_.Count() != 0) {
+            ws.send("{\"t\":\"error\",\"msg\":\"controller already connected\"}");
+            ws.close(httplib::ws::CloseStatus::PolicyViolation, "controller already connected");
+            return;
+        }
+        if (!TryBeginAuthAttempt()) {
+            ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"server busy\"}");
+            ws.close(httplib::ws::CloseStatus::PolicyViolation, "server busy");
+            return;
+        }
+        AuthAttemptGuard authAttempt(*this);
         // 鉴权:第一帧必须是文本 JSON {"t":"auth","token":"..."}
         std::string msg;
         const auto r = ws.read(msg);
@@ -314,7 +394,7 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "no auth");
             return;
         }
-        if (!CanAttemptAuth()) {
+        if (!CanAttemptAuth(remoteAddr)) {
             ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"retry later\"}");
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "retry later");
             return;
@@ -332,12 +412,12 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             ok = false;
         }
         if (!ok) {
-            RecordAuthFailure();
+            RecordAuthFailure(remoteAddr);
             ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"bad token\"}");
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "bad token");
             return;
         }
-        ResetAuthFailures();
+        ResetAuthFailures(remoteAddr);
         ws.send("{\"t\":\"auth\",\"ok\":true}");
         if (cfgProvider_) {
             ws.send(cfgProvider_());
@@ -347,6 +427,9 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "controller already connected");
             return;
         }
+        // 在 controller 真正注册前保持认证槽位，避免两个并发握手都收到
+        // auth ok 后才发现控制端已满。
+        authAttempt.Complete();
         ControllerSessionGuard controllerGuard(broadcaster_, ws, onControllerDisconnected_);
         controllerGuard.Arm();
         log::Info("ws client connected, total=" + std::to_string(broadcaster_.Count()));

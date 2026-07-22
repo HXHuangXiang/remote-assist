@@ -14,6 +14,8 @@ GET / 返回 web/index.html;GET /app.js、/app.css 返回静态资源。
 
 agent 按 config.json 的 password_iterations 使用 PBKDF2-SHA256 校验 token；缺少该字段的历史配置兼容 SHA-256(salt + token)。失败则发送 {"t":"auth","ok":false,"reason":"bad token"} 并断开;成功发 {"t":"auth","ok":true} 并进入流模式。
 
+认证失败会按来源 IP 采用 1、2、4…32 秒退避；单个来源的错误密码不会让其他局域网控制端进入同一退避期。服务同一时刻只处理一个未鉴权握手，避免空连接耗尽工作线程。
+
 ### 下行(agent -> 浏览器)
 
 1. 进入流模式先发一帧配置:

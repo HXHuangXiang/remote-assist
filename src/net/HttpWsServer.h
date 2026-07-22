@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace remote_assist {
@@ -121,9 +122,12 @@ public:
     void Stop();
 
 private:
-    bool CanAttemptAuth();
-    void RecordAuthFailure();
-    void ResetAuthFailures();
+    class AuthAttemptGuard;
+    bool TryBeginAuthAttempt();
+    void EndAuthAttempt();
+    bool CanAttemptAuth(const std::string& remoteAddr);
+    void RecordAuthFailure(const std::string& remoteAddr);
+    void ResetAuthFailures(const std::string& remoteAddr);
 
     httplib::Server svr_;
     WsBroadcaster broadcaster_;
@@ -131,9 +135,16 @@ private:
     CfgProvider cfgProvider_;
     OnMessage onMessage_;
     OnControllerDisconnected onControllerDisconnected_;
+    struct AuthThrottle {
+        int failures = 0;
+        std::chrono::steady_clock::time_point nextAttemptAt{};
+        std::chrono::steady_clock::time_point lastSeenAt{};
+    };
     std::mutex authMu_;
-    int authFailures_ = 0;
-    std::chrono::steady_clock::time_point nextAuthAt_{};
+    // 仅允许一个客户端占用“首帧认证”读取槽位，避免多个空 WebSocket 将 httplib
+    // 的小线程池耗尽；认证通过后立即释放该槽位，正常控制端仍由 broadcaster 限制。
+    bool authAttemptInProgress_ = false;
+    std::unordered_map<std::string, AuthThrottle> authThrottles_;
     std::atomic<bool> running_{false};
     std::thread thread_;
 };
