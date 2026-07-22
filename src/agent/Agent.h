@@ -62,6 +62,15 @@ private:
     // cfg_.fps 是用户配置的上限。采集线程按浏览器 ACK 与 H.264 重同步状态动态下调，
     // 防止慢链路堆满两帧窗口后反复丢弃增量帧。
     std::atomic<int> streamFps_{30};
+    // 浏览器每 5 秒上报一次呈现侧增量指标；CaptureLoop 用 exchange 取走并写入同一
+    // 条 stream metrics，便于区分“编码慢”和“浏览器解码/绘制慢”。
+    std::atomic<uint64_t> clientDrawnFrames_{0};
+    std::atomic<uint64_t> clientDroppedFrames_{0};
+    std::atomic<uint64_t> clientDrawMsTotal_{0};
+    std::atomic<uint64_t> clientDrawMsSamples_{0};
+    std::atomic<uint64_t> clientDecodeErrors_{0};
+    std::atomic<uint32_t> clientMaxDecodeQueue_{0};
+    std::atomic<uint32_t> clientMaxWsBufferedBytes_{0};
     bool encoderReady_ = false;
     // 连接重建、切屏和解码器恢复后，在看到真正的 H.264 IDR 前不发送增量帧。
     // 仅由采集线程访问。

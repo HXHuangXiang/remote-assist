@@ -13,6 +13,14 @@ let pendingH264Presentation = null, h264DrawQueued = false, h264DrawRequestId = 
 let h264NeedsKeyFrame = true;
 let lastKeyFrameRequestAt = 0;
 let wheelRemainder = 0;
+// 键盘和鼠标按键绝不能因网络背压被丢弃；高频 move/wheel 则只保留最新状态，
+// 避免浏览器的 WebSocket 发送缓冲区堆满后，用户已经停手但远端鼠标仍持续移动。
+const inputBufferHighWaterMark = 16 * 1024;
+let pendingWheelDelta = 0, wheelQueued = false;
+const clientStats = {
+  drawn: 0, dropped: 0, drawMsTotal: 0, drawMsSamples: 0,
+  decodeErrors: 0, maxDecodeQueue: 0, maxWsBuffered: 0
+};
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
@@ -34,6 +42,9 @@ function connect() {
   log('connecting ' + url);
   releasePressedInputs();
   resetFramePipeline(false);
+  pendingMove = null;
+  pendingWheelDelta = 0;
+  wheelRemainder = 0;
   authed = false;
   setStatus('连接中');
   if (ws) { ws.close(); }
@@ -55,6 +66,9 @@ function connect() {
     resetFramePipeline(false);
     pressedKeys.clear();
     pressedButtons.clear();
+    pendingMove = null;
+    pendingWheelDelta = 0;
+    wheelRemainder = 0;
     ws = null;
     log('disconnected'); setStatus('未连接'); authed = false;
   };
@@ -128,6 +142,7 @@ function acknowledgeH264Frames() {
 function queueH264Presentation(videoFrame, info, streamId, decoder) {
   if (pendingH264Presentation) {
     acknowledgeFrameForSocket(pendingH264Presentation.info);
+    clientStats.dropped++;
     pendingH264Presentation.videoFrame.close();
   }
   pendingH264Presentation = {
@@ -152,6 +167,7 @@ function queueH264Presentation(videoFrame, info, streamId, decoder) {
     if (valid) {
       try {
         ctx.drawImage(presentation.videoFrame, 0, 0, canvas.width, canvas.height);
+        recordPresentedFrame(presentation.info);
       } catch (error) {
         log('H.264 draw error: ' + error.message);
       }
@@ -164,6 +180,7 @@ function queueH264Presentation(videoFrame, info, streamId, decoder) {
 function discardPendingH264Presentation(ackActive) {
   if (pendingH264Presentation) {
     if (ackActive) acknowledgeFrameForSocket(pendingH264Presentation.info);
+    clientStats.dropped++;
     pendingH264Presentation.videoFrame.close();
     pendingH264Presentation = null;
   }
@@ -211,6 +228,7 @@ function setupH264Decoder(c) {
     error: function(error) {
       if (h264Decoder !== decoder) return;
       log('H.264 decode error: ' + error.message);
+      clientStats.decodeErrors++;
       setStatus('H.264 解码失败');
       discardPendingH264Presentation(true);
       acknowledgeH264Frames();
@@ -284,13 +302,15 @@ function handleBinary(data) {
     if (h264Decoder.decodeQueueSize > 2) {
       // 丢掉一个 delta 后，后续参考帧不再可靠；直接回到下一张 IDR，保持低延迟。
       acknowledgeFrame(info.id);
+      clientStats.dropped++;
       h264NeedsKeyFrame = true;
       requestKeyFrame();
       return;
     }
     const socket = ws;
+    clientStats.maxDecodeQueue = Math.max(clientStats.maxDecodeQueue, h264Decoder.decodeQueueSize);
     const infos = h264Frames.get(info.timestamp) || [];
-    const pending = { id:info.id, socket:socket };
+    const pending = { id:info.id, socket:socket, receivedAt:performance.now() };
     infos.push(pending);
     h264Frames.set(info.timestamp, infos);
     try {
@@ -305,13 +325,19 @@ function handleBinary(data) {
       if (pendingIndex >= 0) infos.splice(pendingIndex, 1);
       if (infos.length === 0) h264Frames.delete(info.timestamp);
       acknowledgeFrame(info.id);
+      clientStats.dropped++;
       h264NeedsKeyFrame = true;
       requestKeyFrame();
       log('H.264 chunk rejected: ' + error.message);
     }
     return;
   }
-  pendingFrame = { data:data, id:info.id, streamId:info.streamId };
+  if (pendingFrame) {
+    // JPEG 没有帧间依赖，前端也始终只绘制最新帧；立刻确认旧帧以释放服务端窗口。
+    acknowledgeFrame(pendingFrame.id);
+    clientStats.dropped++;
+  }
+  pendingFrame = { data:data, id:info.id, streamId:info.streamId, receivedAt:performance.now() };
   if (!imgLoading) drawNext();
 }
 function drawNext() {
@@ -335,6 +361,7 @@ function drawNext() {
     if (generation !== decodeGeneration || ws !== socket) return;
     if (cfg && frame.streamId === cfg.stream_id) {
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      recordPresentedFrame(frame);
       // 图片已绘制到 canvas，释放服务端的唯一在途帧配额。
       acknowledgeFrame(frame.id);
     }
@@ -353,7 +380,84 @@ function drawNext() {
   img.src = url;
 }
 
-function send(obj) { if (ws && ws.readyState === WebSocket.OPEN && authed) ws.send(JSON.stringify(obj)); }
+function canSendInput() {
+  return ws && ws.readyState === WebSocket.OPEN && authed;
+}
+
+function send(obj) {
+  if (!canSendInput()) return false;
+  ws.send(JSON.stringify(obj));
+  clientStats.maxWsBuffered = Math.max(clientStats.maxWsBuffered, ws.bufferedAmount);
+  return true;
+}
+
+function recordPresentedFrame(info) {
+  clientStats.drawn++;
+  if (info && Number.isFinite(info.receivedAt)) {
+    clientStats.drawMsTotal += Math.max(0, performance.now() - info.receivedAt);
+    clientStats.drawMsSamples++;
+  }
+}
+
+function scheduleMoveFlush() {
+  if (moveQueued) return;
+  moveQueued = true;
+  requestAnimationFrame(flushPendingMove);
+}
+
+function flushPendingMove() {
+  moveQueued = false;
+  if (!pendingMove || !canSendInput()) {
+    if (!canSendInput()) pendingMove = null;
+    return;
+  }
+  if (ws.bufferedAmount > inputBufferHighWaterMark) {
+    // 保留最终位置，缓冲退下去后再发；不把早已过期的轨迹继续发送到远端。
+    window.setTimeout(scheduleMoveFlush, 16);
+    return;
+  }
+  const point = pendingMove;
+  pendingMove = null;
+  send({t:'move', x:point.x, y:point.y});
+  if (pendingMove) scheduleMoveFlush();
+}
+
+function scheduleWheelFlush() {
+  if (wheelQueued) return;
+  wheelQueued = true;
+  requestAnimationFrame(flushPendingWheel);
+}
+
+function flushPendingWheel() {
+  wheelQueued = false;
+  if (!pendingWheelDelta || !canSendInput()) {
+    if (!canSendInput()) pendingWheelDelta = 0;
+    return;
+  }
+  if (ws.bufferedAmount > inputBufferHighWaterMark) {
+    window.setTimeout(scheduleWheelFlush, 16);
+    return;
+  }
+  const delta = Math.max(-1200, Math.min(1200, Math.trunc(pendingWheelDelta)));
+  pendingWheelDelta -= delta;
+  if (delta) send({t:'wheel', delta:delta});
+  if (pendingWheelDelta) scheduleWheelFlush();
+}
+
+function flushClientStats() {
+  if (!canSendInput()) return;
+  const payload = {
+    t:'client_stats', drawn:clientStats.drawn, dropped:clientStats.dropped,
+    draw_ms_total:Math.round(clientStats.drawMsTotal),
+    draw_ms_samples:clientStats.drawMsSamples, decode_errors:clientStats.decodeErrors,
+    max_decode_queue:clientStats.maxDecodeQueue,
+    max_ws_buffered:Math.round(clientStats.maxWsBuffered)
+  };
+  clientStats.drawn = 0; clientStats.dropped = 0;
+  clientStats.drawMsTotal = 0; clientStats.drawMsSamples = 0;
+  clientStats.decodeErrors = 0; clientStats.maxDecodeQueue = 0; clientStats.maxWsBuffered = 0;
+  send(payload);
+}
 function btnName(b) { return b === 1 ? 'middle' : b === 2 ? 'right' : 'left'; }
 
 function normalizedWheelDelta(e) {
@@ -373,12 +477,7 @@ function normalizedWheelDelta(e) {
 function queueMove(e) {
   pendingMove = normXY(e);
   lastPointer = pendingMove;
-  if (moveQueued) return;
-  moveQueued = true;
-  requestAnimationFrame(function() {
-    moveQueued = false;
-    if (pendingMove) { send({t:'move', x:pendingMove.x, y:pendingMove.y}); pendingMove = null; }
-  });
+  scheduleMoveFlush();
 }
 
 function releasePressedInputs() {
@@ -484,11 +583,15 @@ window.addEventListener('DOMContentLoaded', function() {
   canvas.addEventListener('wheel', function(e) {
     if (!authed) return;
     const delta = normalizedWheelDelta(e);
-    if (delta) send({t:'wheel', delta:delta});
+    if (delta) {
+      pendingWheelDelta = Math.max(-12000, Math.min(12000, pendingWheelDelta + delta));
+      scheduleWheelFlush();
+    }
     e.preventDefault();
   }, { passive:false });
   window.addEventListener('blur', releasePressedInputs);
   document.addEventListener('visibilitychange', function() {
     if (document.hidden) releasePressedInputs();
   });
+  window.setInterval(flushClientStats, 5000);
 });

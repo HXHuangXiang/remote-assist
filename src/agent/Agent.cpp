@@ -113,6 +113,15 @@ uint64_t CounterDelta(uint64_t current, uint64_t previous) {
     return current >= previous ? current - previous : 0;
 }
 
+// C++17 没有 atomic::fetch_max。浏览器指标只用于诊断，保留一个窗口内峰值即可，
+// 通过 CAS 避免高频输入回调为此引入额外 mutex。
+void UpdateAtomicMax(std::atomic<uint32_t>& target, uint32_t value) {
+    uint32_t current = target.load(std::memory_order_relaxed);
+    while (current < value && !target.compare_exchange_weak(
+               current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
 std::string AvcCodecString(uint32_t profile) {
     char codec[16] = {};
     std::snprintf(codec, sizeof(codec), "avc1.%06X", profile & 0xFFFFFF);
@@ -456,8 +465,21 @@ void Agent::CaptureLoop() {
                                                    broadcasterStatsBase.sendFailures);
         const uint64_t h264Resyncs = CounterDelta(broadcasterStats.h264Resyncs,
                                                   broadcasterStatsBase.h264Resyncs);
+        const uint64_t clientDrawn = clientDrawnFrames_.exchange(0, std::memory_order_relaxed);
+        const uint64_t clientDropped = clientDroppedFrames_.exchange(0, std::memory_order_relaxed);
+        const uint64_t clientDrawMsTotal =
+            clientDrawMsTotal_.exchange(0, std::memory_order_relaxed);
+        const uint64_t clientDrawMsSamples =
+            clientDrawMsSamples_.exchange(0, std::memory_order_relaxed);
+        const uint64_t clientDecodeErrors =
+            clientDecodeErrors_.exchange(0, std::memory_order_relaxed);
+        const uint32_t clientMaxDecodeQueue =
+            clientMaxDecodeQueue_.exchange(0, std::memory_order_relaxed);
+        const uint32_t clientMaxWsBuffered =
+            clientMaxWsBufferedBytes_.exchange(0, std::memory_order_relaxed);
         const bool active = metrics.captureAttempts != 0 || queued != 0 || sent != 0 ||
-            acknowledged != 0 || ackTimeouts != 0 || sendFailures != 0 || h264Resyncs != 0;
+            acknowledged != 0 || ackTimeouts != 0 || sendFailures != 0 || h264Resyncs != 0 ||
+            clientDrawn != 0 || clientDropped != 0 || clientDecodeErrors != 0;
         if (active) {
             const auto elapsedMs = std::max<int64_t>(1,
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - metricsStartedAt).count());
@@ -467,6 +489,8 @@ void Agent::CaptureLoop() {
                 metrics.encodeTimeMs / metrics.encodeAttempts;
             const uint64_t avgAckMs = ackLatencySamples == 0 ? 0 :
                 ackLatencyUs / ackLatencySamples / 1000;
+            const uint64_t clientDrawAvgMs = clientDrawMsSamples == 0 ? 0 :
+                clientDrawMsTotal / clientDrawMsSamples;
             log::Info("stream metrics " + std::to_string(elapsedMs) + "ms clients=" +
                       std::to_string(server_.Broadcaster().Count()) +
                       " capture=" + std::to_string(metrics.capturedFrames) + "/" +
@@ -491,6 +515,12 @@ void Agent::CaptureLoop() {
                       " ack_timeout=" + std::to_string(ackTimeouts) +
                       " send_fail=" + std::to_string(sendFailures) +
                       " h264_resync=" + std::to_string(h264Resyncs) +
+                      " client_drawn=" + std::to_string(clientDrawn) +
+                      " client_dropped=" + std::to_string(clientDropped) +
+                      " client_draw_avg_ms=" + std::to_string(clientDrawAvgMs) +
+                      " client_decode_errors=" + std::to_string(clientDecodeErrors) +
+                      " client_decode_queue_max=" + std::to_string(clientMaxDecodeQueue) +
+                      " client_ws_buffered_max=" + std::to_string(clientMaxWsBuffered) +
                       " stream_fps=" + std::to_string(adaptiveFps) +
                       " stream_bitrate=" + std::to_string(adaptiveBitrate) +
                       " stream_cap=" +
@@ -840,6 +870,40 @@ void Agent::OnMessage(const std::string& msg) {
     }
     std::string t;
     if (!ReadJsonString(j, "t", t)) {
+        return;
+    }
+
+    if (t == "client_stats") {
+        // 这些指标仅用于定位浏览器解码/绘制是否成为瓶颈。每个字段都限制为一个
+        // 短统计窗口内的合理上限，避免异常页面把无界数值带入诊断日志。
+        int drawn = 0;
+        int dropped = 0;
+        int drawMsTotal = 0;
+        int drawMsSamples = 0;
+        int decodeErrors = 0;
+        int maxDecodeQueue = 0;
+        int maxWsBuffered = 0;
+        if (!ReadJsonIntInRange(j, "drawn", 0, 10'000, drawn) ||
+            !ReadJsonIntInRange(j, "dropped", 0, 10'000, dropped) ||
+            !ReadJsonIntInRange(j, "draw_ms_total", 0, 10'000'000, drawMsTotal) ||
+            !ReadJsonIntInRange(j, "draw_ms_samples", 0, 10'000, drawMsSamples) ||
+            !ReadJsonIntInRange(j, "decode_errors", 0, 10'000, decodeErrors) ||
+            !ReadJsonIntInRange(j, "max_decode_queue", 0, 10'000, maxDecodeQueue) ||
+            !ReadJsonIntInRange(j, "max_ws_buffered", 0, 16 * 1024 * 1024,
+                                maxWsBuffered)) {
+            return;
+        }
+        clientDrawnFrames_.fetch_add(static_cast<uint64_t>(drawn), std::memory_order_relaxed);
+        clientDroppedFrames_.fetch_add(static_cast<uint64_t>(dropped),
+                                       std::memory_order_relaxed);
+        clientDrawMsTotal_.fetch_add(static_cast<uint64_t>(drawMsTotal),
+                                     std::memory_order_relaxed);
+        clientDrawMsSamples_.fetch_add(static_cast<uint64_t>(drawMsSamples),
+                                       std::memory_order_relaxed);
+        clientDecodeErrors_.fetch_add(static_cast<uint64_t>(decodeErrors),
+                                      std::memory_order_relaxed);
+        UpdateAtomicMax(clientMaxDecodeQueue_, static_cast<uint32_t>(maxDecodeQueue));
+        UpdateAtomicMax(clientMaxWsBufferedBytes_, static_cast<uint32_t>(maxWsBuffered));
         return;
     }
 
