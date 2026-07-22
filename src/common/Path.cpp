@@ -14,6 +14,25 @@ constexpr DWORD kMaximumPathCapacity = 32768;
 
 }  // namespace
 
+std::string Utf8FromWide(const std::wstring& value) {
+    if (value.empty()) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                                         static_cast<int>(value.size()), nullptr, 0,
+                                         nullptr, nullptr);
+    if (size <= 0) {
+        return {};
+    }
+    std::string result(static_cast<size_t>(size), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                            static_cast<int>(value.size()), result.data(), size,
+                            nullptr, nullptr) != size) {
+        return {};
+    }
+    return result;
+}
+
 std::wstring ModulePath() {
     DWORD capacity = kInitialPathCapacity;
     while (capacity <= kMaximumPathCapacity) {

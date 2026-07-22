@@ -23,19 +23,6 @@ namespace remote_assist {
 
 namespace {
 
-std::string WideToUtf8(const std::wstring& w) {
-    if (w.empty()) {
-        return {};
-    }
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
-                                     static_cast<int>(w.size()), nullptr, 0,
-                                     nullptr, nullptr);
-    std::string s(static_cast<size_t>(n), 0);
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
-                        s.data(), n, nullptr, nullptr);
-    return s;
-}
-
 // 采集线程私有统计，按窗口输出增量而非每帧打日志，既便于定位性能瓶颈又不会
 // 因日志 I/O 干扰远控体验。
 struct CaptureLoopStats {
@@ -210,11 +197,11 @@ std::string Agent::WebDirFromExe() {
         const std::wstring full = AbsolutePath(alt);
         if (!full.empty()) {
             if (PathFileExistsW(full.c_str())) {
-                return WideToUtf8(full);
+                return Utf8FromWide(full);
             }
         }
     }
-    return WideToUtf8(dir);
+    return Utf8FromWide(dir);
 }
 
 int Agent::Run(bool serviceManaged) {

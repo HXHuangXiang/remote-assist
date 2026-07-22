@@ -4,6 +4,10 @@
 
 namespace remote_assist {
 
+// 将 Windows 宽字符串转换为 UTF-8。日志、HTTP 资源路径等跨进程/跨代码页文本必须
+// 统一使用该转换，不能直接按 wchar_t 截断为 char。
+std::string Utf8FromWide(const std::wstring& value);
+
 // 返回当前可执行文件的绝对路径。内部按需扩容，支持超过 MAX_PATH 的便携部署目录；
 // 失败返回空字符串，由调用方记录其所属流程的上下文错误。
 std::wstring ModulePath();

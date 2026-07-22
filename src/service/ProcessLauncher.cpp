@@ -1,6 +1,7 @@
 #include "service/ProcessLauncher.h"
 
 #include "common/Log.h"
+#include "common/Path.h"
 
 #include <tlhelp32.h>
 #include <userenv.h>
@@ -159,7 +160,7 @@ bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
         } else {
             CloseHandle(pi.hProcess);
         }
-        log::Info("launched child: " + std::string(commandLine.begin(), commandLine.end()));
+        log::Info("launched child: " + Utf8FromWide(commandLine));
     } else {
         log::Error("CreateProcessAsUserW failed: " + std::to_string(GetLastError()));
     }
