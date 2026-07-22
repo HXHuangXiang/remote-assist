@@ -69,7 +69,7 @@ private:
     bool CaptureGDI(CapturedFrame& out);
     void CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                            int x, int y, int width, int height,
-                           CapturedFrame& out) const;
+                           CapturedFrame& out);
     void ReleaseAll();
 
     // DXGI
@@ -100,6 +100,14 @@ private:
     int width_ = 0;
     int height_ = 0;
     bool use_gdi_ = false;
+
+    // 缩放时的相对源坐标表。分辨率稳定时重复使用，避免每帧按像素执行整数除法。
+    int scaleMapSourceWidth_ = 0;
+    int scaleMapSourceHeight_ = 0;
+    int scaleMapOutputWidth_ = 0;
+    int scaleMapOutputHeight_ = 0;
+    std::vector<int> scaleMapX_;
+    std::vector<int> scaleMapY_;
 };
 
 }  // namespace remote_assist

@@ -308,7 +308,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
 
 void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                                 int x, int y, int width, int height,
-                                CapturedFrame& out) const {
+                                CapturedFrame& out) {
     const double scale = std::min(1.0, std::min(
         static_cast<double>(kMaxStreamWidth) / width,
         static_cast<double>(kMaxStreamHeight) / height));
@@ -333,12 +333,28 @@ void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
         return;
     }
 
-    // 最近邻缩放避免额外依赖与大缓冲，优先保障远控的低延迟。
+    // 最近邻缩放避免额外依赖与大缓冲，优先保障远控的低延迟。源/目标尺寸不变时
+    // 复用坐标表，避免在 4K -> 1080p 情况下每帧执行约两百万次除法。
+    if (scaleMapSourceWidth_ != width || scaleMapSourceHeight_ != height ||
+        scaleMapOutputWidth_ != outputWidth || scaleMapOutputHeight_ != outputHeight) {
+        scaleMapSourceWidth_ = width;
+        scaleMapSourceHeight_ = height;
+        scaleMapOutputWidth_ = outputWidth;
+        scaleMapOutputHeight_ = outputHeight;
+        scaleMapX_.resize(static_cast<size_t>(outputWidth));
+        scaleMapY_.resize(static_cast<size_t>(outputHeight));
+        for (int outputX = 0; outputX < outputWidth; ++outputX) {
+            scaleMapX_[outputX] = outputX * width / outputWidth;
+        }
+        for (int outputY = 0; outputY < outputHeight; ++outputY) {
+            scaleMapY_[outputY] = outputY * height / outputHeight;
+        }
+    }
     for (int outputY = 0; outputY < outputHeight; ++outputY) {
-        const int sourceY = y + (outputY * height / outputHeight);
+        const int sourceY = y + scaleMapY_[outputY];
         uint8_t* destination = out.data.data() + static_cast<size_t>(outputY) * outputWidth * 4;
         for (int outputX = 0; outputX < outputWidth; ++outputX) {
-            const int sourceX = x + (outputX * width / outputWidth);
+            const int sourceX = x + scaleMapX_[outputX];
             const uint8_t* pixel = source + static_cast<size_t>(sourceY) * sourceStrideBytes +
                 static_cast<size_t>(sourceX) * 4;
             std::memcpy(destination + static_cast<size_t>(outputX) * 4, pixel, 4);
