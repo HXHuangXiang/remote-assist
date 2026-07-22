@@ -354,9 +354,13 @@ void ServiceWorker() {
     ReportState(SERVICE_RUNNING);
 
     auto cfg = LoadOrCreateConfig();
-    log::Info("config port=" + std::to_string(cfg.port) +
-              " fps=" + std::to_string(cfg.fps) +
-              " bitrate=" + std::to_string(cfg.bitrate));
+    if (cfg.passwordHash.empty() || cfg.salt.empty()) {
+        log::Error("configuration is invalid; agent will wait for setup dialog repair");
+    } else {
+        log::Info("config port=" + std::to_string(cfg.port) +
+                  " fps=" + std::to_string(cfg.fps) +
+                  " bitrate=" + std::to_string(cfg.bitrate));
+    }
 
     g_state.agentStopEvent = CreateProtectedAgentEvent(runtime::kAgentStopEventName);
     if (!g_state.agentStopEvent) {

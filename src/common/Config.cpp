@@ -296,7 +296,12 @@ Config LoadOrCreateConfig() {
     }
 
     if (!loaded && configFileFound) {
-        log::Warn("config invalid, regenerating defaults");
+        // 已存在的配置一旦损坏，不能静默覆盖并随机生成新密码：用户会失去原有
+        // 访问口令，且托盘可能展示与其预期不一致的新密码。保留原文件供排查，
+        // 由配置窗口设置新密码后显式修复。
+        RemoveInitialPasswordHint();
+        log::Error("config invalid, preserving file for repair in setup dialog");
+        return Config{};
     }
     if (!loaded) {
         cfg = Config{};

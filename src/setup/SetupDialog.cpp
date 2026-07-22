@@ -529,7 +529,9 @@ bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
 
 static void UpdateStatus() {
     std::wstring s;
-    if (!ServiceExists()) {
+    if (g_cfg.passwordHash.empty() || g_cfg.salt.empty()) {
+        s = L"配置文件无效：设置新密码后保存即可修复";
+    } else if (!ServiceExists()) {
         s = L"\u670d\u52a1\u672a\u5b89\u88c5";
     } else if (ServiceRunning()) {
         s = WaitForAgentReady(0) ?

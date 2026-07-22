@@ -173,7 +173,9 @@ bool TrayApp::CreateIcon() {
     AppendMenuW(hMenu_, MF_STRING, kMenuCommandShowPw, L"显示首次访问密码");
     AppendMenuW(hMenu_, MF_STRING, kMenuCommandAbout, L"关于 RemoteAssist");
     AppendMenuW(hMenu_, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu_, MF_STRING, kMenuCommandExit, L"退出托盘（服务继续运行）");
+    // 服务会监控 tray 子进程并自动恢复，因此这里不能承诺“退出后不再显示”。
+    // 使用准确文案，避免用户误以为该操作会停止服务或永久关闭托盘。
+    AppendMenuW(hMenu_, MF_STRING, kMenuCommandExit, L"关闭图标（服务会自动恢复）");
     if (!AddIconToTaskbar()) {
         DestroyMenu(hMenu_);
         hMenu_ = nullptr;
