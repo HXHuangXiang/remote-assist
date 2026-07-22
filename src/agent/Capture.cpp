@@ -75,7 +75,7 @@ BOOL CALLBACK Capture::MonitorEnumProc(HMONITOR hMon, HDC, LPRECT lprcMonitor, L
         m.y = lprcMonitor->top - vy;
         m.w = lprcMonitor->right - lprcMonitor->left;
         m.h = lprcMonitor->bottom - lprcMonitor->top;
-        // 通过 friend 或 public 接口添加 —— 用 const_cast 绕过 const(回调设计如此)。
+        // EnumMonitors 在持有 monitorMu_ 时发起该同步回调，因此可安全写入当前枚举列表。
         self->monitors_.push_back(m);
     }
     return TRUE;
@@ -114,6 +114,8 @@ void Capture::ReleaseAll() {
     gdiFingerprint_ = 0;
     hasGdiFingerprint_ = false;
     lastGdiFullFrameAt_ = {};
+    gdiConsecutiveFailures_ = 0;
+    lastGdiFailureLogAt_ = {};
     pointer_ = {};
     pointerKnown_ = false;
     pointerDirty_ = false;
@@ -206,6 +208,27 @@ void Capture::UpdatePointerFromSystem() {
     }
     UpdatePointerFromDesktop((cursorInfo.flags & CURSOR_SHOWING) != 0,
                              cursorInfo.ptScreenPos.x, cursorInfo.ptScreenPos.y);
+}
+
+void Capture::RecordGdiCaptureFailure(DWORD error) {
+    const auto now = std::chrono::steady_clock::now();
+    ++gdiConsecutiveFailures_;
+    if (lastGdiFailureLogAt_.time_since_epoch().count() == 0 ||
+        now - lastGdiFailureLogAt_ >= std::chrono::seconds(10)) {
+        log::Warn("GDI BitBlt failed: " + std::to_string(error) +
+                  " consecutive=" + std::to_string(gdiConsecutiveFailures_));
+        lastGdiFailureLogAt_ = now;
+    }
+}
+
+void Capture::RecordGdiCaptureRecovery() {
+    if (gdiConsecutiveFailures_ == 0) {
+        return;
+    }
+    log::Info("GDI BitBlt recovered after " + std::to_string(gdiConsecutiveFailures_) +
+              " consecutive failures");
+    gdiConsecutiveFailures_ = 0;
+    lastGdiFailureLogAt_ = {};
 }
 
 bool Capture::EnumMonitors() {
@@ -518,9 +541,10 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out) {
     const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     if (!BitBlt(mem_dc_, 0, 0, vw, vh, gdi_dc_, vx, vy, SRCCOPY | CAPTUREBLT)) {
         // GetDIBits 仅会读回当前 DIB 内容，不能作为屏幕采集失败后的替代方案。
-        log::Warn("GDI BitBlt failed: " + std::to_string(GetLastError()));
+        RecordGdiCaptureFailure(GetLastError());
         return CaptureResult::kFailed;
     }
+    RecordGdiCaptureRecovery();
     // GDI 不提供 Desktop Duplication 的 pointer metadata；读取当前输入桌面的系统
     // 指针即可保持锁屏和多屏回退路径也有相同的浏览器叠加反馈。
     UpdatePointerFromSystem();

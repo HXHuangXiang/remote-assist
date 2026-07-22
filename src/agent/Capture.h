@@ -109,6 +109,8 @@ private:
     void UpdatePointerFromDesktop(bool visible, int screenX, int screenY);
     void UpdatePointerFromFrame(const DXGI_OUTDUPL_FRAME_INFO& frameInfo);
     void UpdatePointerFromSystem();
+    void RecordGdiCaptureFailure(DWORD error);
+    void RecordGdiCaptureRecovery();
 
     // DXGI
     Microsoft::WRL::ComPtr<ID3D11Device> d3d_;
@@ -134,6 +136,8 @@ private:
     uint64_t gdiFingerprint_ = 0;
     bool hasGdiFingerprint_ = false;
     std::chrono::steady_clock::time_point lastGdiFullFrameAt_{};
+    uint64_t gdiConsecutiveFailures_ = 0;
+    std::chrono::steady_clock::time_point lastGdiFailureLogAt_{};
 
     // 指针状态与画面只由采集线程访问，无需同步。pointerDirty_ 允许 pointer-only
     // DXGI 通知通过独立 WebSocket 消息立即到达浏览器，而不会触发整帧编码。
