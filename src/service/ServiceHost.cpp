@@ -10,6 +10,7 @@
 #include <wtsapi32.h>
 
 #include <atomic>
+#include <mutex>
 #include <string>
 namespace remote_assist {
 
@@ -27,6 +28,9 @@ constexpr wchar_t kAgentEventSddl[] =
     L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)";
 
 struct ServiceState {
+    // SCM 的控制回调线程和 ServiceWorker 都会汇报状态。SERVICE_STATUS 是可变
+    // 结构，必须串行更新，避免 stop 控制与工作线程的 checkpoint/wait hint 互相覆盖。
+    std::mutex statusMu;
     SERVICE_STATUS status{};
     SERVICE_STATUS_HANDLE hStatus = nullptr;
     std::wstring exePath;
@@ -45,6 +49,7 @@ ServiceState g_state;
 
 void ReportState(DWORD state, DWORD exitCode = NO_ERROR, DWORD hint = 0,
                  DWORD checkpoint = 0) {
+    std::lock_guard<std::mutex> lock(g_state.statusMu);
     g_state.status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_state.status.dwCurrentState = state;
     g_state.status.dwWin32ExitCode = exitCode;
