@@ -39,7 +39,10 @@ DWORD FindProcessInSession(const wchar_t* exeName, DWORD sessionId) {
 }
 
 bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
-                                 const std::wstring& desktop) {
+                                 const std::wstring& desktop, HANDLE* processOut) {
+    if (processOut) {
+        *processOut = nullptr;
+    }
     const HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, srcPid);
     if (!hProc) {
         log::Error("OpenProcess(pid=" + std::to_string(srcPid) +
@@ -83,7 +86,11 @@ bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
     }
     if (ok) {
         CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+        if (processOut) {
+            *processOut = pi.hProcess;
+        } else {
+            CloseHandle(pi.hProcess);
+        }
         log::Info("launched child: " + std::string(commandLine.begin(), commandLine.end()));
     } else {
         log::Error("CreateProcessAsUserW failed: " + std::to_string(GetLastError()));
@@ -95,7 +102,7 @@ bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
     return ok == TRUE;
 }
 
-bool LaunchAgentInConsoleSession(const std::wstring& exePath) {
+bool LaunchAgentInConsoleSession(const std::wstring& exePath, HANDLE* processOut) {
     const DWORD sid = WTSGetActiveConsoleSessionId();
     if (sid == 0xFFFFFFFF) {
         log::Warn("no active console session, skip agent launch");
@@ -106,11 +113,11 @@ bool LaunchAgentInConsoleSession(const std::wstring& exePath) {
         log::Warn("winlogon.exe not found in console session");
         return false;
     }
-    const std::wstring cmd = L"\"" + exePath + L"\" --agent";
-    return LaunchChildWithProcessToken(winlogonPid, cmd, L"winsta0\\default");
+    const std::wstring cmd = L"\"" + exePath + L"\" --agent --service-managed";
+    return LaunchChildWithProcessToken(winlogonPid, cmd, L"winsta0\\default", processOut);
 }
 
-bool LaunchTrayInConsoleSession(const std::wstring& exePath) {
+bool LaunchTrayInConsoleSession(const std::wstring& exePath, HANDLE* processOut) {
     const DWORD sid = WTSGetActiveConsoleSessionId();
     if (sid == 0xFFFFFFFF) {
         return false;
@@ -121,8 +128,7 @@ bool LaunchTrayInConsoleSession(const std::wstring& exePath) {
         return false;
     }
     const std::wstring cmd = L"\"" + exePath + L"\" --tray";
-    return LaunchChildWithProcessToken(explorerPid, cmd, L"winsta0\\default");
+    return LaunchChildWithProcessToken(explorerPid, cmd, L"winsta0\\default", processOut);
 }
 
 }  // namespace remote_assist
-

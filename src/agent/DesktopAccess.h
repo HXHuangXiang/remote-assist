@@ -22,12 +22,16 @@ public:
     // 若当前 input desktop 与上次绑定不同,重新 SetThreadDesktop。返回是否发生重绑。
     bool CheckRebind();
 
+    // 当前线程是否已经成功绑定桌面。
+    bool IsBound() const { return h_desk_ != nullptr; }
+
     // 当前桌面名(Winlogon / Default 等),仅用于日志/状态展示。
     std::wstring CurrentName() const;
 
 private:
     HDESK h_desk_ = nullptr;
+    DWORD owner_thread_id_ = 0;
+    std::wstring desktop_name_;
 };
 
 }  // namespace remote_assist
-

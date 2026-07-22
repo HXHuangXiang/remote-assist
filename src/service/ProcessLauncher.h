@@ -12,15 +12,15 @@ DWORD FindProcessInSession(const wchar_t* exeName, DWORD sessionId);
 // 复制 srcPid 的 token,以 TokenPrimary + SecurityIdentification 复制成主令牌,
 // 然后用 CreateProcessAsUserW 启动 commandLine,桌面设为 desktop。
 // 用于让 LocalSystem 服务把子进程送入交互式会话(含 Winlogon 桌面)。
+// 成功时由 processOut 接管进程句柄;调用方负责 CloseHandle。
 bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
-                                 const std::wstring& desktop);
+                                 const std::wstring& desktop, HANDLE* processOut = nullptr);
 
 // 在当前控制台会话里,以 winlogon.exe 的 token 启动本 exe 的 --agent 模式,
 // 桌面 winsta0\default。agent 进而在 agent 模式内 OpenInputDesktop 切到当前桌面。
-bool LaunchAgentInConsoleSession(const std::wstring& exePath);
+bool LaunchAgentInConsoleSession(const std::wstring& exePath, HANDLE* processOut = nullptr);
 
 // 在当前控制台会话里,以 explorer.exe 的 token 启动 --tray 模式到用户桌面。
-bool LaunchTrayInConsoleSession(const std::wstring& exePath);
+bool LaunchTrayInConsoleSession(const std::wstring& exePath, HANDLE* processOut = nullptr);
 
 }  // namespace remote_assist
-

@@ -1,14 +1,16 @@
 #include "agent/Agent.h"
 
+#include "agent/DesktopAccess.h"
 #include "agent/Input.h"
 #include "common/Log.h"
+#include "common/RuntimeNames.h"
 
 #include <nlohmann/json.hpp>
 
 #include <objbase.h>
 #include <shlwapi.h>
 
-
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -35,6 +37,14 @@ std::string WideToUtf8(const std::wstring& w) {
 
 Agent::~Agent() {
     Stop();
+    if (stopEvent_) {
+        CloseHandle(stopEvent_);
+        stopEvent_ = nullptr;
+    }
+    if (instanceMutex_) {
+        CloseHandle(instanceMutex_);
+        instanceMutex_ = nullptr;
+    }
 }
 
 std::string Agent::WebDirFromExe() {
@@ -57,23 +67,43 @@ std::string Agent::WebDirFromExe() {
     return WideToUtf8(dir);
 }
 
-int Agent::Run() {
+int Agent::Run(bool serviceManaged) {
     log::Init(LogDir());
     log::Info("agent starting");
+
+    instanceMutex_ = CreateMutexW(nullptr, FALSE, runtime::kAgentMutexName);
+    const DWORD mutexError = GetLastError();
+    if (!instanceMutex_) {
+        log::Error("agent mutex creation failed: " + std::to_string(mutexError));
+        return 1;
+    }
+    if (mutexError == ERROR_ALREADY_EXISTS) {
+        log::Warn("agent already running, skip duplicate launch");
+        return 0;
+    }
+
+    if (serviceManaged) {
+        stopEvent_ = OpenEventW(SYNCHRONIZE, FALSE, runtime::kAgentStopEventName);
+        if (!stopEvent_) {
+            log::Error("agent stop event open failed: " + std::to_string(GetLastError()));
+            return 1;
+        }
+    }
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
 
     cfg_ = LoadOrCreateConfig();
+    if (cfg_.passwordHash.empty() || cfg_.salt.empty()) {
+        log::Error("agent: valid configuration unavailable");
+        CoUninitialize();
+        return 1;
+    }
     log::Info("agent config port=" + std::to_string(cfg_.port) +
               " fps=" + std::to_string(cfg_.fps));
 
-    if (!desktop_.Bind()) {
-        log::Error("agent: bind desktop failed");
-    }
-    if (!capture_.Init()) {
-        log::Error("agent: capture init failed");
-    }
+    // 显示器清单在启动网络服务前完成,后续仅由采集线程读取。
+    capture_.EnumMonitors();
 
     server_.SetWebDir(WebDirFromExe());
     server_.SetAuthVerifier([this](const std::string& token) {
@@ -84,13 +114,21 @@ int Agent::Run() {
 
     if (!server_.Start("0.0.0.0", cfg_.port)) {
         log::Error("agent: server start failed");
+        CoUninitialize();
+        return 1;
     }
 
     captureThread_ = std::thread(&Agent::CaptureLoop, this);
 
     // 主线程等待停止信号(MVP:轮询 stop_ 标志,后续可改事件)。
     while (!stop_.load()) {
-        Sleep(200);
+        const DWORD waitResult = stopEvent_
+            ? WaitForSingleObject(stopEvent_, 200)
+            : WAIT_TIMEOUT;
+        if (waitResult == WAIT_OBJECT_0) {
+            log::Info("agent stop event received");
+            Stop();
+        }
     }
 
     Stop();
@@ -115,21 +153,48 @@ void Agent::Stop() {
 
 void Agent::CaptureLoop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    DesktopAccess captureDesktop;
+    if (!captureDesktop.Bind()) {
+        log::Error("capture thread: bind desktop failed");
+    }
+    if (!capture_.Init()) {
+        log::Error("capture thread: capture init failed");
+    }
+    auto nextDesktopCheck = std::chrono::steady_clock::now();
+
     while (!stop_.load()) {
         const auto t0 = std::chrono::steady_clock::now();
 
         // 大屏幕降低帧率,平衡编码时间和带宽
         int effectiveFps = cfg_.fps;
-        if (deskWidth_ * deskHeight_ > 1920 * 1080) {
+        if (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080) {
             effectiveFps = std::min(effectiveFps, 15);
         }
         const int targetMs = 1000 / std::max(1, effectiveFps);
 
         // 跟随桌面切换(锁屏↔解锁、Winlogon↔Default)。
-        desktop_.CheckRebind();
+        // 桌面检查是较重的系统调用,每秒一次即可覆盖切换场景。
+        if (t0 >= nextDesktopCheck) {
+            nextDesktopCheck = t0 + std::chrono::seconds(1);
+            if (captureDesktop.CheckRebind()) {
+                capture_.ResetForDesktop();
+                prevFrame_.clear();
+                firstFrame_ = true;
+            }
+        }
 
         CapturedFrame frame;
-        if (!capture_.CaptureFrame(frame)) {
+        const CaptureResult captureResult = capture_.CaptureFrame(frame);
+        if (captureResult == CaptureResult::kNoChange) {
+            const auto t1 = std::chrono::steady_clock::now();
+            const auto used = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+            const int remain = targetMs - static_cast<int>(used);
+            if (remain > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(remain));
+            }
+            continue;
+        }
+        if (captureResult == CaptureResult::kFailed) {
             static int failCount = 0;
             if (++failCount % 300 == 1) {  // 每 10s(30fps*300)打一次,避免刷屏
                 log::Warn("capture frame failed, count=" + std::to_string(failCount));
@@ -153,9 +218,9 @@ void Agent::CaptureLoop() {
         prevFrame_ = frame.data;
         firstFrame_ = false;
 
-        if (!encoder_ || frame.width != deskWidth_ || frame.height != deskHeight_) {
-            deskWidth_ = frame.width;
-            deskHeight_ = frame.height;
+        if (!encoder_ || frame.width != deskWidth_.load() || frame.height != deskHeight_.load()) {
+            deskWidth_.store(frame.width);
+            deskHeight_.store(frame.height);
             encoderReady_ = false;
             encoder_ = std::make_unique<EncoderMf>();
             if (!encoder_->Init(frame.width, frame.height, cfg_.fps, cfg_.bitrate)) {
@@ -193,9 +258,10 @@ void Agent::CaptureLoop() {
 std::string Agent::MakeCfgJson() const {
     nlohmann::json j;
     j["t"] = "cfg";
-    j["codec"] = encoder_ ? encoder_->CodecString() : std::string("jpeg");
-    j["w"] = deskWidth_;
-    j["h"] = deskHeight_;
+    // 当前编码器固定输出 JPEG,避免跨线程读取 encoder_ 实例。
+    j["codec"] = "jpeg";
+    j["w"] = deskWidth_.load();
+    j["h"] = deskHeight_.load();
     j["fps"] = cfg_.fps;
     auto mons = nlohmann::json::array();
     for (const auto& m : capture_.Monitors()) {
@@ -206,35 +272,62 @@ std::string Agent::MakeCfgJson() const {
 }
 
 void Agent::OnMessage(const std::string& msg) {
+    // WebSocket 回调在线程池工作线程中执行。每个线程独立绑定当前输入桌面，
+    // 避免把采集线程的 desktop handle 跨线程复用。
+    thread_local DesktopAccess inputDesktop;
+    thread_local auto nextDesktopCheck = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (!inputDesktop.IsBound()) {
+        if (!inputDesktop.Bind()) {
+            return;
+        }
+        nextDesktopCheck = now + std::chrono::seconds(1);
+    } else if (now >= nextDesktopCheck) {
+        nextDesktopCheck = now + std::chrono::seconds(1);
+        inputDesktop.CheckRebind();
+    }
+
     auto j = nlohmann::json::parse(msg, nullptr, false);
     if (!j.is_object()) {
         return;
     }
     const std::string t = j.value("t", std::string());
     if (t == "key") {
-        const USHORT sc = static_cast<USHORT>(j.value("sc", 0));
+        const int scanCode = j.value("sc", 0);
+        if (scanCode <= 0 || scanCode > 0x7F) {
+            return;
+        }
+        const USHORT sc = static_cast<USHORT>(scanCode);
         const bool down = j.value("down", false);
-        Input::SendKey(sc, down);
+        const bool extended = j.value("ext", false);
+        Input::SendKey(sc, down, extended);
     } else if (t == "mouse") {
         const double x = j.value("x", 0.0);
         const double y = j.value("y", 0.0);
         const std::string btn = j.value("btn", std::string());
         const bool down = j.value("down", false);
-        Input::SendMouseAbs(x, y);
+        double virtualX = 0.0;
+        double virtualY = 0.0;
+        if (!capture_.MapNormalizedToVirtual(x, y, virtualX, virtualY)) {
+            return;
+        }
+        Input::SendMouseAbs(virtualX, virtualY);
         Input::SendMouseButton(btn, down);
     } else if (t == "move") {
         const double x = j.value("x", 0.0);
         const double y = j.value("y", 0.0);
-        Input::SendMouseAbs(x, y);
+        double virtualX = 0.0;
+        double virtualY = 0.0;
+        if (capture_.MapNormalizedToVirtual(x, y, virtualX, virtualY)) {
+            Input::SendMouseAbs(virtualX, virtualY);
+        }
     } else if (t == "wheel") {
-        const int delta = j.value("delta", 0);
+        const int delta = std::clamp(j.value("delta", 0), -1200, 1200);
         Input::SendWheel(delta);
     } else if (t == "monitor") {
         const int idx = j.value("index", -1);
         capture_.SetMonitor(idx);
         log::Info("monitor switched to idx=" + std::to_string(idx));
-        deskWidth_ = 0;
-        deskHeight_ = 0;
     }
 }
 

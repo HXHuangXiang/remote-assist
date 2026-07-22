@@ -2,15 +2,21 @@
 
 #include "common/Log.h"
 
+#include <algorithm>
+#include <cmath>
+
 #pragma comment(lib, "user32.lib")
 
 namespace remote_assist {
 
-bool Input::SendKey(USHORT sc, bool down) {
+bool Input::SendKey(USHORT sc, bool down, bool extended) {
     INPUT in{};
     in.type = INPUT_KEYBOARD;
     in.ki.wScan = sc;
     in.ki.dwFlags = KEYEVENTF_SCANCODE;
+    if (extended) {
+        in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    }
     if (!down) {
         in.ki.dwFlags |= KEYEVENTF_KEYUP;
     }
@@ -22,11 +28,16 @@ bool Input::SendKey(USHORT sc, bool down) {
 }
 
 bool Input::SendMouseAbs(double x, double y) {
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        return false;
+    }
+    x = std::clamp(x, 0.0, 1.0);
+    y = std::clamp(y, 0.0, 1.0);
     INPUT in{};
     in.type = INPUT_MOUSE;
     in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-    in.mi.dx = static_cast<LONG>(x * 65535.0);
-    in.mi.dy = static_cast<LONG>(y * 65535.0);
+    in.mi.dx = static_cast<LONG>(x * 65535.0 + 0.5);
+    in.mi.dy = static_cast<LONG>(y * 65535.0 + 0.5);
     return SendInput(1, &in, sizeof(INPUT)) == 1;
 }
 
@@ -56,4 +67,3 @@ bool Input::SendWheel(int delta) {
 }
 
 }  // namespace remote_assist
-

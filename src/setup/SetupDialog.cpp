@@ -1,6 +1,7 @@
 #include "setup/SetupDialog.h"
 #include "common/Config.h"
 #include "common/Log.h"
+#include "common/RuntimeNames.h"
 
 #include <shellapi.h>
 #include <string>
@@ -46,7 +47,7 @@ static std::wstring ExePath() {
 static bool ServiceExists() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return false;
-    SC_HANDLE svc = OpenServiceW(scm, L"remote-assist", SERVICE_QUERY_STATUS);
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_QUERY_STATUS);
     bool exists = svc != nullptr;
     if (svc) CloseServiceHandle(svc);
     CloseServiceHandle(scm);
@@ -56,7 +57,7 @@ static bool ServiceExists() {
 static bool ServiceRunning() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return false;
-    SC_HANDLE svc = OpenServiceW(scm, L"remote-assist", SERVICE_QUERY_STATUS);
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_QUERY_STATUS);
     if (!svc) { CloseServiceHandle(scm); return false; }
     SERVICE_STATUS st{};
     QueryServiceStatus(svc, &st);
@@ -70,7 +71,7 @@ static bool InstallService() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (!scm) { log::Error("OpenSCManager failed err=" + std::to_string(GetLastError())); return false; }
     std::wstring binPath = L"\"" + ExePath() + L"\" --service";
-    SC_HANDLE svc = CreateServiceW(scm, L"remote-assist", L"RemoteAssist",
+    SC_HANDLE svc = CreateServiceW(scm, runtime::kServiceName, L"RemoteAssist",
         SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
         SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
         binPath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -83,7 +84,7 @@ static bool InstallService() {
 static bool UninstallService() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return false;
-    SC_HANDLE svc = OpenServiceW(scm, L"remote-assist", SERVICE_STOP | DELETE);
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_STOP | DELETE);
     if (!svc) { CloseServiceHandle(scm); return false; }
     SERVICE_STATUS st{};
     ControlService(svc, SERVICE_CONTROL_STOP, &st);
@@ -96,7 +97,7 @@ static bool UninstallService() {
 static bool StartServiceS() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return false;
-    SC_HANDLE svc = OpenServiceW(scm, L"remote-assist", SERVICE_START);
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_START);
     if (!svc) { CloseServiceHandle(scm); return false; }
     bool ok = StartServiceW(svc, 0, nullptr);
     DWORD err = GetLastError();
@@ -108,7 +109,7 @@ static bool StartServiceS() {
 static bool StopServiceS() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return false;
-    SC_HANDLE svc = OpenServiceW(scm, L"remote-assist", SERVICE_STOP);
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_STOP);
     if (!svc) { CloseServiceHandle(scm); return false; }
     SERVICE_STATUS st{};
     bool ok = ControlService(svc, SERVICE_CONTROL_STOP, &st);
@@ -270,8 +271,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char pw[256] = {};
             GetDlgItemTextA(hwnd, IDC_PW_EDIT, pw, sizeof(pw));
             if (pw[0]) {
-                SetPassword(g_cfg, pw);
-                MessageBoxW(hwnd, L"\u5bc6\u7801\u5df2\u4fdd\u5b58", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+                if (SetPassword(g_cfg, pw)) {
+                    MessageBoxW(hwnd, L"\u5bc6\u7801\u5df2\u4fdd\u5b58", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBoxW(hwnd, L"\u5bc6\u7801\u4fdd\u5b58\u5931\u8d25,\u8bf7\u68c0\u67e5 exe \u76ee\u5f55\u5199\u6743\u9650", L"RemoteAssist", MB_OK | MB_ICONERROR);
+                }
             } else {
                 MessageBoxW(hwnd, L"\u8bf7\u8f93\u5165\u5bc6\u7801", L"RemoteAssist", MB_OK | MB_ICONWARNING);
             }
@@ -280,10 +284,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_SVC_INSTALL: {
             char pw[256] = {};
             GetDlgItemTextA(hwnd, IDC_PW_EDIT, pw, sizeof(pw));
-            if (pw[0]) SetPassword(g_cfg, pw);
+            if (pw[0] && !SetPassword(g_cfg, pw)) {
+                MessageBoxW(hwnd, L"\u5bc6\u7801\u4fdd\u5b58\u5931\u8d25,\u8bf7\u68c0\u67e5 exe \u76ee\u5f55\u5199\u6743\u9650", L"RemoteAssist", MB_OK | MB_ICONERROR);
+                break;
+            }
             char portStr[16] = {};
             GetDlgItemTextA(hwnd, IDC_PORT_EDIT, portStr, sizeof(portStr));
-            if (portStr[0]) { g_cfg.port = atoi(portStr); SaveConfig(g_cfg); }
+            if (portStr[0]) {
+                g_cfg.port = atoi(portStr);
+                if (!SaveConfig(g_cfg)) {
+                    MessageBoxW(hwnd, L"\u914d\u7f6e\u4fdd\u5b58\u5931\u8d25,\u8bf7\u68c0\u67e5 exe \u76ee\u5f55\u5199\u6743\u9650", L"RemoteAssist", MB_OK | MB_ICONERROR);
+                    break;
+                }
+            }
             if (InstallService()) {
                 MessageBoxW(hwnd, L"\u670d\u52a1\u5b89\u88c5\u6210\u529f,\u6b63\u5728\u542f\u52a8...", L"RemoteAssist", MB_OK);
                 StartServiceS();

@@ -22,6 +22,27 @@ namespace remote_assist {
 
 namespace {
 
+constexpr int kMinPort = 1;
+constexpr int kMaxPort = 65535;
+constexpr int kMinFps = 1;
+constexpr int kMaxFps = 60;
+constexpr int kMinBitrate = 100'000;
+constexpr int kMaxBitrate = 50'000'000;
+
+int HexValue(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+bool IsHex(const std::string& value, size_t expectedLength) {
+    if (value.size() != expectedLength) return false;
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return HexValue(ch) >= 0;
+    });
+}
+
 std::string ToHex(const uint8_t* data, size_t len) {
     static const char* kHex = "0123456789abcdef";
     std::string s;
@@ -35,11 +56,14 @@ std::string ToHex(const uint8_t* data, size_t len) {
 
 // 用 CNG BCrypt 计算 SHA-256(saltBytes || tokenUtf8),返回 hex 小写。
 std::string Sha256Hex(const std::string& saltHex, const std::string& token) {
+    if (!IsHex(saltHex, 32)) {
+        return {};
+    }
     std::vector<uint8_t> saltBytes;
     saltBytes.reserve(saltHex.size() / 2);
     for (size_t i = 0; i + 1 < saltHex.size(); i += 2) {
-        const auto v = static_cast<uint8_t>(
-            std::stoi(saltHex.substr(i, 2), nullptr, 16));
+        const auto v = static_cast<uint8_t>((HexValue(saltHex[i]) << 4) |
+                                            HexValue(saltHex[i + 1]));
         saltBytes.push_back(v);
     }
     std::vector<uint8_t> input = saltBytes;
@@ -70,10 +94,9 @@ std::string Sha256Hex(const std::string& saltHex, const std::string& token) {
 
 std::string GenRandomHex(size_t bytes) {
     std::vector<uint8_t> buf(bytes);
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_RNG_ALGORITHM, nullptr, 0) == 0) {
-        BCryptGenRandom(hAlg, buf.data(), static_cast<ULONG>(buf.size()), 0);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (BCryptGenRandom(nullptr, buf.data(), static_cast<ULONG>(buf.size()),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        return {};
     }
     return ToHex(buf.data(), buf.size());
 }
@@ -85,6 +108,49 @@ std::string GenReadablePassword() {
         return static_cast<char>(std::toupper(c));
     });
     return h;
+}
+
+bool IsConfigValid(const Config& cfg) {
+    return cfg.port >= kMinPort && cfg.port <= kMaxPort &&
+           cfg.fps >= kMinFps && cfg.fps <= kMaxFps &&
+           cfg.bitrate >= kMinBitrate && cfg.bitrate <= kMaxBitrate &&
+           IsHex(cfg.salt, 32) && IsHex(cfg.passwordHash, 64);
+}
+
+bool WriteConfigAtomically(const Config& cfg) {
+    nlohmann::json j;
+    j["port"] = cfg.port;
+    j["password_hash"] = cfg.passwordHash;
+    j["salt"] = cfg.salt;
+    j["bitrate"] = cfg.bitrate;
+    j["fps"] = cfg.fps;
+
+    const std::wstring path = ConfigFilePath();
+    const std::wstring tempPath = path + L".tmp";
+    {
+        std::ofstream f(tempPath, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            return false;
+        }
+        f << j.dump(2);
+        f.flush();
+        if (!f) {
+            return false;
+        }
+    }
+    return MoveFileExW(tempPath.c_str(), path.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
+bool ConstantTimeEquals(const std::string& left, const std::string& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    unsigned char difference = 0;
+    for (size_t i = 0; i < left.size(); ++i) {
+        difference |= static_cast<unsigned char>(left[i] ^ right[i]);
+    }
+    return difference == 0;
 }
 
 }  // namespace
@@ -114,6 +180,7 @@ Config LoadOrCreateConfig() {
     const std::wstring path = ConfigFilePath();
     std::ifstream f(path, std::ios::binary);
     bool loaded = false;
+    const bool configFileFound = static_cast<bool>(f);
     if (f) {
         std::stringstream ss;
         ss << f.rdbuf();
@@ -125,11 +192,18 @@ Config LoadOrCreateConfig() {
                 cfg.salt = j.value("salt", cfg.salt);
                 cfg.bitrate = j.value("bitrate", cfg.bitrate);
                 cfg.fps = j.value("fps", cfg.fps);
-                loaded = true;
+                loaded = IsConfigValid(cfg);
             }
         } catch (...) {
             loaded = false;
         }
+    }
+
+    if (!loaded && configFileFound) {
+        log::Warn("config invalid, regenerating defaults");
+    }
+    if (!loaded) {
+        cfg = Config{};
     }
 
     if (cfg.passwordHash.empty() || cfg.salt.empty()) {
@@ -137,7 +211,11 @@ Config LoadOrCreateConfig() {
         cfg.initialPassword = GenReadablePassword();
         cfg.passwordHash = Sha256Hex(cfg.salt, cfg.initialPassword);
 
-        nlohmann::json j;
+        if (!IsConfigValid(cfg)) {
+            log::Error("config generation failed");
+            return Config{};
+        }
+
         // 把明文密码写到一个 only-once 文件,供 tray 进程读取后删除;
         // 首次生成的密码不进入 service 的命令行或长期存储。
         {
@@ -148,14 +226,9 @@ Config LoadOrCreateConfig() {
                          static_cast<std::streamsize>(cfg.initialPassword.size()));
             }
         }
-        j["port"] = cfg.port;
-        j["password_hash"] = cfg.passwordHash;
-        j["salt"] = cfg.salt;
-        j["bitrate"] = cfg.bitrate;
-        j["fps"] = cfg.fps;
-        std::ofstream of(path, std::ios::binary | std::ios::trunc);
-        if (of) {
-            of << j.dump(2);
+        if (!WriteConfigAtomically(cfg)) {
+            log::Error("config write failed: " + std::to_string(GetLastError()));
+            return Config{};
         }
         log::Info("config generated with new password (len=" +
                   std::to_string(cfg.initialPassword.size()) + ")");
@@ -166,27 +239,24 @@ Config LoadOrCreateConfig() {
 }
 
 bool VerifyPassword(const Config& cfg, const std::string& token) {
-    if (cfg.passwordHash.empty() || token.empty()) {
+    if (!IsConfigValid(cfg) || token.empty()) {
         return false;
     }
-    return Sha256Hex(cfg.salt, token) == cfg.passwordHash;
+    return ConstantTimeEquals(Sha256Hex(cfg.salt, token), cfg.passwordHash);
 }
 
-void SaveConfig(const Config& cfg) {
-    nlohmann::json j;
-    j["port"] = cfg.port;
-    j["password_hash"] = cfg.passwordHash;
-    j["salt"] = cfg.salt;
-    j["bitrate"] = cfg.bitrate;
-    j["fps"] = cfg.fps;
-    std::ofstream f(ConfigFilePath(), std::ios::binary);
-    if (f) f << j.dump(2);
+bool SaveConfig(const Config& cfg) {
+    if (!IsConfigValid(cfg) || !WriteConfigAtomically(cfg)) {
+        log::Error("config save failed");
+        return false;
+    }
+    return true;
 }
 
-void SetPassword(Config& cfg, const std::string& password) {
-    if (cfg.salt.empty()) cfg.salt = GenRandomHex(16);
+bool SetPassword(Config& cfg, const std::string& password) {
+    if (!IsHex(cfg.salt, 32)) cfg.salt = GenRandomHex(16);
     cfg.passwordHash = Sha256Hex(cfg.salt, password);
-    SaveConfig(cfg);
+    return SaveConfig(cfg);
 }
 
 }  // namespace remote_assist

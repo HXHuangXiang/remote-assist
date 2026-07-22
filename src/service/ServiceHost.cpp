@@ -2,24 +2,30 @@
 
 #include "common/Config.h"
 #include "common/Log.h"
+#include "common/RuntimeNames.h"
 #include "service/ProcessLauncher.h"
 
 #include <windows.h>
 
 #include <atomic>
-#include <mutex>
-
+#include <string>
 namespace remote_assist {
 
 namespace {
 
-constexpr const wchar_t* kServiceName = L"RemoteAssist";
+constexpr DWORD kMonitorIntervalMs = 2000;
+constexpr DWORD kAgentStopTimeoutMs = 5000;
+constexpr DWORD kTrayStopTimeoutMs = 1000;
 
 struct ServiceState {
     SERVICE_STATUS status{};
     SERVICE_STATUS_HANDLE hStatus = nullptr;
     std::wstring exePath;
     std::atomic<bool> stopRequested{false};
+    HANDLE agentProcess = nullptr;
+    HANDLE trayProcess = nullptr;
+    HANDLE agentStopEvent = nullptr;
+    HANDLE childJob = nullptr;
 };
 ServiceState g_state;
 
@@ -31,7 +37,7 @@ void ReportState(DWORD state, DWORD exitCode = NO_ERROR, DWORD hint = 0) {
     g_state.status.dwCheckPoint = 0;
     g_state.status.dwWaitHint = hint;
     g_state.status.dwControlsAccepted =
-        (state == SERVICE_START_PENDING) ? 0 : SERVICE_ACCEPT_STOP;
+        (state == SERVICE_RUNNING) ? SERVICE_ACCEPT_STOP : 0;
     if (g_state.hStatus) {
         SetServiceStatus(g_state.hStatus, &g_state.status);
     }
@@ -41,7 +47,108 @@ void WINAPI ServiceHandler(DWORD ctrl) {
     if (ctrl == SERVICE_CONTROL_STOP) {
         g_state.stopRequested.store(true);
         ReportState(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+        if (g_state.agentStopEvent) {
+            SetEvent(g_state.agentStopEvent);
+        }
     }
+}
+
+void CloseChild(HANDLE& process, const char* role) {
+    if (!process) {
+        return;
+    }
+    DWORD exitCode = STILL_ACTIVE;
+    GetExitCodeProcess(process, &exitCode);
+    log::Info(std::string(role) + " exited, code=" + std::to_string(exitCode));
+    CloseHandle(process);
+    process = nullptr;
+}
+
+bool IsChildRunning(HANDLE& process, const char* role) {
+    if (!process) {
+        return false;
+    }
+    const DWORD result = WaitForSingleObject(process, 0);
+    if (result == WAIT_TIMEOUT) {
+        return true;
+    }
+    if (result == WAIT_OBJECT_0) {
+        CloseChild(process, role);
+        return false;
+    }
+    log::Warn(std::string("WaitForSingleObject failed for ") + role +
+              ": " + std::to_string(GetLastError()));
+    CloseChild(process, role);
+    return false;
+}
+
+void AddChildToJob(HANDLE process, const char* role) {
+    if (!g_state.childJob || !process) {
+        return;
+    }
+    if (!AssignProcessToJobObject(g_state.childJob, process)) {
+        log::Warn(std::string("AssignProcessToJobObject failed for ") + role +
+                  ": " + std::to_string(GetLastError()));
+    }
+}
+
+void EnsureAgent() {
+    if (IsChildRunning(g_state.agentProcess, "agent")) {
+        return;
+    }
+    if (!g_state.agentStopEvent) {
+        return;
+    }
+
+    HANDLE process = nullptr;
+    if (LaunchAgentInConsoleSession(g_state.exePath, &process)) {
+        g_state.agentProcess = process;
+        AddChildToJob(process, "agent");
+    }
+}
+
+void EnsureTray() {
+    if (IsChildRunning(g_state.trayProcess, "tray")) {
+        return;
+    }
+
+    HANDLE process = nullptr;
+    if (LaunchTrayInConsoleSession(g_state.exePath, &process)) {
+        g_state.trayProcess = process;
+        AddChildToJob(process, "tray");
+    }
+}
+
+void StopChild(HANDLE& process, const char* role, DWORD timeoutMs) {
+    if (!process) {
+        return;
+    }
+    if (WaitForSingleObject(process, timeoutMs) == WAIT_TIMEOUT) {
+        log::Warn(std::string("force stopping ") + role);
+        TerminateProcess(process, ERROR_PROCESS_ABORTED);
+        WaitForSingleObject(process, 1000);
+    }
+    CloseChild(process, role);
+}
+
+bool CreateChildJob() {
+    // Job 仅由当前服务实例持有，无需暴露为可被其他进程抢占的命名对象。
+    g_state.childJob = CreateJobObjectW(nullptr, nullptr);
+    if (!g_state.childJob) {
+        log::Error("CreateJobObject failed: " + std::to_string(GetLastError()));
+        return false;
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(g_state.childJob,
+            JobObjectExtendedLimitInformation, &info, sizeof(info))) {
+        log::Error("SetInformationJobObject failed: " + std::to_string(GetLastError()));
+        CloseHandle(g_state.childJob);
+        g_state.childJob = nullptr;
+        return false;
+    }
+    return true;
 }
 
 void ServiceWorker() {
@@ -56,14 +163,38 @@ void ServiceWorker() {
               " fps=" + std::to_string(cfg.fps) +
               " bitrate=" + std::to_string(cfg.bitrate));
 
-    // 启动 agent 到 winlogon 桌面;启动 tray 到用户桌面。
-    // agent 内部会重新 OpenInputDesktop 跟随当前桌面(锁屏/解锁切换)。
-    LaunchAgentInConsoleSession(g_state.exePath);
-    LaunchTrayInConsoleSession(g_state.exePath);
+    g_state.agentStopEvent = CreateEventW(nullptr, TRUE, FALSE,
+                                          runtime::kAgentStopEventName);
+    if (!g_state.agentStopEvent) {
+        log::Error("CreateEvent(agent stop) failed: " + std::to_string(GetLastError()));
+    } else {
+        ResetEvent(g_state.agentStopEvent);
+    }
+    CreateChildJob();
 
-    // MVP 监控循环:每 5 秒检查停止请求;agent 自然死亡由后续迭代加重启。
+    // 监控循环：未登录时会持续等待会话，子进程异常退出则按下一周期重建。
     while (!g_state.stopRequested.load()) {
-        Sleep(5000);
+        EnsureAgent();
+        EnsureTray();
+        if (g_state.agentStopEvent) {
+            WaitForSingleObject(g_state.agentStopEvent, kMonitorIntervalMs);
+        } else {
+            Sleep(kMonitorIntervalMs);
+        }
+    }
+
+    if (g_state.agentStopEvent) {
+        SetEvent(g_state.agentStopEvent);
+    }
+    StopChild(g_state.agentProcess, "agent", kAgentStopTimeoutMs);
+    StopChild(g_state.trayProcess, "tray", kTrayStopTimeoutMs);
+    if (g_state.childJob) {
+        CloseHandle(g_state.childJob);
+        g_state.childJob = nullptr;
+    }
+    if (g_state.agentStopEvent) {
+        CloseHandle(g_state.agentStopEvent);
+        g_state.agentStopEvent = nullptr;
     }
 
     log::Info("service worker exit");
@@ -71,7 +202,8 @@ void ServiceWorker() {
 }
 
 void WINAPI ServiceMain(DWORD, LPWSTR*) {
-    g_state.hStatus = RegisterServiceCtrlHandlerW(kServiceName, ServiceHandler);
+    g_state.stopRequested.store(false);
+    g_state.hStatus = RegisterServiceCtrlHandlerW(runtime::kServiceName, ServiceHandler);
     if (!g_state.hStatus) {
         return;
     }
@@ -88,7 +220,7 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
 
 int RunAsService() {
     SERVICE_TABLE_ENTRYW table[] = {
-        { const_cast<LPWSTR>(kServiceName), ServiceMain },
+        { const_cast<LPWSTR>(runtime::kServiceName), ServiceMain },
         { nullptr, nullptr }
     };
     if (!StartServiceCtrlDispatcherW(table)) {

@@ -1,5 +1,6 @@
 'use strict';
 let pendingFrame = null, imgLoading = false;
+let pendingMove = null, moveQueued = false;
 let ws = null, cfg = null, authed = false;
 let canvas, ctx, logEl, statusEl, pwEl, monSel;
 
@@ -95,6 +96,15 @@ function drawNext() {
 
 function send(obj) { if (ws && ws.readyState === WebSocket.OPEN && authed) ws.send(JSON.stringify(obj)); }
 function btnName(b) { return b === 1 ? 'middle' : b === 2 ? 'right' : 'left'; }
+function queueMove(e) {
+  pendingMove = normXY(e);
+  if (moveQueued) return;
+  moveQueued = true;
+  requestAnimationFrame(function() {
+    moveQueued = false;
+    if (pendingMove) { send({t:'move', x:pendingMove.x, y:pendingMove.y}); pendingMove = null; }
+  });
+}
 
 const codeToSc = {
   Escape:0x01, Digit1:0x02, Digit2:0x03, Digit3:0x04, Digit4:0x05, Digit5:0x06, Digit6:0x07,
@@ -111,6 +121,10 @@ const codeToSc = {
   ArrowLeft:0x4B, ArrowUp:0x48, ArrowRight:0x4D, ArrowDown:0x50,
   ControlRight:0x1D, AltRight:0x38, Delete:0x53, Insert:0x52, Home:0x47, End:0x4F, PageUp:0x49, PageDown:0x51
 };
+const extendedKeys = new Set([
+  'ControlRight', 'AltRight', 'ArrowLeft', 'ArrowUp', 'ArrowRight', 'ArrowDown',
+  'Delete', 'Insert', 'Home', 'End', 'PageUp', 'PageDown'
+]);
 
 function normXY(e) {
   const r = canvas.getBoundingClientRect();
@@ -131,14 +145,14 @@ window.addEventListener('DOMContentLoaded', function() {
   window.addEventListener('keydown', function(e) {
     if (!authed) return;
     const sc = codeToSc[e.code];
-    if (sc !== undefined) { e.preventDefault(); send({t:'key', sc: sc, down: true}); }
+    if (sc !== undefined) { e.preventDefault(); send({t:'key', sc: sc, ext:extendedKeys.has(e.code), down: true}); }
   });
   window.addEventListener('keyup', function(e) {
     if (!authed) return;
     const sc = codeToSc[e.code];
-    if (sc !== undefined) { e.preventDefault(); send({t:'key', sc: sc, down: false}); }
+    if (sc !== undefined) { e.preventDefault(); send({t:'key', sc: sc, ext:extendedKeys.has(e.code), down: false}); }
   });
-  canvas.addEventListener('mousemove', function(e) { if(!authed) return; const p = normXY(e); send({t:'move', x:p.x, y:p.y}); });
+  canvas.addEventListener('mousemove', function(e) { if(!authed) return; queueMove(e); });
   canvas.addEventListener('mousedown', function(e) { if(!authed) return; const p = normXY(e); send({t:'mouse', x:p.x, y:p.y, btn:btnName(e.button), down:true}); e.preventDefault(); });
   canvas.addEventListener('mouseup', function(e) { if(!authed) return; const p = normXY(e); send({t:'mouse', x:p.x, y:p.y, btn:btnName(e.button), down:false}); });
   canvas.addEventListener('contextmenu', function(e) { e.preventDefault(); });

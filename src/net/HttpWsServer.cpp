@@ -8,37 +8,85 @@
 
 namespace remote_assist {
 
-void WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
-    std::lock_guard<std::mutex> lk(mu_);
-    clients_.push_back(ws);
+WsBroadcaster::WsBroadcaster()
+    : senderThread_(&WsBroadcaster::SendLoop, this) {}
+
+WsBroadcaster::~WsBroadcaster() {
+    Stop();
+}
+
+bool WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
+    std::lock_guard<std::mutex> lk(clientMu_);
+    if (client_ && client_->is_open()) {
+        return false;
+    }
+    client_ = ws;
+    return true;
 }
 
 void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
-    std::lock_guard<std::mutex> lk(mu_);
-    clients_.erase(std::remove(clients_.begin(), clients_.end(), ws), clients_.end());
-}
-
-void WsBroadcaster::BroadcastBinary(const char* data, size_t len) {
-    std::lock_guard<std::mutex> lk(mu_);
-    for (auto* ws : clients_) {
-        if (ws && ws->is_open()) {
-            ws->send(data, len);
-        }
+    std::lock_guard<std::mutex> lk(clientMu_);
+    if (client_ == ws) {
+        client_ = nullptr;
     }
 }
 
-void WsBroadcaster::BroadcastText(const std::string& msg) {
-    std::lock_guard<std::mutex> lk(mu_);
-    for (auto* ws : clients_) {
-        if (ws && ws->is_open()) {
-            ws->send(msg);
+void WsBroadcaster::BroadcastBinary(const char* data, size_t len) {
+    {
+        std::lock_guard<std::mutex> lk(frameMu_);
+        if (stopping_) {
+            return;
         }
+        pendingFrame_.assign(reinterpret_cast<const uint8_t*>(data),
+                             reinterpret_cast<const uint8_t*>(data) + len);
+    }
+    frameCv_.notify_one();
+}
+
+void WsBroadcaster::BroadcastText(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(clientMu_);
+    if (client_ && client_->is_open()) {
+        client_->send(msg);
     }
 }
 
 int WsBroadcaster::Count() {
-    std::lock_guard<std::mutex> lk(mu_);
-    return static_cast<int>(clients_.size());
+    std::lock_guard<std::mutex> lk(clientMu_);
+    return (client_ && client_->is_open()) ? 1 : 0;
+}
+
+void WsBroadcaster::Stop() {
+    {
+        std::lock_guard<std::mutex> lk(frameMu_);
+        if (stopping_) {
+            return;
+        }
+        stopping_ = true;
+        pendingFrame_.clear();
+    }
+    frameCv_.notify_all();
+    if (senderThread_.joinable()) {
+        senderThread_.join();
+    }
+}
+
+void WsBroadcaster::SendLoop() {
+    for (;;) {
+        std::vector<uint8_t> frame;
+        {
+            std::unique_lock<std::mutex> lk(frameMu_);
+            frameCv_.wait(lk, [this] { return stopping_ || !pendingFrame_.empty(); });
+            if (stopping_) {
+                return;
+            }
+            frame.swap(pendingFrame_);
+        }
+
+        std::lock_guard<std::mutex> lk(clientMu_);
+        if (client_ && client_->is_open()) {
+            client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
+        }
+    }
 }
 
 HttpWsServer::HttpWsServer() = default;
@@ -56,6 +104,8 @@ void HttpWsServer::SetCfgProvider(CfgProvider p) { cfgProvider_ = std::move(p); 
 void HttpWsServer::SetOnMessage(OnMessage cb) { onMessage_ = std::move(cb); }
 
 bool HttpWsServer::Start(const std::string& host, int port) {
+    // 发送超时保护发送线程，避免失联浏览器长期占用 socket 写操作。
+    svr_.set_write_timeout(2, 0);
     svr_.WebSocket("/ws", [this](const httplib::Request&, httplib::ws::WebSocket& ws) {
         // 鉴权:第一帧必须是文本 JSON {"t":"auth","token":"..."}
         std::string msg;
@@ -86,7 +136,11 @@ bool HttpWsServer::Start(const std::string& host, int port) {
         if (cfgProvider_) {
             ws.send(cfgProvider_());
         }
-        broadcaster_.Add(&ws);
+        if (!broadcaster_.Add(&ws)) {
+            ws.send("{\"t\":\"error\",\"msg\":\"controller already connected\"}");
+            ws.close(httplib::ws::CloseStatus::PolicyViolation, "controller already connected");
+            return;
+        }
         log::Info("ws client connected, total=" + std::to_string(broadcaster_.Count()));
 
         // 输入消息循环:浏览器回传的键鼠事件 JSON 在此转交 agent 处理。
@@ -104,9 +158,14 @@ bool HttpWsServer::Start(const std::string& host, int port) {
         log::Info("ws client disconnected");
     });
 
+    if (!svr_.bind_to_port(host, port)) {
+        log::Error("bind failed on " + host + ":" + std::to_string(port));
+        return false;
+    }
+
     running_ = true;
     thread_ = std::thread([this, host, port]() {
-        if (!svr_.listen(host, port)) {
+        if (!svr_.listen_after_bind()) {
             log::Error("listen failed on " + host + ":" + std::to_string(port));
             running_ = false;
             return;
@@ -121,8 +180,8 @@ void HttpWsServer::Stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+    broadcaster_.Stop();
     running_ = false;
 }
 
 }  // namespace remote_assist
-

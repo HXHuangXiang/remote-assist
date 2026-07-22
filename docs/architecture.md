@@ -7,12 +7,12 @@
       |- ProcessLauncher
       |    |- 复制 winlogon.exe token -> CreateProcessAsUser(--agent, lpDesktop=winsta0\default)
       |    \- 复制 explorer.exe token -> CreateProcessAsUser(--tray, 用户桌面)
-      \- 监控 agent/tray 存活,退出则按需拉起
+      \- 保留 agent/tray 进程句柄并监控存活，退出则按需拉起；停止服务时回收子进程
 
     RemoteAssist.exe --agent   (由 winlogon token 启动,绑定当前 input desktop)
-      |- DesktopAccess: OpenInputDesktop + SetThreadDesktop,周期重绑跟随锁屏<->解锁
+      |- DesktopAccess: 每个工作线程独立 OpenInputDesktop + SetThreadDesktop，每秒检查桌面切换
       |- Capture: DXGI Desktop Duplication(普通桌面)/ GDI BitBlt(锁屏回退)
-      |- EncoderMf: Media Foundation H.264,输出 Annex-B NAL
+      |- EncoderMf: WIC JPEG 编码，输出单张 JPEG 帧
       |- HttpWsServer: cpp-httplib 托管 web/ + /ws
       \- Input: SendInput 注入键鼠(锁屏桌面用 scancode 路径)
 
@@ -21,7 +21,7 @@
 
 ## 桌面跟随
 
-agent 周期(约每帧)OpenInputDesktop 比较句柄,变化则 SetThreadDesktop 重绑,覆盖 锁屏<->解锁、Winlogon<->Default 切换。MVP 不处理 UAC Secure Desktop(Winlogon 桌面已满足锁屏可见可操作)。
+采集线程和输入线程各自持有当前 input desktop。每秒按桌面名检测变化，变化后重建与旧桌面相关的采集资源，覆盖 锁屏<->解锁、Winlogon<->Default 切换。MVP 不处理 UAC Secure Desktop(Winlogon 桌面已满足锁屏可见可操作)。
 
 ## 安全边界
 
@@ -30,6 +30,5 @@ agent 周期(约每帧)OpenInputDesktop 比较句柄,变化则 SetThreadDesktop 
 
 ## 配置文件
 
-%ProgramData%\RemoteAssist\config.json:port、password_hash(SHA-256 hex)、salt、bitrate、fps。
+exe 同目录的 config.json:port、password_hash(SHA-256 hex)、salt、bitrate、fps；日志位于 exe 同目录 logs/。
 首次启动生成随机密码与 salt,计算哈希并写回;同时把明文密码写入 .initial-password,供 tray 进程读取展示后删除。
-

@@ -19,8 +19,10 @@ std::wstring LogDir();
 std::wstring ConfigFilePath();
 
 Config LoadOrCreateConfig();
-void SaveConfig(const Config& cfg);
-void SetPassword(Config& cfg, const std::string& password);
+// 原子写入配置，失败时返回 false。
+bool SaveConfig(const Config& cfg);
+// 更新密码哈希并保存配置，失败时返回 false。
+bool SetPassword(Config& cfg, const std::string& password);
 bool VerifyPassword(const Config& cfg, const std::string& token);
 
 }  // namespace remote_assist

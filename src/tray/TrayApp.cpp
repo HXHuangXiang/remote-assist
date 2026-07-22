@@ -114,7 +114,7 @@ void TrayApp::ShowMenu() {
 void TrayApp::ShowPasswordDialog() {
     std::wstring msg;
     if (password_.empty()) {
-        msg = L"密码已展示过或非首次启动。如需重置,请删除 %ProgramData%\\RemoteAssist\\config.json 后重启服务。";
+        msg = L"密码已展示过或非首次启动。如需重置,请删除当前 exe 同目录的 config.json 后重启服务。";
     } else {
         msg = L"访问密码(仅本次显示,请妥善保存):\n\n" + password_ +
               L"\n\n浏览器打开 http://<本机IP>:7980/ 后输入此密码连接。";
@@ -157,4 +157,3 @@ int TrayApp::Run() {
 }
 
 }  // namespace remote_assist
-

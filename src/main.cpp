@@ -23,7 +23,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int) {
 
     if (HasArg(cmd, L"--agent")) {
         remote_assist::Agent agent;
-        return agent.Run();
+        return agent.Run(HasArg(cmd, L"--service-managed"));
     }
     if (HasArg(cmd, L"--service")) {
         return remote_assist::RunAsService();
