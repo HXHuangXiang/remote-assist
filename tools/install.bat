@@ -13,6 +13,16 @@ if not exist "%EXE%" (
   exit /b 1
 )
 
+rem 不能把普通用户可写目录中的文件注册为 LocalSystem 服务。与图形安装共用
+rem RemoteAssist.exe 内置的 ACL 校验；失败时不执行任何 sc 操作。
+"%EXE%" --check-service-install-dir
+if errorlevel 1 (
+  echo 当前目录不适合安装 LocalSystem 服务：其中的 exe、web 或父目录可被非管理员改写。
+  echo 请将整个 dist 目录放到仅管理员和 LocalSystem 可写的本机固定磁盘目录后重试。
+  pause
+  exit /b 1
+)
+
 rem 已存在的服务直接更新路径，避免 stop/delete/create 连续执行导致 1072（服务标记删除）。
 sc query "%SERVICE%" >nul 2>&1
 if errorlevel 1 goto :create_service

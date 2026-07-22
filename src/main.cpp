@@ -4,6 +4,8 @@
 
 #include "agent/Agent.h"
 #include "common/Log.h"
+#include "common/Path.h"
+#include "common/ServiceInstallSecurity.h"
 #include "service/ServiceHost.h"
 #include "setup/SetupDialog.h"
 #include "tray/TrayApp.h"
@@ -55,8 +57,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     const bool serviceMode = HasArg(argc, argv, L"--service");
     const bool trayMode = HasArg(argc, argv, L"--tray");
     const bool serviceManaged = HasArg(argc, argv, L"--service-managed");
+    const bool checkServiceInstallPath = HasArg(argc, argv, L"--check-service-install-dir");
     LocalFree(argv);
 
+    if (checkServiceInstallPath) {
+        // 供 tools/install.bat 在调用 sc create 前复用与图形安装完全相同的 ACL
+        // 校验。此模式不创建窗口，也不写配置或日志。
+        return remote_assist::ValidateServiceInstallPath(remote_assist::ModulePath()).secure ? 0 : 2;
+    }
     if (agentMode) {
         remote_assist::Agent agent;
         return agent.Run(serviceManaged);

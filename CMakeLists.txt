@@ -39,6 +39,7 @@ set(SOURCES
     src/common/Config.cpp
     src/common/Log.cpp
     src/common/Path.cpp
+    src/common/ServiceInstallSecurity.cpp
     src/service/ProcessLauncher.cpp
     src/service/ServiceHost.cpp
     src/agent/DesktopAccess.cpp

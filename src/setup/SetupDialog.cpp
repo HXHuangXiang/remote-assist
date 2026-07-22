@@ -3,6 +3,7 @@
 #include "common/Log.h"
 #include "common/Path.h"
 #include "common/RuntimeNames.h"
+#include "common/ServiceInstallSecurity.h"
 
 #include <netfw.h>
 #include <wrl/client.h>
@@ -96,6 +97,8 @@ struct InstallServiceResult {
     ServiceResult service;
     // 防火墙策略可能被企业策略锁定。服务安装不因该项失败回滚，但 UI 必须明确提示。
     DWORD firewallError = ERROR_SUCCESS;
+    // 安装路径不安全时，向用户说明具体目录而不是只显示笼统的 ACCESS_DENIED。
+    std::wstring pathSecurityReason;
 };
 
 // COM 防火墙接口接收 BSTR。此小型 RAII 包装避免每个错误分支遗漏 SysFreeString。
@@ -331,13 +334,21 @@ static bool WaitForAgentReady(DWORD timeoutMs) {
 }
 
 static InstallServiceResult InstallService() {
+    const std::wstring exePath = ExePath();
+    const ServiceInstallPathValidation pathValidation =
+        ValidateServiceInstallPath(exePath);
+    if (!pathValidation.secure) {
+        log::Warn("service install rejected by path ACL validation");
+        return {ServiceFailure(ERROR_ACCESS_DENIED), ERROR_SUCCESS,
+                pathValidation.reason};
+    }
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (!scm) {
         const DWORD error = GetLastError();
         log::Error("OpenSCManager failed err=" + std::to_string(error));
         return {ServiceFailure(error)};
     }
-    std::wstring binPath = L"\"" + ExePath() + L"\" --service";
+    std::wstring binPath = L"\"" + exePath + L"\" --service";
     SC_HANDLE svc = CreateServiceW(scm, runtime::kServiceName, L"RemoteAssist",
         SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP | SERVICE_CHANGE_CONFIG | DELETE,
         SERVICE_WIN32_OWN_PROCESS,
@@ -356,7 +367,7 @@ static InstallServiceResult InstallService() {
         CloseServiceHandle(svc);
         CloseServiceHandle(scm);
         DWORD firewallError = ERROR_SUCCESS;
-        if (!ConfigurePrivateFirewallRule(ExePath(), g_cfg.port, firewallError)) {
+        if (!ConfigurePrivateFirewallRule(exePath, g_cfg.port, firewallError)) {
             log::Warn("private firewall rule update failed err=" +
                       std::to_string(firewallError));
         }
@@ -748,7 +759,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             const InstallServiceResult install = InstallService();
             if (!install.service.ok) {
-                ShowServiceError(hwnd, L"安装服务", install.service.error);
+                if (!install.pathSecurityReason.empty()) {
+                    const std::wstring message =
+                        L"为防止非管理员改写 LocalSystem 服务，已拒绝从当前目录安装。\n\n" +
+                        install.pathSecurityReason +
+                        L"\n\n请将 RemoteAssist.exe 与 web 目录放到仅管理员和 LocalSystem "
+                        L"可写的本机固定磁盘目录，然后重新以管理员身份运行。";
+                    MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONWARNING);
+                } else {
+                    ShowServiceError(hwnd, L"安装服务", install.service.error);
+                }
                 UpdateStatus();
                 break;
             }
