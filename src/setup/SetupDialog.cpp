@@ -5,6 +5,7 @@
 
 #include <shellapi.h>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,30 @@ ServiceResult ServiceSuccess() {
 
 ServiceResult ServiceFailure(DWORD error) {
     return {false, error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error};
+}
+
+// GUI 安装路径与 tools/install.bat 保持一致：异常退出由 SCM 自动拉起，正常
+// StopService 不受影响；这样用户双击安装后不会少掉脚本安装才有的恢复能力。
+ServiceResult ConfigureServiceRecovery(SC_HANDLE service) {
+    SERVICE_DESCRIPTIONW description{};
+    description.lpDescription = const_cast<LPWSTR>(L"RemoteAssist 远控被控端(LocalSystem)");
+    if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description)) {
+        return ServiceFailure(GetLastError());
+    }
+
+    SC_ACTION actions[] = {
+        {SC_ACTION_RESTART, 5000},
+        {SC_ACTION_RESTART, 10000},
+        {SC_ACTION_NONE, 0},
+    };
+    SERVICE_FAILURE_ACTIONSW recovery{};
+    recovery.dwResetPeriod = 86400;
+    recovery.cActions = static_cast<DWORD>(std::size(actions));
+    recovery.lpsaActions = actions;
+    if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &recovery)) {
+        return ServiceFailure(GetLastError());
+    }
+    return ServiceSuccess();
 }
 
 bool QueryServiceState(SC_HANDLE service, SERVICE_STATUS_PROCESS& status, DWORD& error) {
@@ -162,11 +187,20 @@ static ServiceResult InstallService() {
     }
     std::wstring binPath = L"\"" + ExePath() + L"\" --service";
     SC_HANDLE svc = CreateServiceW(scm, runtime::kServiceName, L"RemoteAssist",
-        SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP | DELETE,
+        SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP | SERVICE_CHANGE_CONFIG | DELETE,
         SERVICE_WIN32_OWN_PROCESS,
         SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
         binPath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
     if (svc) {
+        const ServiceResult configured = ConfigureServiceRecovery(svc);
+        if (!configured.ok) {
+            log::Error("ConfigureServiceRecovery failed err=" +
+                       std::to_string(configured.error));
+            DeleteService(svc);
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return configured;
+        }
         CloseServiceHandle(svc);
         CloseServiceHandle(scm);
         return ServiceSuccess();
