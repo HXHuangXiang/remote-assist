@@ -243,13 +243,21 @@ int Agent::Run(bool serviceManaged) {
         ResetEvent(stopEvent_);
     }
 
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
+    const HRESULT mainComInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool mainComInitialized = SUCCEEDED(mainComInit);
+    if (FAILED(mainComInit) && mainComInit != RPC_E_CHANGED_MODE) {
+        log::Warn("agent: CoInitializeEx failed hr=" + std::to_string(mainComInit));
+    }
+    const auto uninitializeMainCom = [&] {
+        if (mainComInitialized) {
+            CoUninitialize();
+        }
+    };
 
     cfg_ = LoadOrCreateConfig();
     if (cfg_.passwordHash.empty() || cfg_.salt.empty()) {
         log::Error("agent: valid configuration unavailable");
-        CoUninitialize();
+        uninitializeMainCom();
         return 1;
     }
     Input::Enable();
@@ -263,7 +271,7 @@ int Agent::Run(bool serviceManaged) {
     const std::string webDir = WebDirFromExe();
     if (!server_.SetWebDir(webDir)) {
         log::Error("agent: web resource directory unavailable: " + webDir);
-        CoUninitialize();
+        uninitializeMainCom();
         return 1;
     }
     server_.SetAuthVerifier([this](const std::string& token) {
@@ -275,7 +283,7 @@ int Agent::Run(bool serviceManaged) {
 
     if (!server_.Start("0.0.0.0", cfg_.port)) {
         log::Error("agent: server start failed");
-        CoUninitialize();
+        uninitializeMainCom();
         return 1;
     }
     if (readyEvent_) {
@@ -302,7 +310,7 @@ int Agent::Run(bool serviceManaged) {
     }
 
     Stop();
-    CoUninitialize();
+    uninitializeMainCom();
     log::Info("agent exit");
     return runResult;
 }
@@ -327,14 +335,16 @@ void Agent::Stop() {
     if (captureThread_.joinable()) {
         captureThread_.join();
     }
-    if (encoder_) {
-        encoder_->Release();
-        encoder_.reset();
-    }
+    // EncoderMf 在采集线程中调用 MFStartup；该线程退出前已经完成 Release/MFShutdown。
+    // 此处 join 仅同步其生命周期，不能跨线程再次触碰 MFT。
 }
 
 void Agent::CaptureLoop() {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool comInitialized = SUCCEEDED(comInit);
+    if (FAILED(comInit) && comInit != RPC_E_CHANGED_MODE) {
+        log::Warn("capture thread: CoInitializeEx failed hr=" + std::to_string(comInit));
+    }
     DesktopAccess captureDesktop;
     if (!captureDesktop.Bind()) {
         log::Error("capture thread: bind desktop failed");
@@ -906,7 +916,16 @@ void Agent::CaptureLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(remain));
         }
     }
-    CoUninitialize();
+    // Media Foundation 的启动与关闭必须保持在同一线程。硬件 MFT 还可能持有该
+    // 线程关联的 COM 资源，因此必须在 CoUninitialize 前释放编码器。
+    if (encoder_) {
+        encoder_->Release();
+        encoder_.reset();
+        encoderReady_ = false;
+    }
+    if (comInitialized) {
+        CoUninitialize();
+    }
 }
 
 std::string Agent::MakeCfgJson() const {
@@ -1058,8 +1077,13 @@ void Agent::OnMessage(const std::string& msg) {
 }
 
 void Agent::OnControllerDisconnected() {
-    // 该回调在接收输入的 WebSocket 工作线程中运行。若本连接曾注入过输入，
-    // 线程已经绑定了对应 desktop，可直接释放远端残留的按下状态。
+    // 该回调在接收输入的 WebSocket 工作线程中运行。断连恰好发生在锁屏/解锁
+    // 切换后时，该线程可能仍绑定旧 desktop；先绑定当前 input desktop，确保释放
+    // 的键鼠事件送往用户当前可见的界面。
+    DesktopAccess disconnectDesktop;
+    if (!disconnectDesktop.Bind()) {
+        log::Warn("controller disconnect: unable to bind current input desktop");
+    }
     Input::ReleaseAll();
     // 即使控制端快速重连，以 CaptureLoop 未观察到“零客户端”为例，也要确保
     // 下一帧从 IDR 开始，并恢复下一位控制者的质量上限。

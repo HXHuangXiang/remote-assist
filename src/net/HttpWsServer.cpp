@@ -33,16 +33,18 @@ public:
         if (!armed_) {
             return;
         }
-        const bool wasCurrentController = broadcaster_.Remove(&ws_);
-        if (wasCurrentController) {
-            try {
-                if (onDisconnected_) {
-                    onDisconnected_();
-                }
-            } catch (...) {
-                // 析构函数绝不能因业务回调异常终止 WebSocket 工作线程。
-                log::Error("controller disconnect callback threw an exception");
+        // 保持 controller 槽位占用直到所有按下状态已释放。若先 Remove，再由新的
+        // WebSocket 连接抢占槽位，旧连接的 ReleaseAll 会误抬起新控制端刚按下的键。
+        // 关闭中的旧 socket 不再接收输入，但 Add 仍会因 client_ 非空而拒绝接管。
+        try {
+            if (onDisconnected_) {
+                onDisconnected_();
             }
+        } catch (...) {
+            // 析构函数绝不能因业务回调异常终止 WebSocket 工作线程。
+            log::Error("controller disconnect callback threw an exception");
+        }
+        if (broadcaster_.Remove(&ws_)) {
             log::Info("ws client disconnected");
         }
     }
@@ -91,8 +93,8 @@ bool WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
     // Count()==1 就入队首个 IDR，随后又被 Add 的清理步骤丢弃，导致新页面等不到画面。
     std::lock_guard<std::mutex> frameLock(frameMu_);
     std::lock_guard<std::mutex> clientLock(clientMu_);
-    // 即使旧连接刚进入关闭态，也必须等它的 handler 通过 Remove 释放全局按键
-    // 状态后再接受下一位控制端；否则旧控制者遗留的 Ctrl/鼠标按下会带到新会话。
+    // 即使旧连接刚进入关闭态，也必须等其 handler 在 Remove 前完成全局按键释放，
+    // 否则旧控制者遗留的 Ctrl/鼠标按下会带到新会话。
     if (client_) {
         return false;
     }
