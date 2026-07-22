@@ -108,15 +108,27 @@ function handleText(m) {
 function setupCfg(c) {
   const streamId = Number(c.stream_id);
   c.stream_id = Number.isSafeInteger(streamId) && streamId >= 0 ? streamId : 0;
-  if (!cfg || cfg.stream_id !== c.stream_id) resetFramePipeline(true);
+  // 显示器列表和选中项也会下发 cfg，但它们不会改变已在解码的 H.264 码流。
+  // 仅当真正的视频协商参数变化时才销毁解码器；否则热插拔/布局刷新会无谓地
+  // 清空参考帧、请求 IDR，并让控制端出现一次短暂黑屏。
+  const videoConfigChanged = !cfg || cfg.stream_id !== c.stream_id ||
+    cfg.codec !== c.codec || cfg.annexb !== c.annexb ||
+    cfg.w !== c.w || cfg.h !== c.h;
+  const sizeChanged = !cfg || cfg.w !== c.w || cfg.h !== c.h;
+  if (videoConfigChanged) resetFramePipeline(true);
   cfg = c;
-    canvas.width = c.w; canvas.height = c.h;
-    cursorCanvas.width = c.w; cursorCanvas.height = c.h;
+  if (sizeChanged) {
+    canvas.width = c.w;
+    canvas.height = c.h;
+    cursorCanvas.width = c.w;
+    cursorCanvas.height = c.h;
     fitCanvas();
-    drawRemoteCursor();
-    if (c.monitors) populateMonitors(c.monitors, c.selected_monitor);
-    if (isH264Codec()) setupH264Decoder(c);
-    log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps);
+  }
+  drawRemoteCursor();
+  if (c.monitors) populateMonitors(c.monitors, c.selected_monitor);
+  if (videoConfigChanged && isH264Codec()) setupH264Decoder(c);
+  log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps +
+    (videoConfigChanged ? ' video-reset' : ' topology-only'));
 }
 
 function updateRemoteCursor(m) {
