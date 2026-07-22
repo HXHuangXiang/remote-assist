@@ -28,6 +28,7 @@ struct ServiceState {
     HANDLE agentProcess = nullptr;
     HANDLE trayProcess = nullptr;
     HANDLE agentStopEvent = nullptr;
+    HANDLE agentReadyEvent = nullptr;
     HANDLE childJob = nullptr;
     DWORD agentSessionId = kInvalidSessionId;
     DWORD traySessionId = kInvalidSessionId;
@@ -119,6 +120,9 @@ void EnsureAgent() {
         StopChild(g_state.agentProcess, "agent", kAgentStopTimeoutMs);
     }
     g_state.agentSessionId = kInvalidSessionId;
+    if (g_state.agentReadyEvent) {
+        ResetEvent(g_state.agentReadyEvent);
+    }
     if (targetSessionId == kInvalidSessionId) {
         return;
     }
@@ -219,6 +223,13 @@ void ServiceWorker() {
     } else {
         ResetEvent(g_state.agentStopEvent);
     }
+    g_state.agentReadyEvent = CreateEventW(nullptr, TRUE, FALSE,
+                                           runtime::kAgentReadyEventName);
+    if (!g_state.agentReadyEvent) {
+        log::Warn("CreateEvent(agent ready) failed: " + std::to_string(GetLastError()));
+    } else {
+        ResetEvent(g_state.agentReadyEvent);
+    }
     CreateChildJob();
 
     // 监控循环：未登录时会持续等待会话，子进程异常退出则按下一周期重建。
@@ -235,6 +246,9 @@ void ServiceWorker() {
     if (g_state.agentStopEvent) {
         SetEvent(g_state.agentStopEvent);
     }
+    if (g_state.agentReadyEvent) {
+        ResetEvent(g_state.agentReadyEvent);
+    }
     StopChild(g_state.agentProcess, "agent", kAgentStopTimeoutMs);
     StopChild(g_state.trayProcess, "tray", kTrayStopTimeoutMs);
     g_state.agentSessionId = kInvalidSessionId;
@@ -246,6 +260,10 @@ void ServiceWorker() {
     if (g_state.agentStopEvent) {
         CloseHandle(g_state.agentStopEvent);
         g_state.agentStopEvent = nullptr;
+    }
+    if (g_state.agentReadyEvent) {
+        CloseHandle(g_state.agentReadyEvent);
+        g_state.agentReadyEvent = nullptr;
     }
 
     log::Info("service worker exit");

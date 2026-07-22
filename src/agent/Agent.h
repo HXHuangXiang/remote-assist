@@ -45,6 +45,7 @@ private:
     std::thread captureThread_;
     HANDLE instanceMutex_ = nullptr;
     HANDLE stopEvent_ = nullptr;
+    HANDLE readyEvent_ = nullptr;
 
     std::atomic<int> deskWidth_{0};
     std::atomic<int> deskHeight_{0};

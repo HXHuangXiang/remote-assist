@@ -84,6 +84,10 @@ Agent::~Agent() {
         CloseHandle(stopEvent_);
         stopEvent_ = nullptr;
     }
+    if (readyEvent_) {
+        CloseHandle(readyEvent_);
+        readyEvent_ = nullptr;
+    }
     if (instanceMutex_) {
         CloseHandle(instanceMutex_);
         instanceMutex_ = nullptr;
@@ -131,6 +135,11 @@ int Agent::Run(bool serviceManaged) {
             log::Error("agent stop event open failed: " + std::to_string(GetLastError()));
             return 1;
         }
+        readyEvent_ = OpenEventW(EVENT_MODIFY_STATE, FALSE, runtime::kAgentReadyEventName);
+        if (!readyEvent_) {
+            // 就绪状态仅用于诊断；服务停止事件仍是 Agent 的必备生命周期契约。
+            log::Warn("agent ready event open failed: " + std::to_string(GetLastError()));
+        }
     }
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -161,6 +170,9 @@ int Agent::Run(bool serviceManaged) {
         CoUninitialize();
         return 1;
     }
+    if (readyEvent_) {
+        SetEvent(readyEvent_);
+    }
 
     captureThread_ = std::thread(&Agent::CaptureLoop, this);
 
@@ -184,6 +196,9 @@ int Agent::Run(bool serviceManaged) {
 void Agent::Stop() {
     if (stop_.exchange(true)) {
         return;
+    }
+    if (readyEvent_) {
+        ResetEvent(readyEvent_);
     }
     // 服务停止不应依赖浏览器正常发送 keyup。主线程临时绑定当前输入桌面，
     // 尽早释放控制端遗留的修饰键和鼠标按键，再等待 WebSocket 工作线程退出。

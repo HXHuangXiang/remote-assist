@@ -137,6 +137,18 @@ static bool ServiceRunning() {
     return running;
 }
 
+// SCM 报告 RUNNING 只表示服务主进程已进入循环；必须等 agent 成功绑定 HTTP/
+// WebSocket 端口后，控制端才真正可以连接。
+static bool WaitForAgentReady(DWORD timeoutMs) {
+    HANDLE readyEvent = OpenEventW(SYNCHRONIZE, FALSE, runtime::kAgentReadyEventName);
+    if (!readyEvent) {
+        return false;
+    }
+    const DWORD result = WaitForSingleObject(readyEvent, timeoutMs);
+    CloseHandle(readyEvent);
+    return result == WAIT_OBJECT_0;
+}
+
 static ServiceResult InstallService() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (!scm) {
@@ -312,7 +324,9 @@ static void UpdateStatus() {
     if (!ServiceExists()) {
         s = L"\u670d\u52a1\u672a\u5b89\u88c5";
     } else if (ServiceRunning()) {
-        s = L"\u670d\u52a1\u8fd0\u884c\u4e2d";
+        s = WaitForAgentReady(0) ?
+            L"\u670d\u52a1\u8fd0\u884c\u4e2d\uff08Agent \u5df2\u5c31\u7eea\uff09" :
+            L"\u670d\u52a1\u8fd0\u884c\u4e2d\uff08\u7b49\u5f85 Agent\uff09";
     } else {
         s = L"\u670d\u52a1\u5df2\u5b89\u88c5\u4f46\u672a\u8fd0\u884c";
     }
@@ -499,8 +513,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!start.ok) {
                 ShowServiceError(hwnd, L"启动服务", start.error);
             } else {
-                const std::wstring message = L"服务已启动。浏览器访问 http://<本机IP>:" +
-                    std::to_wstring(g_cfg.port) + L"/";
+                const bool agentReady = WaitForAgentReady(5000);
+                std::wstring message;
+                if (agentReady) {
+                    message = L"服务与 Agent 已启动。浏览器访问 http://<本机IP>:" +
+                        std::to_wstring(g_cfg.port) + L"/";
+                } else {
+                    message = L"服务已启动。Agent 尚未就绪（等待登录桌面或查看 logs\\service.log）。";
+                }
                 MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             }
             UpdateStatus();
@@ -519,7 +539,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_SVC_START: {
             const ServiceResult start = StartServiceS();
             if (start.ok) {
-                MessageBoxW(hwnd, L"服务已启动。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+                const bool agentReady = WaitForAgentReady(5000);
+                MessageBoxW(hwnd,
+                    agentReady ? L"服务与 Agent 已启动。" :
+                                 L"服务已启动。Agent 尚未就绪（等待登录桌面或查看 logs\\service.log）。",
+                    L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             } else {
                 ShowServiceError(hwnd, L"启动服务", start.error);
             }
