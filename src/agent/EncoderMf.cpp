@@ -329,36 +329,34 @@ bool EncoderMf::ForceH264KeyFrame() {
 void EncoderMf::ConvertBgraToNv12(const uint8_t* bgra, uint8_t* nv12) const {
     uint8_t* yPlane = nv12;
     uint8_t* uvPlane = nv12 + static_cast<size_t>(width_) * height_;
-    for (int y = 0; y < height_; ++y) {
-        for (int x = 0; x < width_; ++x) {
-            const uint8_t* pixel = bgra + (static_cast<size_t>(y) * width_ + x) * 4;
-            const int b = pixel[0];
-            const int g = pixel[1];
-            const int r = pixel[2];
-            yPlane[static_cast<size_t>(y) * width_ + x] =
-                ClampToByte(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-        }
-    }
+    const auto toY = [](const uint8_t* pixel) {
+        return ClampToByte(((66 * pixel[2] + 129 * pixel[1] + 25 * pixel[0] + 128) >> 8) + 16);
+    };
+
+    // NV12 每个 UV 样本覆盖 2x2 个 BGRA 像素。原实现先遍历一次整帧生成 Y，
+    // 再遍历一次计算 UV，导致源图像完整读取两遍；这里在同一个 2x2 块内同时
+    // 生成四个 Y 和一个 UV，显著降低大屏推流的内存带宽压力。
     for (int y = 0; y < height_; y += 2) {
+        const uint8_t* sourceRow0 = bgra + static_cast<size_t>(y) * width_ * 4;
+        const uint8_t* sourceRow1 = sourceRow0 + static_cast<size_t>(width_) * 4;
+        uint8_t* yRow0 = yPlane + static_cast<size_t>(y) * width_;
+        uint8_t* yRow1 = yRow0 + width_;
+        uint8_t* uvRow = uvPlane + static_cast<size_t>(y / 2) * width_;
         for (int x = 0; x < width_; x += 2) {
-            int r = 0;
-            int g = 0;
-            int b = 0;
-            for (int row = 0; row < 2; ++row) {
-                for (int column = 0; column < 2; ++column) {
-                    const uint8_t* pixel = bgra +
-                        (static_cast<size_t>(y + row) * width_ + x + column) * 4;
-                    b += pixel[0];
-                    g += pixel[1];
-                    r += pixel[2];
-                }
-            }
-            r /= 4;
-            g /= 4;
-            b /= 4;
-            uint8_t* uv = uvPlane + static_cast<size_t>(y / 2) * width_ + x;
-            uv[0] = ClampToByte(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-            uv[1] = ClampToByte(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+            const uint8_t* p00 = sourceRow0 + static_cast<size_t>(x) * 4;
+            const uint8_t* p01 = p00 + 4;
+            const uint8_t* p10 = sourceRow1 + static_cast<size_t>(x) * 4;
+            const uint8_t* p11 = p10 + 4;
+            yRow0[x] = toY(p00);
+            yRow0[x + 1] = toY(p01);
+            yRow1[x] = toY(p10);
+            yRow1[x + 1] = toY(p11);
+
+            const int b = (p00[0] + p01[0] + p10[0] + p11[0]) / 4;
+            const int g = (p00[1] + p01[1] + p10[1] + p11[1]) / 4;
+            const int r = (p00[2] + p01[2] + p10[2] + p11[2]) / 4;
+            uvRow[x] = ClampToByte(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+            uvRow[x + 1] = ClampToByte(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
         }
     }
 }
