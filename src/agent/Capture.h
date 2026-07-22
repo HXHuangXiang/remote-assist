@@ -43,7 +43,9 @@ public:
     Capture& operator=(const Capture&) = delete;
 
     bool Init();
-    CaptureResult CaptureFrame(CapturedFrame& out);
+    // waitMs 是 DXGI 等待桌面变化的上限；由 Agent 按实际目标帧率传入，避免
+    // 固定超时把高帧率配置限制在约 20 FPS。
+    CaptureResult CaptureFrame(CapturedFrame& out, DWORD waitMs);
 
     // 输入桌面切换后释放与旧桌面关联的采集资源并重新初始化。
     void ResetForDesktop();
@@ -63,7 +65,7 @@ public:
 
 private:
     bool InitDXGI();
-    CaptureResult CaptureDXGI(CapturedFrame& out);
+    CaptureResult CaptureDXGI(CapturedFrame& out, DWORD waitMs);
     bool CaptureGDI(CapturedFrame& out);
     void CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                            int x, int y, int width, int height,

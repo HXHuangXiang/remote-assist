@@ -174,7 +174,7 @@ bool Capture::InitDXGI() {
     return false;
 }
 
-CaptureResult Capture::CaptureFrame(CapturedFrame& out) {
+CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs) {
     const int selectedMonitor = selectedMonitor_.load();
     if (selectedMonitor != activeMonitor_) {
         // 切换单屏时重建到对应 adapter/output；切回“全部”时保留 GDI 合成。
@@ -185,7 +185,7 @@ CaptureResult Capture::CaptureFrame(CapturedFrame& out) {
         return CaptureGDI(out) ? CaptureResult::kFrame : CaptureResult::kFailed;
     }
 
-    const CaptureResult result = CaptureDXGI(out);
+    const CaptureResult result = CaptureDXGI(out, std::max<DWORD>(1, waitMs));
     if (result != CaptureResult::kFailed) {
         return result;
     }
@@ -195,11 +195,11 @@ CaptureResult Capture::CaptureFrame(CapturedFrame& out) {
     return CaptureResult::kNoChange;
 }
 
-CaptureResult Capture::CaptureDXGI(CapturedFrame& out) {
+CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     if (!dup_) return CaptureResult::kFailed;
     DXGI_OUTDUPL_FRAME_INFO fi{};
     Microsoft::WRL::ComPtr<IDXGIResource> res;
-    HRESULT hr = dup_->AcquireNextFrame(50, &fi, &res);
+    HRESULT hr = dup_->AcquireNextFrame(waitMs, &fi, &res);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         return CaptureResult::kNoChange;
     }
