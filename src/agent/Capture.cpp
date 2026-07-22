@@ -257,7 +257,31 @@ bool Capture::EnumMonitors() {
         selectedDevice = previous[previousSelection].name;
     }
     monitors_.clear();
-    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(this));
+    if (!EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(this))) {
+        // 枚举异常时保留上一份完整拓扑。若把暂时性 Win32 失败当作“所有显示器已
+        // 移除”，CaptureLoop 会重建 DXGI/MFT 并下发空 monitor 列表，远端会出现
+        // 一次无意义的黑屏和解码器重置。
+        const DWORD error = GetLastError();
+        monitors_ = previous;
+        log::Warn("display enumeration failed: " + std::to_string(error));
+        return false;
+    }
+
+    // EnumDisplayMonitors 不保证枚举顺序。外部协议以 index 选择显示器，且布局
+    // 比较依赖 vector 次序；若顺序偶发交换会误判拓扑变化，导致每秒重建采集和
+    // H.264 编码器。按稳定的设备名与几何信息归一化后重新编号。
+    std::sort(monitors_.begin(), monitors_.end(),
+              [](const MonitorInfo& left, const MonitorInfo& right) {
+                  if (left.name != right.name) return left.name < right.name;
+                  if (left.x != right.x) return left.x < right.x;
+                  if (left.y != right.y) return left.y < right.y;
+                  if (left.w != right.w) return left.w < right.w;
+                  return left.h < right.h;
+              });
+    for (size_t index = 0; index < monitors_.size(); ++index) {
+        monitors_[index].index = static_cast<int>(index);
+    }
+
     int nextSelection = -1;
     if (!selectedDevice.empty()) {
         for (const auto& monitor : monitors_) {

@@ -86,8 +86,8 @@ public:
     void ResetForDesktop();
 
     // 多显示器:枚举显示器列表。-1=全部(虚拟屏幕),>=0=指定显示器。
-    // 重新枚举显示器并保留当前选中的设备（若仍存在）。返回 true 表示布局、分辨率
-    // 或选择项发生了变化，调用方应重建采集/编码资源并推送新 cfg。
+    // 重新枚举显示器并按稳定设备顺序编号，保留当前选中的设备（若仍存在）。返回
+    // true 表示布局、分辨率或选择项发生了变化，调用方应重建采集/编码资源并推送 cfg。
     bool EnumMonitors();
     static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM);
     // 返回稳定副本，避免 WebSocket 线程生成 cfg 时与采集线程的热插拔重枚举竞争。
