@@ -24,9 +24,15 @@ struct CapturedFrame {
     std::vector<uint8_t> data;
     const uint8_t* mappedPixels = nullptr;
     size_t mappedStrideBytes = 0;
+    // DXGI + 视频处理器路径下直接交给硬件 H.264 MFT 的 NV12 surface。该资源
+    // 与 data/mappedPixels 互斥，生命周期同样截至 Capture::ReleaseFrame。
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12Texture;
 
     bool IsDirectDxgi() const { return mappedPixels != nullptr; }
-    bool Empty() const { return IsDirectDxgi() ? width <= 0 || height <= 0 : data.empty(); }
+    bool IsGpuNv12() const { return nv12Texture.Get() != nullptr; }
+    bool Empty() const {
+        return IsGpuNv12() || IsDirectDxgi() ? width <= 0 || height <= 0 : data.empty();
+    }
     const uint8_t* Pixels() const { return IsDirectDxgi() ? mappedPixels : data.data(); }
     size_t StrideBytes() const {
         return IsDirectDxgi() ? mappedStrideBytes : static_cast<size_t>(width) * 4;
@@ -91,6 +97,16 @@ public:
     // 仅由采集线程调用。慢链路时降低输出上限可同时缩短缩放、编码和网络发送时间；
     // 源画面宽高均未超过上限时仍保持原始分辨率。
     void SetMaxOutputSize(int width, int height);
+    // H.264 MFT 确认支持同一 D3D11 设备后启用。GDI、缩放和能力不完整的机器
+    // 会继续走现有 CPU 帧路径。当前 D3D11 设备已确认失败时，此调用不会再次
+    // 打开 GPU 输出，直到 Desktop Duplication 重建出新的 device generation。
+    void SetGpuOutputEnabled(bool enabled);
+    // 视频处理器或 H.264 MFT 拒绝 GPU surface 时调用。按 device generation
+    // 熔断，避免每帧在 GPU 与 CPU 回退之间反复初始化、黑屏或刷日志。
+    void DisableGpuOutputForCurrentDevice();
+    bool IsGpuOutputEnabled() const { return gpuOutputEnabled_; }
+    ID3D11Device* D3DDevice() const { return d3d_.Get(); }
+    uint64_t DeviceGeneration() const { return deviceGeneration_; }
     // GDI 包含锁屏、DXGI 失效与全部多屏合成路径，采集成本显著高于 DXGI。
     // 仅由采集线程调用，因此无需额外同步。
     bool IsUsingGdi() const { return use_gdi_; }
@@ -103,6 +119,10 @@ private:
     bool InitDXGI();
     CaptureResult CaptureDXGI(CapturedFrame& out, DWORD waitMs);
     CaptureResult CaptureGDI(CapturedFrame& out, bool forceFrame);
+    bool CreateGpuNv12Frame(ID3D11Texture2D* source, int width, int height,
+                            CapturedFrame& out);
+    bool EnsureVideoProcessor(int sourceWidth, int sourceHeight,
+                              int outputWidth, int outputHeight);
     void CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                            int x, int y, int width, int height,
                            CapturedFrame& out);
@@ -119,7 +139,20 @@ private:
     Microsoft::WRL::ComPtr<IDXGIOutput1> output_;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> dup_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
+    Microsoft::WRL::ComPtr<ID3D11VideoDevice> videoDevice_;
+    Microsoft::WRL::ComPtr<ID3D11VideoContext> videoContext_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> videoProcessorEnumerator_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessor> videoProcessor_;
     bool stagingMapped_ = false;
+    bool gpuOutputEnabled_ = false;
+    // 记录当前设备是否已发生过 GPU 路径故障。0 表示尚未初始化 DXGI device；
+    // InitDXGI 成功时 generation 单调递增，因此旧设备的失败不会阻断新设备重试。
+    uint64_t gpuOutputDisabledGeneration_ = 0;
+    int videoProcessorSourceWidth_ = 0;
+    int videoProcessorSourceHeight_ = 0;
+    int videoProcessorOutputWidth_ = 0;
+    int videoProcessorOutputHeight_ = 0;
+    uint64_t deviceGeneration_ = 0;
 
     // GDI
     HDC gdi_dc_ = nullptr;

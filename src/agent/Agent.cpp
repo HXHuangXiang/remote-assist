@@ -42,6 +42,7 @@ struct CaptureLoopStats {
     uint64_t captureAttempts = 0;
     uint64_t capturedFrames = 0;
     uint64_t directMappedFrames = 0;
+    uint64_t gpuNv12Frames = 0;
     uint64_t noChangeFrames = 0;
     uint64_t pointerOnlyFrames = 0;
     uint64_t captureFailures = 0;
@@ -373,6 +374,7 @@ void Agent::CaptureLoop() {
     uint64_t adaptiveEncodeTimeMs = 0;
     uint64_t adaptiveH264CreditWaits = 0;
     uint64_t lastEncodeLoadPercent = 0;
+    uint64_t encoderDeviceGeneration = 0;
     // 采集结果在相邻帧间复用容量。1920x1080 的 BGRA 帧约 8MB，若每轮都创建
     // 局部 CapturedFrame 会触发持续的大块堆分配和释放，直接放大卡顿。
     CapturedFrame frame;
@@ -501,6 +503,7 @@ void Agent::CaptureLoop() {
                       " capture=" + std::to_string(metrics.capturedFrames) + "/" +
                       std::to_string(metrics.captureAttempts) +
                       " direct=" + std::to_string(metrics.directMappedFrames) +
+                      " gpu_nv12=" + std::to_string(metrics.gpuNv12Frames) +
                       " unchanged=" + std::to_string(metrics.noChangeFrames) +
                       " pointer_only=" + std::to_string(metrics.pointerOnlyFrames) +
                       " capture_fail=" + std::to_string(metrics.captureFailures) +
@@ -670,6 +673,15 @@ void Agent::CaptureLoop() {
             const bool desktopChanged = captureDesktop.CheckRebind();
             const bool displayChanged = capture_.EnumMonitors();
             if (desktopChanged || displayChanged) {
+                // DXGI desktop 重建会产生新的 D3D11 device。保留绑定旧 device 的
+                // MFT 会让下一张 GPU surface 发生跨设备输入；提前释放，后续帧会
+                // 按当前 device 重新协商，CPU/GDI 回退不受影响。
+                if (encoder_ && encoder_->CanEncodeD3D11()) {
+                    encoder_->Release();
+                    encoder_.reset();
+                    encoderReady_ = false;
+                    encoderDeviceGeneration = 0;
+                }
                 capture_.ResetForDesktop();
                 firstFrame_ = true;
                 streamKeyFrameRequired_ = true;
@@ -736,7 +748,7 @@ void Agent::CaptureLoop() {
                 cursor["x"] = pointer.x;
                 cursor["y"] = pointer.y;
             }
-            server_.Broadcaster().BroadcastText(cursor.dump());
+            server_.Broadcaster().BroadcastText(cursor.dump(), true);
         }
         if (captureResult == CaptureResult::kNoChange ||
             captureResult == CaptureResult::kPointerOnly) {
@@ -766,6 +778,9 @@ void Agent::CaptureLoop() {
         if (frame.IsDirectDxgi()) {
             metrics.directMappedFrames++;
         }
+        if (frame.IsGpuNv12()) {
+            metrics.gpuNv12Frames++;
+        }
         CapturedFrameLease frameLease(capture_, frame);
 
         const bool needsFreshFrame = firstFrame_;
@@ -774,12 +789,25 @@ void Agent::CaptureLoop() {
         // CPU 帧，且采样碰撞会把已确认变化的画面推迟到下一次强制刷新。
         firstFrame_ = false;
 
+        if (encoder_ && encoder_->CanEncodeD3D11() &&
+            encoderDeviceGeneration != capture_.DeviceGeneration()) {
+            // 选择显示器后 CaptureFrame 可在本轮内部重建 DXGI；同样不能把新
+            // surface 喂给旧 device manager，下一段会立即按当前分辨率重建编码器。
+            log::Info("DXGI device changed, reinitializing H.264 encoder");
+            encoder_->Release();
+            encoder_.reset();
+            encoderReady_ = false;
+            encoderDeviceGeneration = 0;
+        }
+
         if (!encoder_ || frame.width != deskWidth_.load() || frame.height != deskHeight_.load()) {
             deskWidth_.store(frame.width);
             deskHeight_.store(frame.height);
             encoderReady_ = false;
+            capture_.SetGpuOutputEnabled(false);
             encoder_ = std::make_unique<EncoderMf>();
-            if (!encoder_->Init(frame.width, frame.height, cfg_.fps, adaptiveBitrate)) {
+            if (!encoder_->Init(frame.width, frame.height, cfg_.fps, adaptiveBitrate,
+                                capture_.D3DDevice())) {
                 log::Error("encoder init failed for " + std::to_string(frame.width) +
                            "x" + std::to_string(frame.height));
                 encoder_.reset();
@@ -791,6 +819,8 @@ void Agent::CaptureLoop() {
             streamH264_.store(encoder_->IsH264());
             streamH264Profile_.store(encoder_->H264CodecProfile());
             streamKeyFrameRequired_ = encoder_->IsH264();
+            encoderDeviceGeneration = capture_.DeviceGeneration();
+            capture_.SetGpuOutputEnabled(encoder_->CanEncodeD3D11());
             // 尺寸/编码器变化后提升流版本并重新下发 cfg。浏览器异步图片解码可能
             // 在 cfg 到达后才完成，因此二进制帧会带上该版本供控制端判定。
             streamId_.fetch_add(1);
@@ -804,7 +834,10 @@ void Agent::CaptureLoop() {
             if (needsFreshFrame && encoder_->IsH264()) {
                 encoder_->RequestKeyFrame();
             }
-            const bool encoded = encoder_->Encode(frame.Pixels(), frame.StrideBytes(), chunks);
+            const bool gpuFrame = frame.IsGpuNv12();
+            const bool encoded = gpuFrame
+                ? encoder_->EncodeD3D11(frame.nv12Texture.Get(), chunks)
+                : encoder_->Encode(frame.Pixels(), frame.StrideBytes(), chunks);
             const uint64_t encodeElapsedMs = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - encodeStartedAt).count());
@@ -817,6 +850,7 @@ void Agent::CaptureLoop() {
                     streamH264_.store(encoder_->IsH264());
                     streamH264Profile_.store(encoder_->H264CodecProfile());
                     streamKeyFrameRequired_ = encoder_->IsH264();
+                    capture_.SetGpuOutputEnabled(encoder_->CanEncodeD3D11());
                     streamId_.fetch_add(1);
                     server_.Broadcaster().BroadcastText(MakeCfgJson());
                 }
@@ -861,6 +895,18 @@ void Agent::CaptureLoop() {
                 }
             } else {
                 metrics.encodeFailures++;
+                if (gpuFrame) {
+                    // GPU surface 被驱动/MFT 拒绝时不能把 NV12 误交给 JPEG 回退。
+                    // 释放此编码器并关闭 surface 输出，下一轮自动回到已验证的 CPU
+                    // BGRA->NV12 路径重新建流。
+                    log::Warn("H.264 D3D11 input failed, reverting to CPU encoding");
+                    capture_.DisableGpuOutputForCurrentDevice();
+                    encoder_->Release();
+                    encoder_.reset();
+                    encoderReady_ = false;
+                    streamKeyFrameRequired_ = true;
+                    encoderDeviceGeneration = 0;
+                }
             }
         }
 

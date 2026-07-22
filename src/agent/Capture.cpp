@@ -89,6 +89,10 @@ void Capture::ReleaseAll() {
         stagingMapped_ = false;
     }
     staging_.Reset();
+    videoProcessor_.Reset();
+    videoProcessorEnumerator_.Reset();
+    videoContext_.Reset();
+    videoDevice_.Reset();
     dup_.Reset();
     output_.Reset();
     ctx_.Reset();
@@ -119,6 +123,11 @@ void Capture::ReleaseAll() {
     pointer_ = {};
     pointerKnown_ = false;
     pointerDirty_ = false;
+    gpuOutputEnabled_ = false;
+    videoProcessorSourceWidth_ = 0;
+    videoProcessorSourceHeight_ = 0;
+    videoProcessorOutputWidth_ = 0;
+    videoProcessorOutputHeight_ = 0;
 }
 
 void Capture::ReleaseFrame(CapturedFrame& frame) {
@@ -128,6 +137,7 @@ void Capture::ReleaseFrame(CapturedFrame& frame) {
     }
     frame.mappedPixels = nullptr;
     frame.mappedStrideBytes = 0;
+    frame.nv12Texture.Reset();
 }
 
 bool Capture::TakePointerUpdate(PointerUpdate& out) {
@@ -295,6 +305,34 @@ void Capture::SetMaxOutputSize(int width, int height) {
               std::to_string(maxOutputHeight_));
 }
 
+void Capture::SetGpuOutputEnabled(bool enabled) {
+    // GPU 直通只适用于 DXGI 单输出；视频处理器可同时完成保持比例的缩放。GDI
+    // 回退时 CaptureFrame 会自然改走 CPU 帧，无需由调用者额外清理 surface。
+    gpuOutputEnabled_ = enabled &&
+        gpuOutputDisabledGeneration_ != deviceGeneration_;
+    if (!enabled) {
+        videoProcessor_.Reset();
+        videoProcessorEnumerator_.Reset();
+        videoProcessorSourceWidth_ = 0;
+        videoProcessorSourceHeight_ = 0;
+        videoProcessorOutputWidth_ = 0;
+        videoProcessorOutputHeight_ = 0;
+    }
+}
+
+void Capture::DisableGpuOutputForCurrentDevice() {
+    // 仅关闭当前 DXGI device 的 GPU 通路。设备重建后 generation 会递增，新的
+    // 显卡/输出仍可重新探测；同一设备上则始终走已经验证过的 CPU 回退路径。
+    gpuOutputDisabledGeneration_ = deviceGeneration_;
+    gpuOutputEnabled_ = false;
+    videoProcessor_.Reset();
+    videoProcessorEnumerator_.Reset();
+    videoProcessorSourceWidth_ = 0;
+    videoProcessorSourceHeight_ = 0;
+    videoProcessorOutputWidth_ = 0;
+    videoProcessorOutputHeight_ = 0;
+}
+
 bool Capture::Init() {
     if (InitDXGI()) {
         use_gdi_ = false;
@@ -373,11 +411,27 @@ bool Capture::InitDXGI() {
             Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
             Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication;
             D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
-            if (FAILED(baseOutput.As(&output)) ||
-                FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
-                    &device, &featureLevel, &context)) ||
-                FAILED(output->DuplicateOutput(device.Get(), &duplication))) {
+            if (FAILED(baseOutput.As(&output))) {
+                continue;
+            }
+            HRESULT createDeviceResult = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN,
+                nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                nullptr, 0, D3D11_SDK_VERSION, &device, &featureLevel, &context);
+            HRESULT duplicateResult = FAILED(createDeviceResult) ? createDeviceResult :
+                output->DuplicateOutput(device.Get(), &duplication);
+            // 部分远程桌面/旧驱动不能创建 VIDEO_SUPPORT 设备，但仍可用 Desktop
+            // Duplication。此时保留 CPU 编码路径，而不是把整个采集退化到 GDI。
+            if (FAILED(createDeviceResult) || FAILED(duplicateResult)) {
+                duplication.Reset();
+                context.Reset();
+                device.Reset();
+                createDeviceResult = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN,
+                    nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+                    &device, &featureLevel, &context);
+                duplicateResult = FAILED(createDeviceResult) ? createDeviceResult :
+                    output->DuplicateOutput(device.Get(), &duplication);
+            }
+            if (FAILED(createDeviceResult) || FAILED(duplicateResult)) {
                 continue;
             }
 
@@ -385,6 +439,7 @@ bool Capture::InitDXGI() {
             ctx_ = std::move(context);
             output_ = std::move(output);
             dup_ = std::move(duplication);
+            ++deviceGeneration_;
             return true;
         }
     }
@@ -427,6 +482,145 @@ CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs, bool requi
     return CaptureResult::kNoChange;
 }
 
+bool Capture::EnsureVideoProcessor(int sourceWidth, int sourceHeight,
+                                   int outputWidth, int outputHeight) {
+    if (!d3d_.Get() || !ctx_.Get()) {
+        return false;
+    }
+    if (!videoDevice_.Get() && FAILED(d3d_.As(&videoDevice_))) {
+        return false;
+    }
+    if (!videoContext_.Get() && FAILED(ctx_.As(&videoContext_))) {
+        return false;
+    }
+    if (videoProcessor_.Get() &&
+        videoProcessorSourceWidth_ == sourceWidth && videoProcessorSourceHeight_ == sourceHeight &&
+        videoProcessorOutputWidth_ == outputWidth && videoProcessorOutputHeight_ == outputHeight) {
+        return true;
+    }
+
+    videoProcessor_.Reset();
+    videoProcessorEnumerator_.Reset();
+    videoProcessorSourceWidth_ = 0;
+    videoProcessorSourceHeight_ = 0;
+    videoProcessorOutputWidth_ = 0;
+    videoProcessorOutputHeight_ = 0;
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputWidth = static_cast<UINT>(sourceWidth);
+    content.InputHeight = static_cast<UINT>(sourceHeight);
+    content.OutputWidth = static_cast<UINT>(outputWidth);
+    content.OutputHeight = static_cast<UINT>(outputHeight);
+    content.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+    if (FAILED(videoDevice_->CreateVideoProcessorEnumerator(&content, &videoProcessorEnumerator_))) {
+        return false;
+    }
+
+    UINT bgraSupport = 0;
+    UINT nv12Support = 0;
+    if (FAILED(videoProcessorEnumerator_->CheckVideoProcessorFormat(
+            DXGI_FORMAT_B8G8R8A8_UNORM, &bgraSupport)) ||
+        FAILED(videoProcessorEnumerator_->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &nv12Support)) ||
+        (bgraSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0 ||
+        (nv12Support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0 ||
+        FAILED(videoDevice_->CreateVideoProcessor(videoProcessorEnumerator_.Get(), 0,
+                                                   &videoProcessor_))) {
+        videoProcessorEnumerator_.Reset();
+        return false;
+    }
+
+    videoProcessorSourceWidth_ = sourceWidth;
+    videoProcessorSourceHeight_ = sourceHeight;
+    videoProcessorOutputWidth_ = outputWidth;
+    videoProcessorOutputHeight_ = outputHeight;
+    return true;
+}
+
+bool Capture::CreateGpuNv12Frame(ID3D11Texture2D* source, int width, int height,
+                                 CapturedFrame& out) {
+    if (!gpuOutputEnabled_ || !source || width <= 0 || height <= 0) {
+        return false;
+    }
+    const double scale = std::min(1.0, std::min(
+        static_cast<double>(maxOutputWidth_) / width,
+        static_cast<double>(maxOutputHeight_) / height));
+    int outputWidth = std::max(1, static_cast<int>(width * scale));
+    int outputHeight = std::max(1, static_cast<int>(height * scale));
+    if (outputWidth > 1) outputWidth &= ~1;
+    if (outputHeight > 1) outputHeight &= ~1;
+    if (outputWidth < 2 || outputHeight < 2 || (width & 1) != 0 || (height & 1) != 0) {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC sourceDesc{};
+    source->GetDesc(&sourceDesc);
+    if (sourceDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || sourceDesc.SampleDesc.Count != 1 ||
+        !EnsureVideoProcessor(width, height, outputWidth, outputHeight)) {
+        DisableGpuOutputForCurrentDevice();
+        log::Info("capture: GPU NV12 conversion unavailable, falling back to CPU frames");
+        return false;
+    }
+
+    // MFT 可以异步持有输入 sample；若复用上一帧的 NV12 texture，下一次
+    // VideoProcessorBlt 会覆盖仍在编码的内容。每帧拥有独立 texture，纹理会随
+    // IMFSample 的最后一个引用释放，从根源上避免黑屏、花屏和驱动竞态。
+    D3D11_TEXTURE2D_DESC textureDesc{};
+    textureDesc.Width = static_cast<UINT>(outputWidth);
+    textureDesc.Height = static_cast<UINT>(outputHeight);
+    textureDesc.MipLevels = 1;
+    textureDesc.ArraySize = 1;
+    textureDesc.Format = DXGI_FORMAT_NV12;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Usage = D3D11_USAGE_DEFAULT;
+    textureDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12Texture;
+    if (FAILED(d3d_->CreateTexture2D(&textureDesc, nullptr, &nv12Texture))) {
+        DisableGpuOutputForCurrentDevice();
+        log::Info("capture: GPU NV12 texture allocation failed, falling back to CPU frames");
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputDesc{};
+    inputDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    inputDesc.Texture2D.MipSlice = 0;
+    inputDesc.Texture2D.ArraySlice = 0;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inputView;
+    if (FAILED(videoDevice_->CreateVideoProcessorInputView(source,
+            videoProcessorEnumerator_.Get(), &inputDesc, &inputView))) {
+        DisableGpuOutputForCurrentDevice();
+        log::Info("capture: GPU input view unavailable, falling back to CPU frames");
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputDesc{};
+    outputDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    outputDesc.Texture2D.MipSlice = 0;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> outputView;
+    if (FAILED(videoDevice_->CreateVideoProcessorOutputView(nv12Texture.Get(),
+            videoProcessorEnumerator_.Get(), &outputDesc, &outputView))) {
+        DisableGpuOutputForCurrentDevice();
+        log::Info("capture: GPU output view unavailable, falling back to CPU frames");
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = inputView.Get();
+    if (FAILED(videoContext_->VideoProcessorBlt(videoProcessor_.Get(), outputView.Get(),
+                                                0, 1, &stream))) {
+        DisableGpuOutputForCurrentDevice();
+        log::Info("capture: GPU BGRA to NV12 conversion failed, falling back to CPU frames");
+        return false;
+    }
+    out.width = outputWidth;
+    out.height = outputHeight;
+    out.data.clear();
+    out.mappedPixels = nullptr;
+    out.mappedStrideBytes = 0;
+    out.nv12Texture = std::move(nv12Texture);
+    return true;
+}
+
 CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     if (!dup_) return CaptureResult::kFailed;
     DXGI_OUTDUPL_FRAME_INFO fi{};
@@ -462,6 +656,16 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
 
     D3D11_TEXTURE2D_DESC desc{};
     tex->GetDesc(&desc);
+    const int w = static_cast<int>(desc.Width);
+    const int h = static_cast<int>(desc.Height);
+    // GPU path 在释放 Desktop Duplication 的当前帧前完成颜色转换，并把自有 NV12
+    // surface 交给编码器。它避开了 staging Map、整帧 BGRA 回读和 CPU 色彩转换。
+    if (CreateGpuNv12Frame(tex.Get(), w, h, out)) {
+        dup_->ReleaseFrame();
+        width_ = out.width;
+        height_ = out.height;
+        return CaptureResult::kFrame;
+    }
     D3D11_TEXTURE2D_DESC stagingDesc{};
     if (staging_) {
         staging_->GetDesc(&stagingDesc);
@@ -486,8 +690,6 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     if (FAILED(ctx_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         return CaptureResult::kFailed;
     }
-    const int w = static_cast<int>(desc.Width);
-    const int h = static_cast<int>(desc.Height);
     // 未缩放且 NV12 兼容的偶数尺寸可直接借用 staging 映射。原实现会先完整复制
     // 到 CapturedFrame::data，再由编码器读取一次；此路径每帧省去约一张 BGRA 图像
     // 的 CPU 内存带宽（1080p 约 8 MB）。

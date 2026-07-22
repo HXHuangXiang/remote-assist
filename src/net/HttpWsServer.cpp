@@ -15,6 +15,7 @@ namespace {
 // 写成功无法说明用户已经看到新画面；超时兜底避免旧浏览器或异常连接永久停流。
 constexpr auto kFrameAckTimeout = std::chrono::seconds(1);
 constexpr size_t kMaxFramesInFlight = 2;
+constexpr size_t kMaxPendingTextMessages = 8;
 constexpr auto kAuthThrottleRetention = std::chrono::minutes(10);
 constexpr size_t kMaxAuthThrottleEntries = 64;
 
@@ -32,16 +33,18 @@ public:
         if (!armed_) {
             return;
         }
-        broadcaster_.Remove(&ws_);
-        try {
-            if (onDisconnected_) {
-                onDisconnected_();
+        const bool wasCurrentController = broadcaster_.Remove(&ws_);
+        if (wasCurrentController) {
+            try {
+                if (onDisconnected_) {
+                    onDisconnected_();
+                }
+            } catch (...) {
+                // 析构函数绝不能因业务回调异常终止 WebSocket 工作线程。
+                log::Error("controller disconnect callback threw an exception");
             }
-        } catch (...) {
-            // 析构函数绝不能因业务回调异常终止 WebSocket 工作线程。
-            log::Error("controller disconnect callback threw an exception");
+            log::Info("ws client disconnected");
         }
-        log::Info("ws client disconnected");
     }
 
 private:
@@ -84,15 +87,29 @@ WsBroadcaster::~WsBroadcaster() {
 }
 
 bool WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
-    std::lock_guard<std::mutex> lk(clientMu_);
-    if (client_ && client_->is_open()) {
+    // 在暴露 client_ 前清掉上一位控制端遗留的队列。否则 CaptureLoop 可能刚看到
+    // Count()==1 就入队首个 IDR，随后又被 Add 的清理步骤丢弃，导致新页面等不到画面。
+    std::lock_guard<std::mutex> frameLock(frameMu_);
+    std::lock_guard<std::mutex> clientLock(clientMu_);
+    // 即使旧连接刚进入关闭态，也必须等它的 handler 通过 Remove 释放全局按键
+    // 状态后再接受下一位控制端；否则旧控制者遗留的 Ctrl/鼠标按下会带到新会话。
+    if (client_) {
         return false;
     }
     client_ = ws;
+    pendingFrame_.clear();
+    pendingStreamId_ = 0;
+    pendingTimestampUs_ = 0;
+    pendingKeyFrame_ = true;
+    pendingText_.clear();
+    pendingReplaceableText_.clear();
+    preferReplaceableText_ = false;
+    inFlightFrames_.clear();
+    frameCv_.notify_all();
     return true;
 }
 
-void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
+bool WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
     bool removed = false;
     {
         std::lock_guard<std::mutex> lk(clientMu_);
@@ -108,9 +125,13 @@ void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
         pendingStreamId_ = 0;
         pendingTimestampUs_ = 0;
         pendingKeyFrame_ = true;
+        pendingText_.clear();
+        pendingReplaceableText_.clear();
+        preferReplaceableText_ = false;
         inFlightFrames_.clear();
         frameCv_.notify_all();
     }
+    return removed;
 }
 
 FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
@@ -158,11 +179,29 @@ bool WsBroadcaster::WaitForH264FrameCredit(std::chrono::milliseconds timeout) {
     return ready && !stopping_;
 }
 
-void WsBroadcaster::BroadcastText(const std::string& msg) {
-    std::lock_guard<std::mutex> lk(clientMu_);
-    if (client_ && client_->is_open()) {
-        client_->send(msg);
+void WsBroadcaster::BroadcastText(std::string msg, bool replaceable) {
+    // 无控制端时沿用原来的 no-op 语义。桌面切换/显示器热插拔可能发生在空闲期，
+    // 不能把 cfg 留到下一位控制端，也不应把它计为一次发送失败。
+    if (msg.empty() || Count() == 0) {
+        return;
     }
+    {
+        std::lock_guard<std::mutex> lk(frameMu_);
+        if (stopping_) {
+            return;
+        }
+        if (replaceable) {
+            pendingReplaceableText_ = std::move(msg);
+        } else {
+            // 配置消息以最新状态为准。连接刚切屏或恢复时，保留最末八条足够覆盖
+            // 短暂发送阻塞，又避免异常频繁的拓扑变化无限占用内存。
+            if (pendingText_.size() == kMaxPendingTextMessages) {
+                pendingText_.pop_front();
+            }
+            pendingText_.push_back(std::move(msg));
+        }
+    }
+    frameCv_.notify_one();
 }
 
 void WsBroadcaster::AcknowledgeFrame(uint64_t frameId) {
@@ -217,6 +256,9 @@ void WsBroadcaster::Stop() {
         pendingStreamId_ = 0;
         pendingTimestampUs_ = 0;
         pendingKeyFrame_ = true;
+        pendingText_.clear();
+        pendingReplaceableText_.clear();
+        preferReplaceableText_ = false;
         inFlightFrames_.clear();
     }
     frameCv_.notify_all();
@@ -228,17 +270,43 @@ void WsBroadcaster::Stop() {
 void WsBroadcaster::SendLoop() {
     for (;;) {
         std::vector<uint8_t> frame;
+        std::string text;
         uint64_t streamId = 0;
         uint64_t frameId = 0;
         uint64_t timestampUs = 0;
         bool isKeyFrame = true;
+        bool sendingFrame = false;
         {
             std::unique_lock<std::mutex> lk(frameMu_);
             for (;;) {
                 if (stopping_) {
                     return;
                 }
-                if (inFlightFrames_.size() < kMaxFramesInFlight && !pendingFrame_.empty()) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!inFlightFrames_.empty() &&
+                    now >= inFlightFrames_.front().sentAt + kFrameAckTimeout) {
+                    // 即使持续有 cursor 消息，也必须按时释放超时帧窗口；否则高频
+                    // 指针移动会让 H.264 信用窗口永久卡在满载状态。
+                    log::Warn("frame ack timed out, releasing one in-flight slot");
+                    ackTimeouts_.fetch_add(1, std::memory_order_relaxed);
+                    inFlightFrames_.pop_front();
+                    continue;
+                }
+                if (!pendingText_.empty()) {
+                    text = std::move(pendingText_.front());
+                    pendingText_.pop_front();
+                    break;
+                }
+                const bool canSendFrame = inFlightFrames_.size() < kMaxFramesInFlight &&
+                    !pendingFrame_.empty();
+                if (!pendingReplaceableText_.empty() &&
+                    (!canSendFrame || preferReplaceableText_)) {
+                    text = std::move(pendingReplaceableText_);
+                    pendingReplaceableText_.clear();
+                    preferReplaceableText_ = false;
+                    break;
+                }
+                if (canSendFrame) {
                     frame.swap(pendingFrame_);
                     streamId = pendingStreamId_;
                     pendingStreamId_ = 0;
@@ -247,63 +315,72 @@ void WsBroadcaster::SendLoop() {
                     timestampUs = pendingTimestampUs_;
                     pendingTimestampUs_ = 0;
                     frameId = nextFrameId_++;
-                    inFlightFrames_.push_back({frameId, std::chrono::steady_clock::now()});
+                    inFlightFrames_.push_back({frameId, now});
+                    preferReplaceableText_ = true;
+                    sendingFrame = true;
+                    break;
+                }
+                if (!pendingReplaceableText_.empty()) {
+                    text = std::move(pendingReplaceableText_);
+                    pendingReplaceableText_.clear();
+                    preferReplaceableText_ = false;
                     break;
                 }
                 if (!inFlightFrames_.empty()) {
                     const auto deadline = inFlightFrames_.front().sentAt + kFrameAckTimeout;
                     if (frameCv_.wait_until(lk, deadline, [this] {
-                            return stopping_ ||
-                                (inFlightFrames_.size() < kMaxFramesInFlight &&
-                                 !pendingFrame_.empty());
+                        return stopping_ ||
+                            !pendingText_.empty() || !pendingReplaceableText_.empty() ||
+                            (inFlightFrames_.size() < kMaxFramesInFlight &&
+                             !pendingFrame_.empty());
                         })) {
                         continue;
-                    }
-                    // 连接可能已半开，或者控制端页面在图片解码中崩溃。释放最早
-                    // 超时帧的一个窗口配额；迟到确认按 id 匹配，不会影响新帧。
-                    if (!inFlightFrames_.empty() &&
-                        std::chrono::steady_clock::now() >=
-                            inFlightFrames_.front().sentAt + kFrameAckTimeout) {
-                        log::Warn("frame ack timed out, releasing one in-flight slot");
-                        ackTimeouts_.fetch_add(1, std::memory_order_relaxed);
-                        inFlightFrames_.pop_front();
                     }
                     continue;
                 }
                 frameCv_.wait(lk, [this] {
                     return stopping_ ||
+                        !pendingText_.empty() || !pendingReplaceableText_.empty() ||
                         (inFlightFrames_.size() < kMaxFramesInFlight && !pendingFrame_.empty());
                 });
             }
         }
-        // pendingFrame_ 已被取走，采集线程现在可安全编码下一张 delta。必须在
-        // 释放 frameMu_ 后通知，避免它醒来后马上阻塞在同一把锁上。
-        frameCv_.notify_all();
+        if (sendingFrame) {
+            // pendingFrame_ 已被取走，采集线程现在可安全编码下一张 delta。必须在
+            // 释放 frameMu_ 后通知，避免它醒来后马上阻塞在同一把锁上。
+            frameCv_.notify_all();
+        }
 
         bool sent = false;
         {
             std::lock_guard<std::mutex> lk(clientMu_);
             if (client_ && client_->is_open()) {
-                const std::string header = "{\"t\":\"frame\",\"id\":" +
-                    std::to_string(frameId) + ",\"stream_id\":" + std::to_string(streamId) +
-                    ",\"key\":" + (isKeyFrame ? "true" : "false") +
-                    ",\"ts\":" + std::to_string(timestampUs) + "}";
-                sent = client_->send(header) &&
-                    client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
+                if (!sendingFrame) {
+                    sent = client_->send(text);
+                } else {
+                    const std::string header = "{\"t\":\"frame\",\"id\":" +
+                        std::to_string(frameId) + ",\"stream_id\":" + std::to_string(streamId) +
+                        ",\"key\":" + (isKeyFrame ? "true" : "false") +
+                        ",\"ts\":" + std::to_string(timestampUs) + "}";
+                    sent = client_->send(header) &&
+                        client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
+                }
             }
         }
-        if (sent) {
+        if (sent && sendingFrame) {
             sentFrames_.fetch_add(1, std::memory_order_relaxed);
             sentBytes_.fetch_add(static_cast<uint64_t>(frame.size()), std::memory_order_relaxed);
         }
         if (!sent) {
             sendFailures_.fetch_add(1, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> frameLock(frameMu_);
-            const auto it = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
-                [frameId](const InFlightFrame& inFlight) { return inFlight.id == frameId; });
-            if (it != inFlightFrames_.end()) {
-                inFlightFrames_.erase(it);
-                frameCv_.notify_all();
+            if (sendingFrame) {
+                std::lock_guard<std::mutex> frameLock(frameMu_);
+                const auto it = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
+                    [frameId](const InFlightFrame& inFlight) { return inFlight.id == frameId; });
+                if (it != inFlightFrames_.end()) {
+                    inFlightFrames_.erase(it);
+                    frameCv_.notify_all();
+                }
             }
         }
     }

@@ -180,7 +180,7 @@ private:
 
 EncoderMf::~EncoderMf() { Release(); }
 
-bool EncoderMf::Init(int width, int height, int fps, int bitrateBps) {
+bool EncoderMf::Init(int width, int height, int fps, int bitrateBps, ID3D11Device* d3dDevice) {
     Release();
     if (width < 2 || height < 2 || (width & 1) != 0 || (height & 1) != 0 || fps <= 0) {
         log::Error("encoder received unsupported frame size");
@@ -191,6 +191,7 @@ bool EncoderMf::Init(int width, int height, int fps, int bitrateBps) {
     height_ = height;
     fps_ = std::max(1, fps);
     bitrateBps_ = std::max(100'000, bitrateBps);
+    d3dDevice_ = d3dDevice;
     frameIndex_ = 0;
     timelineStartedAt_ = std::chrono::steady_clock::now();
     lastInputTimestamp100Ns_ = -1;
@@ -205,7 +206,8 @@ bool EncoderMf::Init(int width, int height, int fps, int bitrateBps) {
         log::Info(std::string("H.264 encoder ready (") +
                   (hardwareH264_ ? "hardware" : "software") + "): " +
                   std::to_string(width_) + "x" + std::to_string(height_) +
-                  " bitrate=" + std::to_string(bitrateBps_));
+                  " bitrate=" + std::to_string(bitrateBps_) +
+                  " input=" + (d3dInputEnabled_ ? "d3d11" : "cpu"));
         return true;
     }
 
@@ -296,6 +298,8 @@ bool EncoderMf::TryCreateHardwareH264() {
             }
             h264Mft_.Reset();
             codecApi_.Reset();
+            dxgiDeviceManager_.Reset();
+            d3dInputEnabled_ = false;
         }
     }
     for (UINT32 index = 0; index < count; ++index) {
@@ -319,6 +323,8 @@ bool EncoderMf::TryCreateSoftwareH264() {
     }
     h264Mft_.Reset();
     codecApi_.Reset();
+    dxgiDeviceManager_.Reset();
+    d3dInputEnabled_ = false;
     return false;
 }
 
@@ -327,6 +333,9 @@ bool EncoderMf::ConfigureH264Transform() {
         return false;
     }
     h264Mft_.As(&codecApi_);
+    // D3D manager 必须在协商输入媒体类型前设置。MFT 不支持时仍保持 CPU 内存
+    // 输入可用，不能把单个驱动的能力缺失扩大为 H.264 初始化失败。
+    TryEnableD3D11Input();
     // 常见硬件 MFT 支持码率属性；不支持时仍由 media type 的平均码率兜底。
     // Windows SDK 并没有通用的 H.264 profile CodecAPI 属性，因此不能假定编码器
     // 一定是 Baseline；实际 profile 由后续 SPS 解析后下发给浏览器。
@@ -415,6 +424,34 @@ bool EncoderMf::ForceH264KeyFrame() {
     const HRESULT hr = codecApi_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value);
     VariantClear(&value);
     return SUCCEEDED(hr);
+}
+
+bool EncoderMf::TryEnableD3D11Input() {
+    d3dInputEnabled_ = false;
+    dxgiDeviceManager_.Reset();
+    if (!d3dDevice_.Get() || !h264Mft_.Get()) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IMFAttributes> attributes;
+    UINT32 d3d11Aware = FALSE;
+    if (FAILED(h264Mft_->GetAttributes(&attributes)) || !attributes.Get() ||
+        FAILED(attributes->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware)) || !d3d11Aware) {
+        return false;
+    }
+
+    UINT resetToken = 0;
+    Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> manager;
+    if (FAILED(MFCreateDXGIDeviceManager(&resetToken, &manager)) ||
+        FAILED(manager->ResetDevice(d3dDevice_.Get(), resetToken)) ||
+        FAILED(h264Mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                                        reinterpret_cast<ULONG_PTR>(manager.Get())))) {
+        return false;
+    }
+    dxgiDeviceManager_ = std::move(manager);
+    d3dInputEnabled_ = true;
+    log::Info("H.264 MFT accepts D3D11 NV12 input surfaces");
+    return true;
 }
 
 void EncoderMf::ConvertBgraToNv12(const uint8_t* bgra, size_t bgraStrideBytes,
@@ -752,28 +789,67 @@ bool EncoderMf::EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes,
     Microsoft::WRL::ComPtr<IMFSample> inputSample;
     hr = MFCreateSample(&inputSample);
     if (FAILED(hr)) return false;
-    inputSample->AddBuffer(inputBuffer.Get());
+    if (FAILED(inputSample->AddBuffer(inputBuffer.Get()))) return false;
+    return SubmitH264Sample(inputSample.Get(), out);
+}
+
+bool EncoderMf::EncodeD3D11(ID3D11Texture2D* nv12Texture,
+                            std::vector<EncodedChunk>& out) {
+    out.clear();
+    if (!configured_ || mode_ != EncoderMode::kH264 || !d3dInputEnabled_ || !nv12Texture) {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    nv12Texture->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_NV12 || static_cast<int>(desc.Width) != width_ ||
+        static_cast<int>(desc.Height) != height_ || desc.ArraySize != 1 || desc.MipLevels != 1) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IMFMediaBuffer> inputBuffer;
+    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Texture, 0, FALSE,
+                                           &inputBuffer);
+    if (FAILED(hr)) {
+        log::Warn("H.264 DXGI input buffer creation failed hr=" + std::to_string(hr));
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IMFSample> inputSample;
+    hr = MFCreateSample(&inputSample);
+    if (FAILED(hr) || FAILED(inputSample->AddBuffer(inputBuffer.Get()))) {
+        return false;
+    }
+    return SubmitH264Sample(inputSample.Get(), out);
+}
+
+bool EncoderMf::SubmitH264Sample(IMFSample* inputSample, std::vector<EncodedChunk>& out) {
+    if (!inputSample || !h264Mft_.Get()) {
+        return false;
+    }
     const LONGLONG timestamp100Ns = NextInputTimestamp100Ns();
-    inputSample->SetSampleTime(timestamp100Ns);
-    inputSample->SetSampleDuration(InputDuration100Ns(timestamp100Ns));
+    if (FAILED(inputSample->SetSampleTime(timestamp100Ns)) ||
+        FAILED(inputSample->SetSampleDuration(InputDuration100Ns(timestamp100Ns)))) {
+        return false;
+    }
     const LONGLONG keyFrameInterval100Ns =
         static_cast<LONGLONG>(kKeyFrameIntervalSeconds) * kHundredNsPerSecond;
     const bool periodicKeyFrame =
         timestamp100Ns - lastPeriodicKeyFrameRequest100Ns_ >= keyFrameInterval100Ns;
     if (keyFrameRequested_ || periodicKeyFrame) {
         ForceH264KeyFrame();
-        inputSample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
+        if (FAILED(inputSample->SetUINT32(MFSampleExtension_CleanPoint, TRUE))) {
+            return false;
+        }
         if (periodicKeyFrame) {
             lastPeriodicKeyFrameRequest100Ns_ = timestamp100Ns;
         }
     }
 
-    hr = h264Mft_->ProcessInput(0, inputSample.Get(), 0);
+    HRESULT hr = h264Mft_->ProcessInput(0, inputSample, 0);
     if (hr == MF_E_NOTACCEPTING) {
         if (!DrainH264(out)) {
             return false;
         }
-        hr = h264Mft_->ProcessInput(0, inputSample.Get(), 0);
+        hr = h264Mft_->ProcessInput(0, inputSample, 0);
     }
     if (FAILED(hr)) {
         log::Error("H.264 ProcessInput failed hr=" + std::to_string(hr));
@@ -898,10 +974,15 @@ bool EncoderMf::Encode(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<
 
 void EncoderMf::ReleaseH264() {
     if (h264Mft_.Get()) {
+        if (d3dInputEnabled_) {
+            h264Mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+        }
         h264Mft_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         h264Mft_.Reset();
     }
     codecApi_.Reset();
+    dxgiDeviceManager_.Reset();
+    d3dInputEnabled_ = false;
     h264OutputSample_.Reset();
     h264OutputBuffer_.Reset();
     h264OutputBufferSize_ = 0;
@@ -922,6 +1003,7 @@ void EncoderMf::Release() {
     configured_ = false;
     wicFactory_.Reset();
     ReleaseH264();
+    d3dDevice_.Reset();
     width_ = 0;
     height_ = 0;
     frameIndex_ = 0;

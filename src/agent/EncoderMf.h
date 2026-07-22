@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <codecapi.h>
+#include <d3d11.h>
 #include <strmif.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -38,10 +39,15 @@ public:
     ~EncoderMf();
     EncoderMf(const EncoderMf&) = delete;
     EncoderMf& operator=(const EncoderMf&) = delete;
-    bool Init(int width, int height, int fps, int bitrateBps);
+    bool Init(int width, int height, int fps, int bitrateBps,
+              ID3D11Device* d3dDevice = nullptr);
     // bgraStrideBytes 允许 DXGI staging texture 的对齐行距，避免未缩放画面额外拷贝到
     // 紧凑 CPU 缓冲区。
     bool Encode(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
+    // 同一 D3D11 设备上的 NV12 surface 可直接输入硬件 MFT，跳过 CPU 读回和
+    // BGRA->NV12 转换。失败由调用方重新初始化为已有 CPU 路径。
+    bool EncodeD3D11(ID3D11Texture2D* nv12Texture, std::vector<EncodedChunk>& out);
+    bool CanEncodeD3D11() const { return d3dInputEnabled_; }
     std::string CodecString() const;
     // 由采集线程在新控制端、切屏或解码恢复后调用。请求会保持到编码器实际输出
     // IDR 为止，避免把无法独立解码的增量帧作为新流首帧发送。
@@ -62,6 +68,7 @@ private:
     bool ConfigureH264Transform();
     bool ConfigureH264OutputType();
     bool EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
+    bool SubmitH264Sample(IMFSample* inputSample, std::vector<EncodedChunk>& out);
     bool DrainH264(std::vector<EncodedChunk>& out);
     bool EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
     DWORD H264OutputBufferTargetSize() const;
@@ -71,6 +78,7 @@ private:
     LONGLONG InputDuration100Ns(LONGLONG timestamp100Ns) const;
     void ReleaseH264();
     bool ForceH264KeyFrame();
+    bool TryEnableD3D11Input();
     void ConvertBgraToNv12(const uint8_t* bgra, size_t bgraStrideBytes, uint8_t* nv12) const;
     void CacheH264ParameterSets(const std::vector<uint8_t>& data);
     void PrependCachedParameterSets(EncodedChunk& chunk) const;
@@ -82,6 +90,8 @@ private:
     Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory_;
     Microsoft::WRL::ComPtr<IMFTransform> h264Mft_;
     Microsoft::WRL::ComPtr<ICodecAPI> codecApi_;
+    Microsoft::WRL::ComPtr<ID3D11Device> d3dDevice_;
+    Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> dxgiDeviceManager_;
     // caller-allocated 输出模式下复用 MFT 输出缓冲。ProcessOutput 返回后立即复制
     // NAL 数据，因此下次调用前可安全复用；输入样本可能被 MFT 异步持有，不能同样
     // 复用，仍维持每帧独立输入缓冲以保证正确性。
@@ -106,6 +116,7 @@ private:
         std::numeric_limits<LONGLONG>::min() / 2;
     bool mfStarted_ = false;
     bool hardwareH264_ = false;
+    bool d3dInputEnabled_ = false;
     EncoderMode mode_ = EncoderMode::kJpeg;
     bool configured_ = false;
     // 缓存最新 SPS/PPS。某些 MFT 将其与 IDR 拆成不同 sample 输出，重连时必须

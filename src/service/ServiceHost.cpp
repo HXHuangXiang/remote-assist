@@ -11,6 +11,7 @@
 #include <wtsapi32.h>
 
 #include <atomic>
+#include <algorithm>
 #include <mutex>
 #include <string>
 namespace remote_assist {
@@ -23,10 +24,17 @@ constexpr DWORD kMonitorIntervalMs = 2000;
 constexpr DWORD kAgentStopTimeoutMs = 8000;
 constexpr DWORD kTrayStopTimeoutMs = 1000;
 constexpr DWORD kServiceStopMarginMs = 2000;
+constexpr DWORD kChildRetryBaseDelayMs = 1000;
+constexpr DWORD kChildRetryMaxDelayMs = 30000;
 // Service 创建的全局事件只允许 LocalSystem/管理员修改；交互式用户仅可同步等待
 // readyEvent，供配置窗口展示状态。这样普通本地进程不能伪造就绪或随意停止 Agent。
 constexpr wchar_t kAgentEventSddl[] =
     L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)";
+
+struct ChildRetryState {
+    DWORD consecutiveFailures = 0;
+    ULONGLONG nextAttemptAt = 0;
+};
 
 struct ServiceState {
     // SCM 的控制回调线程和 ServiceWorker 都会汇报状态。SERVICE_STATUS 是可变
@@ -45,6 +53,8 @@ struct ServiceState {
     DWORD traySessionId = kInvalidSessionId;
     bool externalAgentStopRequested = false;
     bool externalTrayDetected = false;
+    ChildRetryState agentRetry;
+    ChildRetryState trayRetry;
 };
 ServiceState g_state;
 
@@ -116,6 +126,27 @@ void AddChildToJob(HANDLE process, const char* role) {
     }
 }
 
+// 子进程因端口占用、显卡驱动异常等原因立即退出时，固定 2 秒轮询会持续创建
+// 进程、刷日志并干扰系统恢复。采用 1/2/4/.../30 秒的有界退避，成功启动后清零。
+bool IsRetryDue(const ChildRetryState& retry) {
+    return GetTickCount64() >= retry.nextAttemptAt;
+}
+
+void ResetRetry(ChildRetryState& retry) {
+    retry = {};
+}
+
+void RecordChildLaunchFailure(ChildRetryState& retry, const char* role) {
+    retry.consecutiveFailures = std::min<DWORD>(retry.consecutiveFailures + 1, 6);
+    const DWORD multiplier = 1u << (retry.consecutiveFailures - 1);
+    const DWORD delayMs = std::min(kChildRetryMaxDelayMs,
+        kChildRetryBaseDelayMs * multiplier);
+    retry.nextAttemptAt = GetTickCount64() + delayMs;
+    log::Warn(std::string(role) + " launch/recovery failed, retry in " +
+              std::to_string(delayMs) + "ms (consecutive=" +
+              std::to_string(retry.consecutiveFailures) + ")");
+}
+
 // Agent/Tray 以“初始所有者”方式持有命名 mutex。服务只有在没有自己管理的
 // 子进程时探测它：WAIT_TIMEOUT 代表外部同类进程仍在运行；可立即获取时要先
 // ReleaseMutex，避免服务线程意外把对象永久锁住。
@@ -165,7 +196,12 @@ void EnsureAgent() {
         return;
     }
     const DWORD targetSessionId = FindActiveInteractiveSessionId();
+    const bool hadAgentProcess = g_state.agentProcess != nullptr;
     const bool agentRunning = IsChildRunning(g_state.agentProcess, "agent");
+    const bool agentExited = hadAgentProcess && !agentRunning;
+    if (agentExited) {
+        RecordChildLaunchFailure(g_state.agentRetry, "agent");
+    }
     if (agentRunning && (targetSessionId == kInvalidSessionId ||
                          g_state.agentSessionId == targetSessionId)) {
         return;
@@ -184,6 +220,9 @@ void EnsureAgent() {
         ResetEvent(g_state.agentReadyEvent);
     }
     if (targetSessionId == kInvalidSessionId) {
+        // 没有交互会话不是子进程故障；用户重新登录后应立即尝试，而不是沿用上次
+        // 端口/驱动异常留下的最长退避时间。
+        ResetRetry(g_state.agentRetry);
         return;
     }
     if (!g_state.agentStopEvent) {
@@ -200,6 +239,9 @@ void EnsureAgent() {
         return;
     }
     g_state.externalAgentStopRequested = false;
+    if (!IsRetryDue(g_state.agentRetry)) {
+        return;
+    }
     ResetEvent(g_state.agentStopEvent);
 
     HANDLE process = nullptr;
@@ -209,6 +251,13 @@ void EnsureAgent() {
         ProcessIdToSessionId(GetProcessId(process), &childSessionId);
         g_state.agentSessionId = childSessionId;
         AddChildToJob(process, "agent");
+        ResetRetry(g_state.agentRetry);
+    } else {
+        // 同一轮中已记录“已启动子进程退出”时，不再把随后的 launch 失败重复
+        // 计数；下一次实际重试失败才进入下一档退避。
+        if (!agentExited) {
+            RecordChildLaunchFailure(g_state.agentRetry, "agent");
+        }
     }
 }
 
@@ -217,7 +266,12 @@ void EnsureTray() {
         return;
     }
     const DWORD targetSessionId = FindActiveInteractiveSessionId();
+    const bool hadTrayProcess = g_state.trayProcess != nullptr;
     const bool trayRunning = IsChildRunning(g_state.trayProcess, "tray");
+    const bool trayExited = hadTrayProcess && !trayRunning;
+    if (trayExited) {
+        RecordChildLaunchFailure(g_state.trayRetry, "tray");
+    }
     if (trayRunning && (targetSessionId == kInvalidSessionId ||
                         g_state.traySessionId == targetSessionId)) {
         return;
@@ -230,6 +284,7 @@ void EnsureTray() {
     }
     g_state.traySessionId = kInvalidSessionId;
     if (targetSessionId == kInvalidSessionId) {
+        ResetRetry(g_state.trayRetry);
         return;
     }
     if (IsNamedMutexHeld(runtime::kTrayMutexName)) {
@@ -240,6 +295,9 @@ void EnsureTray() {
         return;
     }
     g_state.externalTrayDetected = false;
+    if (!IsRetryDue(g_state.trayRetry)) {
+        return;
+    }
 
     HANDLE process = nullptr;
     if (LaunchTrayInConsoleSession(g_state.exePath, &process)) {
@@ -248,6 +306,11 @@ void EnsureTray() {
         ProcessIdToSessionId(GetProcessId(process), &childSessionId);
         g_state.traySessionId = childSessionId;
         AddChildToJob(process, "tray");
+        ResetRetry(g_state.trayRetry);
+    } else {
+        if (!trayExited) {
+            RecordChildLaunchFailure(g_state.trayRetry, "tray");
+        }
     }
 }
 
@@ -335,6 +398,8 @@ void ServiceWorker() {
     g_state.traySessionId = kInvalidSessionId;
     g_state.externalAgentStopRequested = false;
     g_state.externalTrayDetected = false;
+    ResetRetry(g_state.agentRetry);
+    ResetRetry(g_state.trayRetry);
     if (g_state.childJob) {
         CloseHandle(g_state.childJob);
         g_state.childJob = nullptr;

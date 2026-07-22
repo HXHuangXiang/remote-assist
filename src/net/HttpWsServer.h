@@ -53,7 +53,9 @@ public:
 
     // 仅允许一个控制端连接。返回 false 表示已有连接。
     bool Add(httplib::ws::WebSocket* ws);
-    void Remove(httplib::ws::WebSocket* ws);
+    // 仅当 ws 仍是当前控制端时返回 true。旧连接在新控制端接管后退出时不能再
+    // 触发输入释放，否则会错误中断新控制端正在按下的键鼠状态。
+    bool Remove(httplib::ws::WebSocket* ws);
     // 取得编码器生成的帧所有权。JPEG 只保留最新一帧；H.264 不能跳过中间
     // 增量帧，若队列已满则清空待发送帧并要求调用方强制下一张 IDR。
     // streamId 与配置消息对应，用于浏览器丢弃过期图像。
@@ -63,7 +65,10 @@ public:
     // 可以直接跳过本轮采集输入而不产生缺失的参考帧，避免编码后再触发 IDR 重同步。
     // 返回 false 表示等待超时或 broadcaster 正在停止。
     bool WaitForH264FrameCredit(std::chrono::milliseconds timeout);
-    void BroadcastText(const std::string& msg);
+    // 文本下行与视频帧共用唯一发送线程，避免慢 socket 写操作阻塞采集线程。
+    // replaceable=true 用于高频 cursor 位置，只保留最新一条；配置等关键消息
+    // 使用默认值，按顺序可靠发送。
+    void BroadcastText(std::string msg, bool replaceable = false);
     // 浏览器在帧真正绘制（或主动丢弃过期帧）后确认，服务端释放对应的发送窗口。
     void AcknowledgeFrame(uint64_t frameId);
     BroadcasterStats SnapshotStats() const;
@@ -84,6 +89,11 @@ private:
     uint64_t pendingStreamId_ = 0;
     uint64_t pendingTimestampUs_ = 0;
     bool pendingKeyFrame_ = true;
+    // 配置等关键文本消息不能被高频 cursor 覆盖；cursor 则独立合并为最新状态。
+    // 发送循环在视频与 cursor 间交替，既保持指针低延迟，也不能让鼠标移动饿死视频。
+    std::deque<std::string> pendingText_;
+    std::string pendingReplaceableText_;
+    bool preferReplaceableText_ = false;
     uint64_t nextFrameId_ = 1;
     struct InFlightFrame {
         uint64_t id = 0;
