@@ -23,6 +23,8 @@ namespace {
 
 constexpr LONGLONG kHundredNsPerSecond = 10'000'000;
 constexpr int kKeyFrameIntervalSeconds = 2;
+constexpr DWORD kMinH264OutputBufferBytes = 512 * 1024;
+constexpr DWORD kMaxH264OutputBufferBytes = 32 * 1024 * 1024;
 
 uint8_t ClampToByte(int value) {
     return static_cast<uint8_t>(std::clamp(value, 0, 255));
@@ -474,6 +476,21 @@ LONGLONG EncoderMf::InputDuration100Ns(LONGLONG timestamp100Ns) const {
     return std::max<LONGLONG>(1, timestamp100Ns - lastInputTimestamp100Ns_);
 }
 
+DWORD EncoderMf::H264OutputBufferTargetSize() const {
+    // 硬件 MFT 有时把 cbSize 留为 0 或仅填普通 P 帧大小。IDR 的体积可接近一个
+    // GOP 的目标码率，因此按两秒关键帧周期给 caller-allocated 样本预留空间；上限
+    // 受配置最大码率约束，避免异常 MFT 诱导过大的长期内存占用。
+    const uint64_t bitrateBudget = static_cast<uint64_t>(std::max(100'000, bitrateBps_)) *
+        kKeyFrameIntervalSeconds / 8;
+    const uint64_t target = std::max<uint64_t>({
+        kMinH264OutputBufferBytes,
+        outputStreamInfo_.cbSize,
+        h264OutputBufferFloorSize_,
+        std::min<uint64_t>(bitrateBudget, kMaxH264OutputBufferBytes),
+    });
+    return static_cast<DWORD>(std::min<uint64_t>(target, kMaxH264OutputBufferBytes));
+}
+
 bool EncoderMf::NormalizeH264ToAnnexB(const uint8_t* source, size_t len,
                                       std::vector<uint8_t>& destination) {
     if (!source || len == 0) {
@@ -608,9 +625,9 @@ bool EncoderMf::DrainH264(std::vector<EncodedChunk>& out) {
         MFT_OUTPUT_DATA_BUFFER output{};
         Microsoft::WRL::ComPtr<IMFSample> callerSample;
         if ((outputStreamInfo_.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
-            // 部分硬件 MFT 没有填写 cbSize。为首个 IDR 预留合理下限，并在分辨率或
-            // 输出类型变化后按新的 stream info 重建，而不是每帧重新分配。
-            const DWORD outputSize = std::max<DWORD>(256 * 1024, outputStreamInfo_.cbSize);
+            // 部分硬件 MFT 没有填写 cbSize，或仅按普通 P 帧大小填充。为 IDR 按
+            // 码率预算预留空间，并在分辨率或输出类型变化后复用已有样本。
+            const DWORD outputSize = H264OutputBufferTargetSize();
             if (!h264OutputSample_.Get() || !h264OutputBuffer_.Get() ||
                 h264OutputBufferSize_ < outputSize) {
                 Microsoft::WRL::ComPtr<IMFSample> sample;
@@ -644,6 +661,24 @@ bool EncoderMf::DrainH264(std::vector<EncodedChunk>& out) {
                 return false;
             }
             continue;
+        }
+        if (hr == MF_E_BUFFERTOOSMALL && callerSample.Get() &&
+            h264OutputBufferSize_ < kMaxH264OutputBufferBytes) {
+            // ProcessOutput 不消耗待输出访问单元；增大 caller buffer 后可直接重试。
+            // 保留一个容量下限，后续 IDR 不会再次退化为 JPEG fallback。
+            const uint64_t doubled = static_cast<uint64_t>(h264OutputBufferSize_) * 2;
+            const DWORD largerBuffer = static_cast<DWORD>(std::min<uint64_t>(
+                kMaxH264OutputBufferBytes,
+                std::max<uint64_t>(doubled, h264OutputBufferSize_ + kMinH264OutputBufferBytes)));
+            if (largerBuffer > h264OutputBufferSize_) {
+                log::Warn("H.264 output buffer too small, retrying with " +
+                          std::to_string(largerBuffer) + " bytes");
+                h264OutputBufferFloorSize_ = largerBuffer;
+                h264OutputSample_.Reset();
+                h264OutputBuffer_.Reset();
+                h264OutputBufferSize_ = 0;
+                continue;
+            }
         }
         if (FAILED(hr)) {
             log::Error("H.264 ProcessOutput failed hr=" + std::to_string(hr));
@@ -870,6 +905,7 @@ void EncoderMf::ReleaseH264() {
     h264OutputSample_.Reset();
     h264OutputBuffer_.Reset();
     h264OutputBufferSize_ = 0;
+    h264OutputBufferFloorSize_ = 0;
     outputStreamInfo_ = {};
     hardwareH264_ = false;
     h264Sps_.clear();

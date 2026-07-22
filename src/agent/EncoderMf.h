@@ -64,6 +64,7 @@ private:
     bool EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
     bool DrainH264(std::vector<EncodedChunk>& out);
     bool EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
+    DWORD H264OutputBufferTargetSize() const;
     // 采集帧率会被 Agent 根据网络和编码压力动态下调，因此不能继续以初始化时的
     // fps_ 推导 PTS。使用单调时钟为 MFT/WebCodecs 提供真实、严格递增的时间基。
     LONGLONG NextInputTimestamp100Ns();
@@ -87,6 +88,9 @@ private:
     Microsoft::WRL::ComPtr<IMFSample> h264OutputSample_;
     Microsoft::WRL::ComPtr<IMFMediaBuffer> h264OutputBuffer_;
     DWORD h264OutputBufferSize_ = 0;
+    // 运行期收到 MF_E_BUFFERTOOSMALL 后抬高的容量下限；分辨率/码率变化时仍保留
+    // 已验证的安全容量，避免关键帧反复触发同一失败。
+    DWORD h264OutputBufferFloorSize_ = 0;
     MFT_OUTPUT_STREAM_INFO outputStreamInfo_{};
     int width_ = 0;
     int height_ = 0;
