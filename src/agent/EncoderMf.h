@@ -9,7 +9,9 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include <chrono>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -62,6 +64,10 @@ private:
     bool EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
     bool DrainH264(std::vector<EncodedChunk>& out);
     bool EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
+    // 采集帧率会被 Agent 根据网络和编码压力动态下调，因此不能继续以初始化时的
+    // fps_ 推导 PTS。使用单调时钟为 MFT/WebCodecs 提供真实、严格递增的时间基。
+    LONGLONG NextInputTimestamp100Ns();
+    LONGLONG InputDuration100Ns(LONGLONG timestamp100Ns) const;
     void ReleaseH264();
     bool ForceH264KeyFrame();
     void ConvertBgraToNv12(const uint8_t* bgra, size_t bgraStrideBytes, uint8_t* nv12) const;
@@ -88,6 +94,12 @@ private:
     int bitrateBps_ = 4'000'000;
     int quality_ = 75;
     uint64_t frameIndex_ = 0;
+    std::chrono::steady_clock::time_point timelineStartedAt_{};
+    LONGLONG lastInputTimestamp100Ns_ = -1;
+    // 定期 IDR 必须以真实时间而非“输入帧数 / 初始 FPS”决定，否则自适应降帧后
+    // 连接恢复会等待远超预期的关键帧间隔。
+    LONGLONG lastPeriodicKeyFrameRequest100Ns_ =
+        std::numeric_limits<LONGLONG>::min() / 2;
     bool mfStarted_ = false;
     bool hardwareH264_ = false;
     EncoderMode mode_ = EncoderMode::kJpeg;

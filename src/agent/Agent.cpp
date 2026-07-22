@@ -382,9 +382,27 @@ void Agent::CaptureLoop() {
     int adaptiveResolutionTier = 0;
     int congestionWindows = 0;
     int healthyResolutionWindows = 0;
+    // metrics 会每十秒清零，不能直接拿它作为一秒自适应窗口。编码耗时只累计
+    // 真正调用编码器的时间，不包含 DXGI 等待桌面变化的阻塞时间。
+    uint64_t adaptiveEncodeAttempts = 0;
+    uint64_t adaptiveEncodeTimeMs = 0;
+    uint64_t lastEncodeLoadPercent = 0;
     // 采集结果在相邻帧间复用容量。1920x1080 的 BGRA 帧约 8MB，若每轮都创建
     // 局部 CapturedFrame 会触发持续的大块堆分配和释放，直接放大卡顿。
     CapturedFrame frame;
+
+    auto effectiveFpsFor = [&](int requestedFps) {
+        int effectiveFps = requestedFps;
+        if (capture_.IsUsingGdi()) {
+            // BitBlt 即使画面未变也需要整帧复制到 DIB；锁屏和“全部屏幕”路径
+            // 优先保持低延迟与输入响应，15 FPS 已足够避免远端界面出现明显跳变。
+            effectiveFps = std::min(effectiveFps, 15);
+        } else if ((!encoder_ || !encoder_->IsH264()) &&
+                   (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080)) {
+            effectiveFps = std::min(effectiveFps, 15);
+        }
+        return std::max(1, effectiveFps);
+    };
 
     auto setResolutionTier = [&](int tier) {
         tier = std::clamp(tier, 0, kStreamResolutionCapCount - 1);
@@ -505,6 +523,7 @@ void Agent::CaptureLoop() {
                       std::to_string(metrics.encodeAttempts) +
                       " encode_fail=" + std::to_string(metrics.encodeFailures) +
                       " encode_avg_ms=" + std::to_string(avgEncodeMs) +
+                      " encode_load_pct=" + std::to_string(lastEncodeLoadPercent) +
                       " encoded_kib=" + std::to_string(metrics.encodedBytes / 1024) +
                       " queued=" + std::to_string(queued) +
                       " replaced=" + std::to_string(replaced) +
@@ -533,9 +552,9 @@ void Agent::CaptureLoop() {
         nextMetricsLog = now + std::chrono::seconds(10);
     };
 
-    // 发送队列只能安全保留很少的 H.264 增量帧；一旦浏览器绘制确认追不上，继续
-    // 以固定 FPS 编码只会反复触发 IDR 重同步。依据一秒窗口的 ACK 端到端延迟
-    // 快速降帧，网络恢复后再平滑回升到用户配置上限。
+    // 发送队列只能安全保留很少的 H.264 增量帧；一旦浏览器绘制确认或本机编码
+    // 追不上，继续以固定 FPS 编码只会反复触发 IDR 重同步。依据一秒窗口的网络
+    // 和真实编码耗时快速降帧，网络/CPU 恢复后再平滑回升到用户配置上限。
     auto adaptFrameRateIfDue = [&](std::chrono::steady_clock::time_point now) {
         if (now < nextAdaptation) {
             return;
@@ -552,19 +571,35 @@ void Agent::CaptureLoop() {
         const uint64_t sendFailures = CounterDelta(stats.sendFailures,
                                                    adaptationStatsBase.sendFailures);
         const uint64_t averageAckMs = ackSamples == 0 ? 0 : ackLatencyUs / ackSamples / 1000;
-        const bool congested = ackTimeouts != 0 || h264Resyncs != 0 || sendFailures != 0 ||
+        const int currentEffectiveFps = effectiveFpsFor(adaptiveFps);
+        const uint64_t averageEncodeMs = adaptiveEncodeAttempts == 0 ? 0 :
+            adaptiveEncodeTimeMs / adaptiveEncodeAttempts;
+        lastEncodeLoadPercent = averageEncodeMs * static_cast<uint64_t>(currentEffectiveFps) *
+            100 / 1000;
+        // 保留约 15% 的编码时间预算给采集、内存传输与系统调度；只在至少有两帧
+        // 样本时触发，避免切屏首帧或一次 IDR 的偶发耗时造成无谓降档。
+        const bool encoderOverloaded = adaptiveEncodeAttempts >= 2 &&
+            lastEncodeLoadPercent >= 85;
+        const bool encoderHealthy = adaptiveEncodeAttempts == 0 ||
+            (adaptiveEncodeAttempts >= 2 && lastEncodeLoadPercent <= 55);
+        const bool networkCongested = ackTimeouts != 0 || h264Resyncs != 0 || sendFailures != 0 ||
             (ackSamples != 0 && averageAckMs >= 120);
-        const bool healthy = ackSamples >= 4 && averageAckMs <= 65 && ackTimeouts == 0 &&
+        const bool networkHealthy = ackSamples >= 4 && averageAckMs <= 65 && ackTimeouts == 0 &&
             h264Resyncs == 0 && sendFailures == 0;
-        const bool severeCongestion = ackTimeouts != 0 || h264Resyncs != 0 ||
-            sendFailures != 0;
+        const bool congested = networkCongested || encoderOverloaded;
+        const bool healthy = networkHealthy && encoderHealthy;
+        const bool severeCongestion = ackTimeouts != 0 || h264Resyncs != 0 || sendFailures != 0 ||
+            lastEncodeLoadPercent >= 100;
         int nextFps = adaptiveFps;
         int nextBitrate = adaptiveBitrate;
         const int minimumBitrate = std::min(cfg_.bitrate,
             std::max(100'000, cfg_.bitrate / 8));
         if (congested) {
             // 乘法退避能在高延迟 Wi-Fi 下更快逃离“P 帧挤压 -> IDR”的循环。
-            nextFps = std::max(5, adaptiveFps * 3 / 4);
+            const int encoderLimitedFps = encoderOverloaded
+                ? std::max(5, currentEffectiveFps * 3 / 4)
+                : adaptiveFps;
+            nextFps = std::max(5, std::min(adaptiveFps * 3 / 4, encoderLimitedFps));
             nextBitrate = std::max(minimumBitrate, adaptiveBitrate * 3 / 4);
         } else if (healthy) {
             // 恢复阶段使用小步上调，避免刚恢复就再次压垮解码/网络窗口。
@@ -601,7 +636,10 @@ void Agent::CaptureLoop() {
                       std::to_string(nextFps) + " ack_avg_ms=" +
                       std::to_string(averageAckMs) + " ack_timeout=" +
                       std::to_string(ackTimeouts) + " h264_resync=" +
-                      std::to_string(h264Resyncs));
+                      std::to_string(h264Resyncs) + " encode_avg_ms=" +
+                      std::to_string(averageEncodeMs) + " encode_load_pct=" +
+                      std::to_string(lastEncodeLoadPercent) + " encoder_overload=" +
+                      (encoderOverloaded ? "true" : "false"));
             adaptiveFps = nextFps;
             streamFps_.store(adaptiveFps);
         }
@@ -617,6 +655,8 @@ void Agent::CaptureLoop() {
             }
         }
         adaptationStatsBase = stats;
+        adaptiveEncodeAttempts = 0;
+        adaptiveEncodeTimeMs = 0;
         nextAdaptation = now + std::chrono::seconds(1);
     };
 
@@ -627,16 +667,8 @@ void Agent::CaptureLoop() {
 
         // JPEG 回退需要 CPU 全帧压缩，大屏时保守限帧；H.264 模式的压缩由 MFT
         // 承担，不应仅因分辨率达到 1080p 就被无条件锁在 15 FPS，否则既浪费
-        // 硬件能力，也会让编码器的 30 FPS 时间戳和实际采集节奏不一致。
-        int effectiveFps = adaptiveFps;
-        if (capture_.IsUsingGdi()) {
-            // BitBlt 即使画面未变也需要整帧复制到 DIB；锁屏和“全部屏幕”路径
-            // 优先保持低延迟与输入响应，15 FPS 已足够避免远端界面出现明显跳变。
-            effectiveFps = std::min(effectiveFps, 15);
-        } else if ((!encoder_ || !encoder_->IsH264()) &&
-                   (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080)) {
-            effectiveFps = std::min(effectiveFps, 15);
-        }
+        // 硬件能力，也会让编码器的帧时间基和实际采集节奏不一致。
+        const int effectiveFps = effectiveFpsFor(adaptiveFps);
         const int targetMs = 1000 / std::max(1, effectiveFps);
 
         // 跟随桌面切换(锁屏↔解锁、Winlogon↔Default)。
@@ -782,10 +814,13 @@ void Agent::CaptureLoop() {
                 encoder_->RequestKeyFrame();
             }
             const bool encoded = encoder_->Encode(frame.Pixels(), frame.StrideBytes(), chunks);
-            metrics.encodeAttempts++;
-            metrics.encodeTimeMs += static_cast<uint64_t>(
+            const uint64_t encodeElapsedMs = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - encodeStartedAt).count());
+            metrics.encodeAttempts++;
+            metrics.encodeTimeMs += encodeElapsedMs;
+            ++adaptiveEncodeAttempts;
+            adaptiveEncodeTimeMs += encodeElapsedMs;
             if (encoded) {
                 if (wasH264 != encoder_->IsH264()) {
                     streamH264_.store(encoder_->IsH264());

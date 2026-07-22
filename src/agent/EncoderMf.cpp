@@ -22,7 +22,6 @@ namespace remote_assist {
 namespace {
 
 constexpr LONGLONG kHundredNsPerSecond = 10'000'000;
-constexpr uint64_t kMicrosecondsPerSecond = 1'000'000;
 constexpr int kKeyFrameIntervalSeconds = 2;
 
 uint8_t ClampToByte(int value) {
@@ -191,6 +190,9 @@ bool EncoderMf::Init(int width, int height, int fps, int bitrateBps) {
     fps_ = std::max(1, fps);
     bitrateBps_ = std::max(100'000, bitrateBps);
     frameIndex_ = 0;
+    timelineStartedAt_ = std::chrono::steady_clock::now();
+    lastInputTimestamp100Ns_ = -1;
+    lastPeriodicKeyFrameRequest100Ns_ = std::numeric_limits<LONGLONG>::min() / 2;
     h264Sps_.clear();
     h264Pps_.clear();
     h264CodecProfile_ = 0x42E01E;
@@ -453,6 +455,25 @@ void EncoderMf::ConvertBgraToNv12(const uint8_t* bgra, size_t bgraStrideBytes,
     }
 }
 
+LONGLONG EncoderMf::NextInputTimestamp100Ns() {
+    const auto now = std::chrono::steady_clock::now();
+    LONGLONG timestamp100Ns = static_cast<LONGLONG>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - timelineStartedAt_).count() / 100);
+    // 部分 MFT/WebCodecs 实现拒绝相同或倒退的 PTS。高分辨率计时器在紧邻的两次
+    // 调用中仍可能落在同一个 100ns tick，因此至少前进一个 tick。
+    if (lastInputTimestamp100Ns_ >= 0 && timestamp100Ns <= lastInputTimestamp100Ns_) {
+        timestamp100Ns = lastInputTimestamp100Ns_ + 1;
+    }
+    return std::max<LONGLONG>(0, timestamp100Ns);
+}
+
+LONGLONG EncoderMf::InputDuration100Ns(LONGLONG timestamp100Ns) const {
+    if (lastInputTimestamp100Ns_ < 0) {
+        return std::max<LONGLONG>(1, kHundredNsPerSecond / std::max(1, fps_));
+    }
+    return std::max<LONGLONG>(1, timestamp100Ns - lastInputTimestamp100Ns_);
+}
+
 bool EncoderMf::NormalizeH264ToAnnexB(const uint8_t* source, size_t len,
                                       std::vector<uint8_t>& destination) {
     if (!source || len == 0) {
@@ -665,8 +686,9 @@ bool EncoderMf::DrainH264(std::vector<EncodedChunk>& out) {
             PrependCachedParameterSets(chunk);
             keyFrameRequested_ = false;
         }
-        LONGLONG timestamp100Ns = static_cast<LONGLONG>(frameIndex_) *
-            kHundredNsPerSecond / std::max(1, fps_);
+        // 硬件 MFT 会保留输入 PTS；若某个驱动没有填充输出 sample time，则退回
+        // 最近一次真实输入时间，而不是配置 FPS 推导出的虚假时间基。
+        LONGLONG timestamp100Ns = std::max<LONGLONG>(0, lastInputTimestamp100Ns_);
         outputSample->GetSampleTime(&timestamp100Ns);
         chunk.timestampUs = timestamp100Ns < 0 ? 0 :
             static_cast<uint64_t>(timestamp100Ns) / 10;
@@ -696,15 +718,19 @@ bool EncoderMf::EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes,
     hr = MFCreateSample(&inputSample);
     if (FAILED(hr)) return false;
     inputSample->AddBuffer(inputBuffer.Get());
-    const LONGLONG timestamp100Ns = static_cast<LONGLONG>(frameIndex_) *
-        kHundredNsPerSecond / std::max(1, fps_);
+    const LONGLONG timestamp100Ns = NextInputTimestamp100Ns();
     inputSample->SetSampleTime(timestamp100Ns);
-    inputSample->SetSampleDuration(kHundredNsPerSecond / std::max(1, fps_));
-    const uint64_t keyFrameInterval = static_cast<uint64_t>(std::max(1, fps_)) *
-        kKeyFrameIntervalSeconds;
-    if (keyFrameRequested_ || frameIndex_ % keyFrameInterval == 0) {
+    inputSample->SetSampleDuration(InputDuration100Ns(timestamp100Ns));
+    const LONGLONG keyFrameInterval100Ns =
+        static_cast<LONGLONG>(kKeyFrameIntervalSeconds) * kHundredNsPerSecond;
+    const bool periodicKeyFrame =
+        timestamp100Ns - lastPeriodicKeyFrameRequest100Ns_ >= keyFrameInterval100Ns;
+    if (keyFrameRequested_ || periodicKeyFrame) {
         ForceH264KeyFrame();
         inputSample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
+        if (periodicKeyFrame) {
+            lastPeriodicKeyFrameRequest100Ns_ = timestamp100Ns;
+        }
     }
 
     hr = h264Mft_->ProcessInput(0, inputSample.Get(), 0);
@@ -718,6 +744,7 @@ bool EncoderMf::EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes,
         log::Error("H.264 ProcessInput failed hr=" + std::to_string(hr));
         return false;
     }
+    lastInputTimestamp100Ns_ = timestamp100Ns;
     ++frameIndex_;
     if (!DrainH264(out)) {
         return false;
@@ -800,7 +827,9 @@ bool EncoderMf::EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes,
         return false;
     }
     chunk.isKey = true;
-    chunk.timestampUs = frameIndex_ * kMicrosecondsPerSecond / std::max(1, fps_);
+    const LONGLONG timestamp100Ns = NextInputTimestamp100Ns();
+    chunk.timestampUs = static_cast<uint64_t>(timestamp100Ns) / 10;
+    lastInputTimestamp100Ns_ = timestamp100Ns;
     ++frameIndex_;
     out.clear();
     out.push_back(std::move(chunk));
@@ -860,6 +889,9 @@ void EncoderMf::Release() {
     width_ = 0;
     height_ = 0;
     frameIndex_ = 0;
+    timelineStartedAt_ = {};
+    lastInputTimestamp100Ns_ = -1;
+    lastPeriodicKeyFrameRequest100Ns_ = std::numeric_limits<LONGLONG>::min() / 2;
     mode_ = EncoderMode::kJpeg;
 }
 
