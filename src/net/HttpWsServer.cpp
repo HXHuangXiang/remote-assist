@@ -81,6 +81,28 @@ private:
     bool active_ = true;
 };
 
+// WebSocket 对象由 httplib handler 在栈上持有，不能把裸指针复制到 Stop 之后再
+// 使用。guard 的析构与 CloseActiveSocketForStop 使用同一把锁，因此 Stop 持锁
+// 发送 Close 帧时，handler 不会抢先返回并销毁对象。
+class HttpWsServer::ActiveWebSocketGuard {
+public:
+    ActiveWebSocketGuard(HttpWsServer& server, httplib::ws::WebSocket& ws)
+        : server_(server), ws_(ws), registered_(server_.RegisterActiveSocket(&ws_)) {}
+
+    ~ActiveWebSocketGuard() {
+        if (registered_) {
+            server_.UnregisterActiveSocket(&ws_);
+        }
+    }
+
+    bool Registered() const { return registered_; }
+
+private:
+    HttpWsServer& server_;
+    httplib::ws::WebSocket& ws_;
+    bool registered_ = false;
+};
+
 WsBroadcaster::WsBroadcaster()
     : senderThread_(&WsBroadcaster::SendLoop, this) {}
 
@@ -407,7 +429,7 @@ void HttpWsServer::SetOnControllerDisconnected(OnControllerDisconnected cb) {
 
 bool HttpWsServer::TryBeginAuthAttempt() {
     std::lock_guard<std::mutex> lk(authMu_);
-    if (authAttemptInProgress_) {
+    if (stopping_.load(std::memory_order_acquire) || authAttemptInProgress_) {
         return false;
     }
     authAttemptInProgress_ = true;
@@ -417,6 +439,37 @@ bool HttpWsServer::TryBeginAuthAttempt() {
 void HttpWsServer::EndAuthAttempt() {
     std::lock_guard<std::mutex> lk(authMu_);
     authAttemptInProgress_ = false;
+}
+
+bool HttpWsServer::RegisterActiveSocket(httplib::ws::WebSocket* ws) {
+    if (!ws) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(connectionMu_);
+    if (stopping_.load(std::memory_order_acquire) || activeSocket_) {
+        return false;
+    }
+    activeSocket_ = ws;
+    return true;
+}
+
+void HttpWsServer::UnregisterActiveSocket(httplib::ws::WebSocket* ws) {
+    std::lock_guard<std::mutex> lk(connectionMu_);
+    if (activeSocket_ == ws) {
+        activeSocket_ = nullptr;
+    }
+}
+
+void HttpWsServer::CloseActiveSocketForStop() {
+    std::lock_guard<std::mutex> lk(connectionMu_);
+    if (!activeSocket_ || !activeSocket_->is_open()) {
+        return;
+    }
+    // 正常浏览器会立即回 Close 帧；不响应的对端仍受 WebSocket 读取超时保护。
+    // 先设置 stopping_ 再关闭，确保认证刚成功的 handler 不会把已关闭连接重新
+    // 注册为控制端。
+    log::Info("requesting active WebSocket close for server shutdown");
+    activeSocket_->close(httplib::ws::CloseStatus::GoingAway, "server stopping");
 }
 
 bool HttpWsServer::CanAttemptAuth(const std::string& remoteAddr) {
@@ -470,6 +523,7 @@ void HttpWsServer::ResetAuthFailures(const std::string& remoteAddr) {
 bool HttpWsServer::Start(const std::string& host, int port) {
     // 远控报文很小且延迟敏感，禁用 Nagle；同时限制 HTTP 请求体，避免未使用的
     // 上传路径被大请求占用内存。WebSocket 报文上限由 CMake 宏单独收紧。
+    stopping_.store(false, std::memory_order_release);
     svr_.set_tcp_nodelay(true);
     svr_.set_payload_max_length(64 * 1024);
     // 发送超时保护发送线程，避免失联浏览器长期占用 socket 写操作。
@@ -490,6 +544,11 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             return;
         }
         AuthAttemptGuard authAttempt(*this);
+        ActiveWebSocketGuard socketGuard(*this, ws);
+        if (!socketGuard.Registered()) {
+            ws.close(httplib::ws::CloseStatus::GoingAway, "server stopping");
+            return;
+        }
         // 鉴权:第一帧必须是文本 JSON {"t":"auth","token":"..."}
         std::string msg;
         const auto r = ws.read(msg);
@@ -522,6 +581,10 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             return;
         }
         ResetAuthFailures(remoteAddr);
+        if (stopping_.load(std::memory_order_acquire)) {
+            ws.close(httplib::ws::CloseStatus::GoingAway, "server stopping");
+            return;
+        }
         ws.send("{\"t\":\"auth\",\"ok\":true}");
         if (cfgProvider_) {
             ws.send(cfgProvider_());
@@ -603,6 +666,10 @@ bool HttpWsServer::Start(const std::string& host, int port) {
 }
 
 void HttpWsServer::Stop() {
+    stopping_.store(true, std::memory_order_release);
+    // 必须在 svr_.stop/join 之前关闭长连接。httplib 只停止 accept 循环，若 handler
+    // 仍在 ws.read 中等待浏览器消息，listen 线程销毁线程池时会一直等待该任务。
+    CloseActiveSocketForStop();
     svr_.stop();
     if (thread_.joinable()) {
         thread_.join();

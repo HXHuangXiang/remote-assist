@@ -148,8 +148,16 @@ public:
 
 private:
     class AuthAttemptGuard;
+    class ActiveWebSocketGuard;
     bool TryBeginAuthAttempt();
     void EndAuthAttempt();
+    // 认证读取与已认证控制会话共用同一个 WebSocket。服务停止前必须关闭它：
+    // httplib::Server::stop 只会关闭监听 socket，不能打断已进入 ws.read 的任务线程。
+    // 这些方法由 connectionMu_ 串行化，确保 Stop 正在调用 close 时 handler 不会销毁
+    // 栈上的 WebSocket 对象。
+    bool RegisterActiveSocket(httplib::ws::WebSocket* ws);
+    void UnregisterActiveSocket(httplib::ws::WebSocket* ws);
+    void CloseActiveSocketForStop();
     bool CanAttemptAuth(const std::string& remoteAddr);
     void RecordAuthFailure(const std::string& remoteAddr);
     void ResetAuthFailures(const std::string& remoteAddr);
@@ -170,6 +178,11 @@ private:
     // 的小线程池耗尽；认证通过后立即释放该槽位，正常控制端仍由 broadcaster 限制。
     bool authAttemptInProgress_ = false;
     std::unordered_map<std::string, AuthThrottle> authThrottles_;
+    std::mutex connectionMu_;
+    // 仅在 WebSocket handler 的栈帧有效期间保存。认证槽位和控制端槽位都只允许一
+    // 个连接，因此服务停止时最多需要主动关闭这一条长连接。
+    httplib::ws::WebSocket* activeSocket_ = nullptr;
+    std::atomic<bool> stopping_{false};
     std::atomic<bool> running_{false};
     std::thread thread_;
 };
