@@ -1,7 +1,6 @@
 #include <windows.h>
 
 #include <shellapi.h>
-#include <string>
 
 #include "agent/Agent.h"
 #include "common/Log.h"
@@ -11,24 +10,37 @@
 
 namespace {
 
-bool HasArg(const std::wstring& cmdLine, const wchar_t* arg) {
-    const std::wstring needle(arg);
-    return cmdLine.find(needle) != std::wstring::npos;
+bool HasArg(int argc, wchar_t* const* argv, const wchar_t* target) {
+    for (int index = 1; index < argc; ++index) {
+        if (_wcsicmp(argv[index], target) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int) {
-    const std::wstring cmd = lpCmdLine ? lpCmdLine : L"";
-
-    if (HasArg(cmd, L"--agent")) {
-        remote_assist::Agent agent;
-        return agent.Run(HasArg(cmd, L"--service-managed"));
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) {
+        return 1;
     }
-    if (HasArg(cmd, L"--service")) {
+    const bool agentMode = HasArg(argc, argv, L"--agent");
+    const bool serviceMode = HasArg(argc, argv, L"--service");
+    const bool trayMode = HasArg(argc, argv, L"--tray");
+    const bool serviceManaged = HasArg(argc, argv, L"--service-managed");
+    LocalFree(argv);
+
+    if (agentMode) {
+        remote_assist::Agent agent;
+        return agent.Run(serviceManaged);
+    }
+    if (serviceMode) {
         return remote_assist::RunAsService();
     }
-    if (HasArg(cmd, L"--tray")) {
+    if (trayMode) {
         remote_assist::TrayApp tray;
         return tray.Run();
     }
