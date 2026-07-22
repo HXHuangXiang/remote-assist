@@ -56,7 +56,6 @@ bool DesktopAccess::Bind() {
     }
     h_desk_ = desk;
     owner_thread_id_ = currentThreadId;
-    desktop_name_ = DeskName(h_desk_);
     log::Info("bound desktop: " + Narrow(CurrentName()));
     return true;
 }
@@ -76,10 +75,11 @@ bool DesktopAccess::CheckRebind() {
         return false;
     }
 
-    // OpenInputDesktop 每次都会返回新的 handle,不能直接比较 handle 值。
-    // 使用桌面名判断是否发生了 Default/Winlogon 等实际切换。
-    const std::wstring nowName = DeskName(now);
-    if (nowName == desktop_name_) {
+    // OpenInputDesktop 每次都会返回新的 handle，不能直接比较句柄值；桌面名
+    // 也不足以区分“用户注销后新建的 Default”。CompareObjectHandles 比较底层
+    // user object，因此能准确发现同名 desktop 实例被替换的场景。
+    const bool sameDesktop = CompareObjectHandles(h_desk_, now) != FALSE;
+    if (sameDesktop) {
         CloseDesktop(now);
         return false;
     }
@@ -93,7 +93,6 @@ bool DesktopAccess::CheckRebind() {
     }
     h_desk_ = now;
     owner_thread_id_ = currentThreadId;
-    desktop_name_ = nowName;
     log::Info("rebound desktop: " + Narrow(CurrentName()));
     return true;
 }

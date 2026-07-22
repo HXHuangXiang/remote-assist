@@ -31,7 +31,6 @@ public:
 private:
     HDESK h_desk_ = nullptr;
     DWORD owner_thread_id_ = 0;
-    std::wstring desktop_name_;
 };
 
 }  // namespace remote_assist

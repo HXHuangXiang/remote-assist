@@ -21,7 +21,7 @@
 
 ## 桌面跟随
 
-采集线程和输入线程各自持有当前 input desktop。每秒按桌面名检测变化，变化后重建与旧桌面相关的采集资源，覆盖 锁屏<->解锁、Winlogon<->Default 切换。新控制端或解码恢复请求完整首帧时，若 DXGI Desktop Duplication 仅返回超时/指针更新，则会一次性通过同一 input desktop 的 GDI 获取基线画面，避免静态桌面持续黑屏；后续继续优先使用 DXGI。MVP 不处理 UAC Secure Desktop(Winlogon 桌面已满足锁屏可见可操作)。
+采集线程和输入线程各自持有当前 input desktop。每秒比较当前与已绑定 desktop 的底层 user object，变化后重建与旧桌面相关的采集资源，覆盖 锁屏<->解锁、Winlogon<->Default 切换，以及注销再登录产生的同名 Default 实例替换。新控制端或解码恢复请求完整首帧时，若 DXGI Desktop Duplication 仅返回超时/指针更新，则会一次性通过同一 input desktop 的 GDI 获取基线画面，避免静态桌面持续黑屏；后续继续优先使用 DXGI。MVP 不处理 UAC Secure Desktop(Winlogon 桌面已满足锁屏可见可操作)。
 
 同一轮检查也会刷新显示器拓扑。热插拔、分辨率变化或被选显示器消失时，采集资源会重建；
 若原设备名仍存在则保留选择，否则回退“全部屏幕”。WebSocket 线程通过显示器快照生成 cfg，
