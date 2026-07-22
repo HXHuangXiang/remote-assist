@@ -49,6 +49,8 @@ private:
     std::atomic<int> deskWidth_{0};
     std::atomic<int> deskHeight_{0};
     std::atomic<bool> frameResetRequested_{false};
+    // 每次编码尺寸变化时递增。控制端据此丢弃异步解码完成的旧尺寸画面。
+    std::atomic<uint64_t> streamId_{0};
     bool encoderReady_ = false;
     uint64_t previousFrameFingerprint_ = 0;
     std::chrono::steady_clock::time_point lastFrameSent_{};

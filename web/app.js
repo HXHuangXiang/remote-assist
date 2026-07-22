@@ -1,11 +1,12 @@
 'use strict';
-let pendingFrame = null, imgLoading = false;
+let pendingFrame = null, nextFrameInfo = null, activeFrame = null, imgLoading = false;
 let pendingMove = null, moveQueued = false;
 let ws = null, cfg = null, authed = false;
 let canvas, ctx, logEl, statusEl, pwEl, monSel;
 const pressedKeys = new Map();
 const pressedButtons = new Set();
 let lastPointer = { x: 0.5, y: 0.5 };
+let decodeGeneration = 0;
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
@@ -26,22 +27,32 @@ function connect() {
   const url = proto + '://' + host + ':' + port + '/ws';
   log('connecting ' + url);
   releasePressedInputs();
-  if (ws) { ws.close(); ws = null; }
-  ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = function() { ws.send(JSON.stringify({t:'auth', token: pwEl.value || ''})); };
-  ws.onmessage = function(ev) {
+  resetFramePipeline(false);
+  authed = false;
+  setStatus('连接中');
+  if (ws) { ws.close(); }
+  const socket = new WebSocket(url);
+  ws = socket;
+  socket.binaryType = 'arraybuffer';
+  socket.onopen = function() {
+    if (ws === socket) socket.send(JSON.stringify({t:'auth', token: pwEl.value || ''}));
+  };
+  socket.onmessage = function(ev) {
+    if (ws !== socket) return;
     if (typeof ev.data === 'string') {
       let m; try { m = JSON.parse(ev.data); } catch(e) { return; }
       handleText(m);
     } else { handleBinary(new Uint8Array(ev.data)); }
   };
-  ws.onclose = function() {
+  socket.onclose = function() {
+    if (ws !== socket) return;
+    resetFramePipeline(false);
     pressedKeys.clear();
     pressedButtons.clear();
+    ws = null;
     log('disconnected'); setStatus('未连接'); authed = false;
   };
-  ws.onerror = function() { log('ws error'); };
+  socket.onerror = function() { if (ws === socket) log('ws error'); };
 }
 
 function handleText(m) {
@@ -53,11 +64,23 @@ function handleText(m) {
     return;
   }
   if (m.t === 'cfg') { setupCfg(m); return; }
+  if (m.t === 'frame') {
+    const id = Number(m.id), streamId = Number(m.stream_id);
+    if (Number.isSafeInteger(id) && id > 0 && Number.isSafeInteger(streamId) && streamId >= 0) {
+      nextFrameInfo = { id:id, streamId:streamId };
+    } else {
+      nextFrameInfo = null;
+    }
+    return;
+  }
   if (m.t === 'monitors') { populateMonitors(m.list); return; }
   if (m.t === 'error') { log('error: ' + (m.msg || '')); return; }
 }
 
 function setupCfg(c) {
+  const streamId = Number(c.stream_id);
+  c.stream_id = Number.isSafeInteger(streamId) && streamId >= 0 ? streamId : 0;
+  if (!cfg || cfg.stream_id !== c.stream_id) resetFramePipeline(true);
   cfg = c;
     canvas.width = c.w; canvas.height = c.h;
     fitCanvas();
@@ -78,26 +101,67 @@ function populateMonitors(list, selectedMonitor) {
   monSel.value = String(Number.isInteger(selectedMonitor) ? selectedMonitor : -1);
 }
 
+function acknowledgeFrame(id) {
+  send({t:'ack', id:id});
+}
+
+function resetFramePipeline(ackActive) {
+  decodeGeneration++;
+  if (ackActive && activeFrame) acknowledgeFrame(activeFrame.id);
+  if (ackActive && pendingFrame) acknowledgeFrame(pendingFrame.id);
+  pendingFrame = null;
+  nextFrameInfo = null;
+  activeFrame = null;
+  imgLoading = false;
+}
+
 function handleBinary(data) {
-  if (!cfg) return;
-  pendingFrame = data;
+  const info = nextFrameInfo;
+  nextFrameInfo = null;
+  if (!cfg || !info) return;
+  if (info.streamId !== cfg.stream_id) {
+    acknowledgeFrame(info.id);
+    return;
+  }
+  pendingFrame = { data:data, id:info.id, streamId:info.streamId };
   if (!imgLoading) drawNext();
 }
 function drawNext() {
   if (!pendingFrame) return;
-  const data = pendingFrame;
+  const frame = pendingFrame;
   pendingFrame = null;
+  if (!cfg || frame.streamId !== cfg.stream_id) {
+    acknowledgeFrame(frame.id);
+    drawNext();
+    return;
+  }
   imgLoading = true;
-  const blob = new Blob([data], { type: 'image/jpeg' });
+  activeFrame = frame;
+  const generation = decodeGeneration;
+  const socket = ws;
+  const blob = new Blob([frame.data], { type: 'image/jpeg' });
   const url = URL.createObjectURL(blob);
   const img = new Image();
   img.onload = function() {
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
     URL.revokeObjectURL(url);
+    if (generation !== decodeGeneration || ws !== socket) return;
+    if (cfg && frame.streamId === cfg.stream_id) {
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      // 图片已绘制到 canvas，释放服务端的唯一在途帧配额。
+      acknowledgeFrame(frame.id);
+    }
+    activeFrame = null;
     imgLoading = false;
     drawNext();
   };
-  img.onerror = function() { URL.revokeObjectURL(url); imgLoading = false; drawNext(); };
+  img.onerror = function() {
+    URL.revokeObjectURL(url);
+    if (generation !== decodeGeneration || ws !== socket) return;
+    acknowledgeFrame(frame.id);
+    activeFrame = null;
+    imgLoading = false;
+    drawNext();
+  };
   img.src = url;
 }
 

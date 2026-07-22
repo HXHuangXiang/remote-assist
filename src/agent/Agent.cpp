@@ -267,7 +267,9 @@ void Agent::CaptureLoop() {
                 continue;
             }
             encoderReady_ = true;
-            // 尺寸/编码器变化后重新下发一次 cfg。
+            // 尺寸/编码器变化后提升流版本并重新下发 cfg。浏览器异步图片解码可能
+            // 在 cfg 到达后才完成，因此二进制帧会带上该版本供控制端判定。
+            streamId_.fetch_add(1);
             server_.Broadcaster().BroadcastText(MakeCfgJson());
         }
 
@@ -279,7 +281,7 @@ void Agent::CaptureLoop() {
                     if (c.data.empty()) {
                         continue;
                     }
-                    server_.Broadcaster().BroadcastBinary(std::move(c.data));
+                    server_.Broadcaster().BroadcastBinary(std::move(c.data), streamId_.load());
                     sent = true;
                 }
                 if (sent) {
@@ -306,6 +308,7 @@ std::string Agent::MakeCfgJson() const {
     j["w"] = deskWidth_.load();
     j["h"] = deskHeight_.load();
     j["fps"] = cfg_.fps;
+    j["stream_id"] = streamId_.load();
     auto mons = nlohmann::json::array();
     for (const auto& m : capture_.Monitors()) {
         mons.push_back({{"index", m.index}, {"name", m.name}, {"w", m.w}, {"h", m.h}});

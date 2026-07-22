@@ -9,6 +9,14 @@
 
 namespace remote_assist {
 
+namespace {
+
+// 浏览器收到 WebSocket 二进制帧后还要经历图片解码和 canvas 绘制。仅靠 TCP
+// 写成功无法说明用户已经看到新画面；超时兜底避免旧浏览器或异常连接永久停流。
+constexpr auto kFrameAckTimeout = std::chrono::seconds(1);
+
+}  // namespace
+
 WsBroadcaster::WsBroadcaster()
     : senderThread_(&WsBroadcaster::SendLoop, this) {}
 
@@ -26,19 +34,34 @@ bool WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
 }
 
 void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
-    std::lock_guard<std::mutex> lk(clientMu_);
-    if (client_ == ws) {
-        client_ = nullptr;
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lk(clientMu_);
+        if (client_ == ws) {
+            client_ = nullptr;
+            removed = true;
+        }
+    }
+    if (removed) {
+        std::lock_guard<std::mutex> lk(frameMu_);
+        // 新控制端连接后由采集线程生成首帧；不要把断连前的旧图像带过去。
+        pendingFrame_.clear();
+        pendingStreamId_ = 0;
+        frameInFlight_ = false;
+        inFlightFrameId_ = 0;
+        inFlightSince_ = {};
+        frameCv_.notify_all();
     }
 }
 
-void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame) {
+void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId) {
     {
         std::lock_guard<std::mutex> lk(frameMu_);
         if (stopping_) {
             return;
         }
         pendingFrame_ = std::move(frame);
+        pendingStreamId_ = streamId;
     }
     frameCv_.notify_one();
 }
@@ -47,6 +70,19 @@ void WsBroadcaster::BroadcastText(const std::string& msg) {
     std::lock_guard<std::mutex> lk(clientMu_);
     if (client_ && client_->is_open()) {
         client_->send(msg);
+    }
+}
+
+void WsBroadcaster::AcknowledgeFrame(uint64_t frameId) {
+    if (frameId == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(frameMu_);
+    if (frameInFlight_ && inFlightFrameId_ == frameId) {
+        frameInFlight_ = false;
+        inFlightFrameId_ = 0;
+        inFlightSince_ = {};
+        frameCv_.notify_one();
     }
 }
 
@@ -63,6 +99,10 @@ void WsBroadcaster::Stop() {
         }
         stopping_ = true;
         pendingFrame_.clear();
+        pendingStreamId_ = 0;
+        frameInFlight_ = false;
+        inFlightFrameId_ = 0;
+        inFlightSince_ = {};
     }
     frameCv_.notify_all();
     if (senderThread_.joinable()) {
@@ -73,18 +113,65 @@ void WsBroadcaster::Stop() {
 void WsBroadcaster::SendLoop() {
     for (;;) {
         std::vector<uint8_t> frame;
+        uint64_t streamId = 0;
+        uint64_t frameId = 0;
         {
             std::unique_lock<std::mutex> lk(frameMu_);
-            frameCv_.wait(lk, [this] { return stopping_ || !pendingFrame_.empty(); });
-            if (stopping_) {
-                return;
+            for (;;) {
+                if (stopping_) {
+                    return;
+                }
+                if (!frameInFlight_ && !pendingFrame_.empty()) {
+                    frame.swap(pendingFrame_);
+                    streamId = pendingStreamId_;
+                    pendingStreamId_ = 0;
+                    frameId = nextFrameId_++;
+                    frameInFlight_ = true;
+                    inFlightFrameId_ = frameId;
+                    inFlightSince_ = std::chrono::steady_clock::now();
+                    break;
+                }
+                if (frameInFlight_) {
+                    const auto deadline = inFlightSince_ + kFrameAckTimeout;
+                    if (frameCv_.wait_until(lk, deadline, [this] {
+                            return stopping_ || !frameInFlight_;
+                        })) {
+                        continue;
+                    }
+                    // 连接可能已半开，或者控制端页面在图片解码中崩溃。允许使用
+                    // 最新待发送帧继续尝试，且帧 id 单调递增避免迟到确认误释放新帧。
+                    if (frameInFlight_) {
+                        log::Warn("frame ack timed out, replacing in-flight frame");
+                        frameInFlight_ = false;
+                        inFlightFrameId_ = 0;
+                        inFlightSince_ = {};
+                    }
+                    continue;
+                }
+                frameCv_.wait(lk, [this] {
+                    return stopping_ || frameInFlight_ || !pendingFrame_.empty();
+                });
             }
-            frame.swap(pendingFrame_);
         }
 
-        std::lock_guard<std::mutex> lk(clientMu_);
-        if (client_ && client_->is_open()) {
-            client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
+        bool sent = false;
+        {
+            std::lock_guard<std::mutex> lk(clientMu_);
+            if (client_ && client_->is_open()) {
+                const std::string header = "{\"t\":\"frame\",\"id\":" +
+                    std::to_string(frameId) + ",\"stream_id\":" + std::to_string(streamId) + "}";
+                sent = client_->send(header) &&
+                    client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
+            }
+        }
+        if (!sent) {
+            std::lock_guard<std::mutex> frameLock(frameMu_);
+            if (frameInFlight_ && inFlightFrameId_ == frameId) {
+                frameInFlight_ = false;
+                inFlightFrameId_ = 0;
+                inFlightSince_ = {};
+                frameCv_.notify_one();
+            }
         }
     }
 }
@@ -182,6 +269,19 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             const auto rr = ws.read(m);
             if (rr == httplib::ws::Fail || !ws.is_open()) {
                 break;
+            }
+            if (rr == httplib::ws::Text) {
+                const auto message = nlohmann::json::parse(m, nullptr, false);
+                if (message.is_object()) {
+                    const auto type = message.find("t");
+                    const auto id = message.find("id");
+                    if (type != message.end() && type->is_string() &&
+                        type->get_ref<const std::string&>() == "ack" &&
+                        id != message.end() && id->is_number_unsigned()) {
+                        broadcaster_.AcknowledgeFrame(id->get<uint64_t>());
+                        continue;
+                    }
+                }
             }
             if (onMessage_) {
                 onMessage_(m);
