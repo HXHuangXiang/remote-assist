@@ -4,6 +4,7 @@
 #include "common/RuntimeNames.h"
 
 #include <shellapi.h>
+#include <cstdlib>
 #include <string>
 
 #pragma comment(lib, "advapi32.lib")
@@ -44,6 +45,75 @@ static std::wstring ExePath() {
     return buf;
 }
 
+struct ServiceResult {
+    bool ok = false;
+    DWORD error = ERROR_GEN_FAILURE;
+};
+
+ServiceResult ServiceSuccess() {
+    return {true, ERROR_SUCCESS};
+}
+
+ServiceResult ServiceFailure(DWORD error) {
+    return {false, error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error};
+}
+
+bool QueryServiceState(SC_HANDLE service, SERVICE_STATUS_PROCESS& status, DWORD& error) {
+    DWORD bytesNeeded = 0;
+    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                              reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded)) {
+        error = GetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool WaitForServiceState(SC_HANDLE service, DWORD targetState, DWORD timeoutMs, DWORD& error) {
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    for (;;) {
+        SERVICE_STATUS_PROCESS status{};
+        if (!QueryServiceState(service, status, error)) {
+            return false;
+        }
+        if (status.dwCurrentState == targetState) {
+            return true;
+        }
+        if (targetState != SERVICE_STOPPED && status.dwCurrentState == SERVICE_STOPPED) {
+            error = status.dwWin32ExitCode != ERROR_SUCCESS
+                ? status.dwWin32ExitCode : ERROR_SERVICE_NOT_ACTIVE;
+            return false;
+        }
+        if (GetTickCount64() >= deadline) {
+            error = ERROR_TIMEOUT;
+            return false;
+        }
+        Sleep(100);
+    }
+}
+
+std::wstring ErrorText(DWORD error) {
+    wchar_t* buffer = nullptr;
+    const DWORD chars = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+            FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, error, 0, reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+    if (!chars || !buffer) {
+        return L"未知错误";
+    }
+    std::wstring text(buffer, chars);
+    LocalFree(buffer);
+    while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ')) {
+        text.pop_back();
+    }
+    return text;
+}
+
+void ShowServiceError(HWND hwnd, const wchar_t* action, DWORD error) {
+    const std::wstring message = std::wstring(action) + L"失败（错误 " +
+        std::to_wstring(error) + L"）：\n" + ErrorText(error);
+    MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONERROR);
+}
+
 static bool ServiceExists() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return false;
@@ -59,63 +129,182 @@ static bool ServiceRunning() {
     if (!scm) return false;
     SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_QUERY_STATUS);
     if (!svc) { CloseServiceHandle(scm); return false; }
-    SERVICE_STATUS st{};
-    QueryServiceStatus(svc, &st);
-    bool running = (st.dwCurrentState == SERVICE_RUNNING);
+    SERVICE_STATUS_PROCESS st{};
+    DWORD error = ERROR_SUCCESS;
+    bool running = QueryServiceState(svc, st, error) && st.dwCurrentState == SERVICE_RUNNING;
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
     return running;
 }
 
-static bool InstallService() {
+static ServiceResult InstallService() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
-    if (!scm) { log::Error("OpenSCManager failed err=" + std::to_string(GetLastError())); return false; }
+    if (!scm) {
+        const DWORD error = GetLastError();
+        log::Error("OpenSCManager failed err=" + std::to_string(error));
+        return ServiceFailure(error);
+    }
     std::wstring binPath = L"\"" + ExePath() + L"\" --service";
     SC_HANDLE svc = CreateServiceW(scm, runtime::kServiceName, L"RemoteAssist",
-        SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP | DELETE,
+        SERVICE_WIN32_OWN_PROCESS,
         SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
         binPath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
-    if (svc) { CloseServiceHandle(svc); CloseServiceHandle(scm); return true; }
-    log::Error("CreateService failed err=" + std::to_string(GetLastError()));
+    if (svc) {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return ServiceSuccess();
+    }
+    const DWORD error = GetLastError();
+    log::Error("CreateService failed err=" + std::to_string(error));
     CloseServiceHandle(scm);
-    return false;
+    return ServiceFailure(error);
 }
 
-static bool UninstallService() {
+static ServiceResult StartServiceS() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scm) return false;
-    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_STOP | DELETE);
-    if (!svc) { CloseServiceHandle(scm); return false; }
-    SERVICE_STATUS st{};
-    ControlService(svc, SERVICE_CONTROL_STOP, &st);
-    bool ok = DeleteService(svc);
+    if (!scm) {
+        return ServiceFailure(GetLastError());
+    }
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_START | SERVICE_QUERY_STATUS);
+    if (!svc) {
+        const DWORD error = GetLastError();
+        CloseServiceHandle(scm);
+        return ServiceFailure(error);
+    }
+
+    DWORD error = ERROR_SUCCESS;
+    SERVICE_STATUS_PROCESS status{};
+    if (!QueryServiceState(svc, status, error)) {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return ServiceFailure(error);
+    }
+    if (status.dwCurrentState == SERVICE_STOP_PENDING &&
+        !WaitForServiceState(svc, SERVICE_STOPPED, 15000, error)) {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return ServiceFailure(error);
+    }
+    if (status.dwCurrentState != SERVICE_RUNNING && status.dwCurrentState != SERVICE_START_PENDING &&
+        !StartServiceW(svc, 0, nullptr)) {
+        error = GetLastError();
+        if (error != ERROR_SERVICE_ALREADY_RUNNING) {
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return ServiceFailure(error);
+        }
+    }
+    const bool ok = WaitForServiceState(svc, SERVICE_RUNNING, 15000, error);
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
-    return ok;
+    return ok ? ServiceSuccess() : ServiceFailure(error);
 }
 
-static bool StartServiceS() {
+static ServiceResult StopServiceS() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scm) return false;
-    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_START);
-    if (!svc) { CloseServiceHandle(scm); return false; }
-    bool ok = StartServiceW(svc, 0, nullptr);
-    DWORD err = GetLastError();
+    if (!scm) {
+        return ServiceFailure(GetLastError());
+    }
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_STOP | SERVICE_QUERY_STATUS);
+    if (!svc) {
+        const DWORD error = GetLastError();
+        CloseServiceHandle(scm);
+        return ServiceFailure(error);
+    }
+
+    DWORD error = ERROR_SUCCESS;
+    SERVICE_STATUS_PROCESS status{};
+    if (!QueryServiceState(svc, status, error)) {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return ServiceFailure(error);
+    }
+    if (status.dwCurrentState != SERVICE_STOPPED && status.dwCurrentState != SERVICE_STOP_PENDING) {
+        SERVICE_STATUS ignored{};
+        if (!ControlService(svc, SERVICE_CONTROL_STOP, &ignored)) {
+            error = GetLastError();
+            if (error != ERROR_SERVICE_NOT_ACTIVE) {
+                CloseServiceHandle(svc);
+                CloseServiceHandle(scm);
+                return ServiceFailure(error);
+            }
+        }
+    }
+    const bool ok = WaitForServiceState(svc, SERVICE_STOPPED, 15000, error);
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
-    return ok || err == ERROR_SERVICE_ALREADY_RUNNING;
+    return ok ? ServiceSuccess() : ServiceFailure(error);
 }
 
-static bool StopServiceS() {
+static ServiceResult RestartServiceS() {
+    ServiceResult result = StopServiceS();
+    if (!result.ok) {
+        return result;
+    }
+    return StartServiceS();
+}
+
+static ServiceResult UninstallService() {
+    ServiceResult stopResult = StopServiceS();
+    if (!stopResult.ok && stopResult.error != ERROR_SERVICE_DOES_NOT_EXIST) {
+        return stopResult;
+    }
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scm) return false;
-    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_STOP);
-    if (!svc) { CloseServiceHandle(scm); return false; }
-    SERVICE_STATUS st{};
-    bool ok = ControlService(svc, SERVICE_CONTROL_STOP, &st);
+    if (!scm) {
+        return ServiceFailure(GetLastError());
+    }
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, DELETE);
+    if (!svc) {
+        const DWORD error = GetLastError();
+        CloseServiceHandle(scm);
+        return error == ERROR_SERVICE_DOES_NOT_EXIST ? ServiceSuccess() : ServiceFailure(error);
+    }
+    const bool ok = DeleteService(svc) != FALSE;
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
-    return ok;
+    return ok ? ServiceSuccess() : ServiceFailure(error);
+}
+
+bool ReadPort(HWND hwnd, int& port) {
+    char text[16] = {};
+    GetDlgItemTextA(hwnd, IDC_PORT_EDIT, text, sizeof(text));
+    char* end = nullptr;
+    const long value = std::strtol(text, &end, 10);
+    if (text[0] == '\0' || !end || *end != '\0' || value < 1 || value > 65535) {
+        MessageBoxW(hwnd, L"端口必须是 1 到 65535 的整数。", L"RemoteAssist", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    port = static_cast<int>(value);
+    return true;
+}
+
+bool SaveSettingsFromControls(HWND hwnd, bool& changed) {
+    int port = 0;
+    if (!ReadPort(hwnd, port)) {
+        return false;
+    }
+
+    char password[256] = {};
+    GetDlgItemTextA(hwnd, IDC_PW_EDIT, password, sizeof(password));
+    const bool passwordChanged = password[0] != '\0';
+    const bool portChanged = g_cfg.port != port;
+    changed = passwordChanged || portChanged;
+    if (!changed) {
+        return true;
+    }
+
+    const Config original = g_cfg;
+    g_cfg.port = port;
+    const bool saved = passwordChanged ? SetPassword(g_cfg, password) : SaveConfig(g_cfg);
+    if (!saved) {
+        g_cfg = original;
+        MessageBoxW(hwnd, L"配置保存失败，请检查 exe 目录写权限。", L"RemoteAssist", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    SetDlgItemTextA(hwnd, IDC_PW_EDIT, "");
+    return true;
 }
 
 static void UpdateStatus() {
@@ -194,9 +383,10 @@ static void CreateControls(HWND hwnd) {
         return hw;
     };
 
-    mk(0, L"STATIC", L"\u5bc6\u7801:", 20, 20, 50, 20, 0);
-    mk(IDC_PW_EDIT, L"EDIT", L"", 70, 18, 180, 24, ES_AUTOHSCROLL | WS_BORDER);
-    mk(IDC_PW_SAVE, L"BUTTON", L"\u4fdd\u5b58\u5bc6\u7801", 260, 17, 90, 26, BS_PUSHBUTTON);
+    mk(0, L"STATIC", L"\u5bc6\u7801(\u7559\u7a7a\u4e0d\u53d8):", 20, 20, 120, 20, 0);
+    mk(IDC_PW_EDIT, L"EDIT", L"", 140, 18, 110, 24,
+       ES_AUTOHSCROLL | ES_PASSWORD | WS_BORDER);
+    mk(IDC_PW_SAVE, L"BUTTON", L"\u4fdd\u5b58\u914d\u7f6e", 260, 17, 90, 26, BS_PUSHBUTTON);
 
     mk(0, L"STATIC", L"\u7aef\u53e3:", 20, 55, 50, 20, 0);
     mk(IDC_PORT_EDIT, L"EDIT", L"7980", 70, 53, 60, 24, ES_NUMBER | WS_BORDER);
@@ -268,73 +458,84 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             PostQuitMessage(0);
             break;
         case IDC_PW_SAVE: {
-            char pw[256] = {};
-            GetDlgItemTextA(hwnd, IDC_PW_EDIT, pw, sizeof(pw));
-            if (pw[0]) {
-                if (SetPassword(g_cfg, pw)) {
-                    MessageBoxW(hwnd, L"\u5bc6\u7801\u5df2\u4fdd\u5b58", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+            bool changed = false;
+            if (!SaveSettingsFromControls(hwnd, changed)) {
+                break;
+            }
+            if (!changed) {
+                MessageBoxW(hwnd, L"配置没有变化。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            if (ServiceRunning()) {
+                const ServiceResult restart = RestartServiceS();
+                if (!restart.ok) {
+                    MessageBoxW(hwnd,
+                                L"配置已保存，但服务重启失败；新配置会在下次服务启动时生效。",
+                                L"RemoteAssist", MB_OK | MB_ICONWARNING);
+                    ShowServiceError(hwnd, L"重启服务", restart.error);
                 } else {
-                    MessageBoxW(hwnd, L"\u5bc6\u7801\u4fdd\u5b58\u5931\u8d25,\u8bf7\u68c0\u67e5 exe \u76ee\u5f55\u5199\u6743\u9650", L"RemoteAssist", MB_OK | MB_ICONERROR);
+                    MessageBoxW(hwnd, L"配置已保存，服务已重启并应用新密码/端口。",
+                                L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
                 }
             } else {
-                MessageBoxW(hwnd, L"\u8bf7\u8f93\u5165\u5bc6\u7801", L"RemoteAssist", MB_OK | MB_ICONWARNING);
+                MessageBoxW(hwnd, L"配置已保存，将在下次启动 Agent 或服务时生效。",
+                            L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             }
+            UpdateStatus();
             break;
         }
         case IDC_SVC_INSTALL: {
-            char pw[256] = {};
-            GetDlgItemTextA(hwnd, IDC_PW_EDIT, pw, sizeof(pw));
-            if (pw[0] && !SetPassword(g_cfg, pw)) {
-                MessageBoxW(hwnd, L"\u5bc6\u7801\u4fdd\u5b58\u5931\u8d25,\u8bf7\u68c0\u67e5 exe \u76ee\u5f55\u5199\u6743\u9650", L"RemoteAssist", MB_OK | MB_ICONERROR);
+            bool changed = false;
+            if (!SaveSettingsFromControls(hwnd, changed)) {
                 break;
             }
-            char portStr[16] = {};
-            GetDlgItemTextA(hwnd, IDC_PORT_EDIT, portStr, sizeof(portStr));
-            if (portStr[0]) {
-                g_cfg.port = atoi(portStr);
-                if (!SaveConfig(g_cfg)) {
-                    MessageBoxW(hwnd, L"\u914d\u7f6e\u4fdd\u5b58\u5931\u8d25,\u8bf7\u68c0\u67e5 exe \u76ee\u5f55\u5199\u6743\u9650", L"RemoteAssist", MB_OK | MB_ICONERROR);
-                    break;
-                }
+            const ServiceResult install = InstallService();
+            if (!install.ok) {
+                ShowServiceError(hwnd, L"安装服务", install.error);
+                UpdateStatus();
+                break;
             }
-            if (InstallService()) {
-                MessageBoxW(hwnd, L"\u670d\u52a1\u5b89\u88c5\u6210\u529f,\u6b63\u5728\u542f\u52a8...", L"RemoteAssist", MB_OK);
-                StartServiceS();
-                MessageBoxW(hwnd, L"\u670d\u52a1\u5df2\u542f\u52a8,\u6d4f\u89c8\u5668\u8bbf\u95ee http://\u672c\u673aIP:7980", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+            const ServiceResult start = StartServiceS();
+            if (!start.ok) {
+                ShowServiceError(hwnd, L"启动服务", start.error);
             } else {
-                DWORD err = GetLastError();
-                wchar_t buf[256];
-                swprintf_s(buf, L"\u5b89\u88c5\u5931\u8d25(\u9519\u8bef\u7801 %u),\u8bf7\u4ee5\u7ba1\u7406\u5458\u8eab\u4efd\u8fd0\u884c", err);
-                MessageBoxW(hwnd, buf, L"RemoteAssist", MB_OK | MB_ICONERROR);
+                const std::wstring message = L"服务已启动。浏览器访问 http://<本机IP>:" +
+                    std::to_wstring(g_cfg.port) + L"/";
+                MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             }
             UpdateStatus();
             break;
         }
-        case IDC_SVC_UNINSTALL:
-            if (UninstallService()) {
-                MessageBoxW(hwnd, L"\u670d\u52a1\u5df2\u5378\u8f7d", L"RemoteAssist", MB_OK);
+        case IDC_SVC_UNINSTALL: {
+            const ServiceResult uninstall = UninstallService();
+            if (uninstall.ok) {
+                MessageBoxW(hwnd, L"服务已卸载。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             } else {
-                MessageBoxW(hwnd, L"\u5378\u8f7d\u5931\u8d25,\u8bf7\u4ee5\u7ba1\u7406\u5458\u8eab\u4efd\u8fd0\u884c", L"RemoteAssist", MB_OK | MB_ICONERROR);
+                ShowServiceError(hwnd, L"卸载服务", uninstall.error);
             }
             UpdateStatus();
             break;
-        case IDC_SVC_START:
-            if (StartServiceS()) {
-                MessageBoxW(hwnd, L"\u670d\u52a1\u5df2\u542f\u52a8", L"RemoteAssist", MB_OK);
+        }
+        case IDC_SVC_START: {
+            const ServiceResult start = StartServiceS();
+            if (start.ok) {
+                MessageBoxW(hwnd, L"服务已启动。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             } else {
-                DWORD err = GetLastError();
-                wchar_t buf[256];
-                swprintf_s(buf, L"\u542f\u52a8\u5931\u8d25(\u9519\u8bef\u7801 %u)", err);
-                MessageBoxW(hwnd, buf, L"RemoteAssist", MB_OK | MB_ICONERROR);
+                ShowServiceError(hwnd, L"启动服务", start.error);
             }
-            Sleep(500);
             UpdateStatus();
             break;
-        case IDC_SVC_STOP:
-            StopServiceS();
-            Sleep(500);
+        }
+        case IDC_SVC_STOP: {
+            const ServiceResult stop = StopServiceS();
+            if (stop.ok) {
+                MessageBoxW(hwnd, L"服务已停止。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+            } else {
+                ShowServiceError(hwnd, L"停止服务", stop.error);
+            }
             UpdateStatus();
             break;
+        }
         case IDC_RUN_AGENT: {
             std::wstring exe = ExePath();
             std::wstring cmd = L"\"" + exe + L"\" --agent";
@@ -345,7 +546,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
-                MessageBoxW(hwnd, L"Agent \u5df2\u542f\u52a8,\u6d4f\u89c8\u5668\u8bbf\u95ee http://\u672c\u673aIP:7980", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+                const std::wstring message = L"Agent 已启动。浏览器访问 http://<本机IP>:" +
+                    std::to_wstring(g_cfg.port) + L"/";
+                MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             } else {
                 MessageBoxW(hwnd, L"\u542f\u52a8 agent \u5931\u8d25", L"RemoteAssist", MB_OK | MB_ICONERROR);
             }

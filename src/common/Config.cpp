@@ -297,6 +297,10 @@ bool SaveConfig(const Config& cfg) {
 }
 
 bool SetPassword(Config& cfg, const std::string& password) {
+    if (password.empty()) {
+        log::Warn("password update rejected: empty password");
+        return false;
+    }
     if (!IsHex(cfg.salt, 32)) cfg.salt = GenRandomHex(16);
     cfg.passwordIterations = kPasswordIterations;
     cfg.passwordHash = Pbkdf2Sha256Hex(cfg.salt, password, cfg.passwordIterations);
