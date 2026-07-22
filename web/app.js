@@ -9,6 +9,7 @@ let lastPointer = { x: 0.5, y: 0.5 };
 let decodeGeneration = 0;
 let h264Decoder = null;
 const h264Frames = new Map();
+let pendingH264Presentation = null, h264DrawQueued = false, h264DrawRequestId = 0;
 let h264NeedsKeyFrame = true;
 let lastKeyFrameRequestAt = 0;
 let wheelRemainder = 0;
@@ -112,10 +113,63 @@ function acknowledgeFrame(id) {
   send({t:'ack', id:id});
 }
 
+function acknowledgeFrameForSocket(info) {
+  if (info && info.socket === ws) acknowledgeFrame(info.id);
+}
+
 function acknowledgeH264Frames() {
   h264Frames.forEach(function(infos) {
-    infos.forEach(function(info) { if (info.socket === ws) acknowledgeFrame(info.id); });
+    infos.forEach(acknowledgeFrameForSocket);
   });
+}
+
+// VideoDecoder 可能在同一次浏览器刷新前连续输出多帧。只展示最新帧，既减少重复
+// drawImage，又不会跳过编码参考帧；被覆盖的帧会立即 ACK，释放服务端有限发送窗口。
+function queueH264Presentation(videoFrame, info, streamId, decoder) {
+  if (pendingH264Presentation) {
+    acknowledgeFrameForSocket(pendingH264Presentation.info);
+    pendingH264Presentation.videoFrame.close();
+  }
+  pendingH264Presentation = {
+    videoFrame:videoFrame, info:info, streamId:streamId,
+    decoder:decoder, generation:decodeGeneration
+  };
+  if (h264DrawQueued) return;
+
+  h264DrawQueued = true;
+  const requestId = ++h264DrawRequestId;
+  requestAnimationFrame(function() {
+    // resetFramePipeline 或解码错误后旧的 rAF 不得消费新流的待绘制帧。
+    if (requestId !== h264DrawRequestId) return;
+    h264DrawQueued = false;
+    const presentation = pendingH264Presentation;
+    pendingH264Presentation = null;
+    if (!presentation) return;
+
+    const valid = presentation.generation === decodeGeneration &&
+      h264Decoder === presentation.decoder && cfg &&
+      cfg.stream_id === presentation.streamId && ws === presentation.info.socket;
+    if (valid) {
+      try {
+        ctx.drawImage(presentation.videoFrame, 0, 0, canvas.width, canvas.height);
+      } catch (error) {
+        log('H.264 draw error: ' + error.message);
+      }
+      acknowledgeFrameForSocket(presentation.info);
+    }
+    presentation.videoFrame.close();
+  });
+}
+
+function discardPendingH264Presentation(ackActive) {
+  if (pendingH264Presentation) {
+    if (ackActive) acknowledgeFrameForSocket(pendingH264Presentation.info);
+    pendingH264Presentation.videoFrame.close();
+    pendingH264Presentation = null;
+  }
+  // 已经预约的 rAF 会因 request id 不匹配安全退出。
+  h264DrawRequestId++;
+  h264DrawQueued = false;
 }
 
 function requestKeyFrame() {
@@ -149,8 +203,8 @@ function setupH264Decoder(c) {
       const info = infos && infos.shift();
       if (infos && infos.length === 0) h264Frames.delete(videoFrame.timestamp);
       if (info && h264Decoder === decoder && cfg && cfg.stream_id === streamId && ws === info.socket) {
-        ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
-        acknowledgeFrame(info.id);
+        queueH264Presentation(videoFrame, info, streamId, decoder);
+        return;
       }
       videoFrame.close();
     },
@@ -158,6 +212,7 @@ function setupH264Decoder(c) {
       if (h264Decoder !== decoder) return;
       log('H.264 decode error: ' + error.message);
       setStatus('H.264 解码失败');
+      discardPendingH264Presentation(true);
       acknowledgeH264Frames();
       h264Frames.clear();
       h264NeedsKeyFrame = true;
@@ -192,6 +247,7 @@ function resetFramePipeline(ackActive) {
   decodeGeneration++;
   if (ackActive && activeFrame) acknowledgeFrame(activeFrame.id);
   if (ackActive && pendingFrame) acknowledgeFrame(pendingFrame.id);
+  discardPendingH264Presentation(ackActive);
   if (ackActive) {
     acknowledgeH264Frames();
   }
