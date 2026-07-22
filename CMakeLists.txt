@@ -69,6 +69,9 @@ if(MSVC)
     target_compile_options(RemoteAssist PRIVATE
         /W4 /permissive- /utf-8 /Zc:__cplusplus /Zc:preprocessor
     )
+    # RemoteAssist.rc 已把定制的 Per-Monitor DPI manifest 嵌入为资源 1。禁用
+    # link.exe 自动生成的同名默认 manifest，否则 CVTRES 会报重复 MANIFEST/1。
+    target_link_options(RemoteAssist PRIVATE /MANIFEST:NO)
     # 静态 CRT,目标单 exe < 8MB,无 vcredist 依赖。
     set_property(TARGET RemoteAssist PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
