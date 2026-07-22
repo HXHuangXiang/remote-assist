@@ -70,6 +70,12 @@ private:
     Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory_;
     Microsoft::WRL::ComPtr<IMFTransform> h264Mft_;
     Microsoft::WRL::ComPtr<ICodecAPI> codecApi_;
+    // caller-allocated 输出模式下复用 MFT 输出缓冲。ProcessOutput 返回后立即复制
+    // NAL 数据，因此下次调用前可安全复用；输入样本可能被 MFT 异步持有，不能同样
+    // 复用，仍维持每帧独立输入缓冲以保证正确性。
+    Microsoft::WRL::ComPtr<IMFSample> h264OutputSample_;
+    Microsoft::WRL::ComPtr<IMFMediaBuffer> h264OutputBuffer_;
+    DWORD h264OutputBufferSize_ = 0;
     MFT_OUTPUT_STREAM_INFO outputStreamInfo_{};
     int width_ = 0;
     int height_ = 0;

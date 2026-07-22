@@ -497,13 +497,24 @@ bool EncoderMf::DrainH264(std::vector<EncodedChunk>& out) {
         MFT_OUTPUT_DATA_BUFFER output{};
         Microsoft::WRL::ComPtr<IMFSample> callerSample;
         if ((outputStreamInfo_.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
-            Microsoft::WRL::ComPtr<IMFMediaBuffer> outputBuffer;
-            const DWORD outputSize = std::max<DWORD>(1, outputStreamInfo_.cbSize);
-            HRESULT hr = MFCreateSample(&callerSample);
-            if (FAILED(hr)) return false;
-            hr = MFCreateMemoryBuffer(outputSize, &outputBuffer);
-            if (FAILED(hr)) return false;
-            callerSample->AddBuffer(outputBuffer.Get());
+            // 部分硬件 MFT 没有填写 cbSize。为首个 IDR 预留合理下限，并在分辨率或
+            // 输出类型变化后按新的 stream info 重建，而不是每帧重新分配。
+            const DWORD outputSize = std::max<DWORD>(256 * 1024, outputStreamInfo_.cbSize);
+            if (!h264OutputSample_.Get() || !h264OutputBuffer_.Get() ||
+                h264OutputBufferSize_ < outputSize) {
+                Microsoft::WRL::ComPtr<IMFSample> sample;
+                Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+                HRESULT hr = MFCreateSample(&sample);
+                if (FAILED(hr)) return false;
+                hr = MFCreateMemoryBuffer(outputSize, &buffer);
+                if (FAILED(hr)) return false;
+                if (FAILED(sample->AddBuffer(buffer.Get()))) return false;
+                h264OutputSample_ = std::move(sample);
+                h264OutputBuffer_ = std::move(buffer);
+                h264OutputBufferSize_ = outputSize;
+            }
+            if (FAILED(h264OutputBuffer_->SetCurrentLength(0))) return false;
+            callerSample = h264OutputSample_;
             output.pSample = callerSample.Get();
         }
 
@@ -728,6 +739,9 @@ void EncoderMf::ReleaseH264() {
         h264Mft_.Reset();
     }
     codecApi_.Reset();
+    h264OutputSample_.Reset();
+    h264OutputBuffer_.Reset();
+    h264OutputBufferSize_ = 0;
     outputStreamInfo_ = {};
     hardwareH264_ = false;
     h264Sps_.clear();

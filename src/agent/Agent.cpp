@@ -217,6 +217,9 @@ void Agent::CaptureLoop() {
     auto nextMetricsLog = nextDesktopCheck + std::chrono::seconds(10);
     CaptureLoopStats metrics;
     BroadcasterStats broadcasterStatsBase = server_.Broadcaster().SnapshotStats();
+    // 采集结果在相邻帧间复用容量。1920x1080 的 BGRA 帧约 8MB，若每轮都创建
+    // 局部 CapturedFrame 会触发持续的大块堆分配和释放，直接放大卡顿。
+    CapturedFrame frame;
 
     auto logMetricsIfDue = [&](std::chrono::steady_clock::time_point now) {
         if (now < nextMetricsLog) {
@@ -315,7 +318,6 @@ void Agent::CaptureLoop() {
             lastFrameSent_ = {};
         }
 
-        CapturedFrame frame;
         // DXGI 空闲时会阻塞等待桌面变化。等待一个目标帧周期即可在静态画面
         // 下避免轮询空转，同时不会再因固定 50ms 把 30FPS 限制为约 20FPS。
         const auto captureStartedAt = std::chrono::steady_clock::now();
