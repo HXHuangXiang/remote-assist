@@ -14,6 +14,7 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "wmcodecdspuuid.lib")
 
 namespace remote_assist {
 
