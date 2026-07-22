@@ -11,8 +11,11 @@
 #include <shellapi.h>
 #include <cstdlib>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "advapi32.lib")
@@ -39,6 +42,7 @@ enum {
 };
 
 constexpr UINT kTrayCallback = WM_APP + 1;
+constexpr UINT kAsyncOperationCompleted = WM_APP + 2;
 
 static Config g_cfg;
 static HWND g_hwnd = nullptr;
@@ -100,6 +104,29 @@ struct InstallServiceResult {
     // 安装路径不安全时，向用户说明具体目录而不是只显示笼统的 ACCESS_DENIED。
     std::wstring pathSecurityReason;
 };
+
+// 服务控制、等待 SCM 状态与防火墙 COM 调用都可能阻塞数秒。它们不能运行在窗口
+// 线程中，否则用户会看到按钮按下后整个配置窗口无响应。
+enum class AsyncOperation {
+    kInstall,
+    kStart,
+    kStop,
+    kUninstall,
+    kRestart,
+    kUpdateFirewall,
+};
+
+struct AsyncOperationResult {
+    AsyncOperation operation = AsyncOperation::kStart;
+    InstallServiceResult install;
+    ServiceResult service;
+    DWORD firewallError = ERROR_SUCCESS;
+    bool agentReady = false;
+};
+
+static bool g_operationInProgress = false;
+static bool g_startAfterInstall = false;
+static DWORD g_installFirewallError = ERROR_SUCCESS;
 
 // COM 防火墙接口接收 BSTR。此小型 RAII 包装避免每个错误分支遗漏 SysFreeString。
 class ScopedBstr {
@@ -493,6 +520,90 @@ static ServiceResult UninstallService() {
     return ok ? ServiceSuccess() : ServiceFailure(error);
 }
 
+// 所有慢服务操作都在独立线程完成。结果对象的所有权在成功 PostMessage 后交给
+// WndProc；窗口已销毁时 PostMessage 失败，由工作线程释放，避免悬挂操作泄漏内存。
+static void StartAsyncOperation(HWND hwnd, AsyncOperation operation, bool updateFirewall = false) {
+    if (!hwnd || g_operationInProgress) {
+        return;
+    }
+    g_operationInProgress = true;
+
+    const wchar_t* status = L"正在执行服务操作...";
+    switch (operation) {
+    case AsyncOperation::kInstall:
+        status = L"正在安装服务...";
+        break;
+    case AsyncOperation::kStart:
+        status = L"正在启动服务并等待 Agent...";
+        break;
+    case AsyncOperation::kStop:
+        status = L"正在停止服务...";
+        break;
+    case AsyncOperation::kUninstall:
+        status = L"正在卸载服务...";
+        break;
+    case AsyncOperation::kRestart:
+        status = L"正在重启服务并应用配置...";
+        break;
+    case AsyncOperation::kUpdateFirewall:
+        status = L"正在更新专用网络防火墙规则...";
+        break;
+    }
+    SetDlgItemTextW(hwnd, IDC_STATUS, status);
+    constexpr int kBusyControls[] = {
+        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
+        IDC_SVC_START, IDC_SVC_STOP, IDC_RUN_AGENT, IDC_HIDE_TRAY, IDC_EXIT,
+    };
+    for (const int id : kBusyControls) {
+        EnableWindow(GetDlgItem(hwnd, id), FALSE);
+    }
+
+    std::thread([hwnd, operation, updateFirewall] {
+        auto result = std::make_unique<AsyncOperationResult>();
+        result->operation = operation;
+        switch (operation) {
+        case AsyncOperation::kInstall:
+            result->install = InstallService();
+            break;
+        case AsyncOperation::kStart:
+            result->service = StartServiceS();
+            if (result->service.ok) {
+                result->agentReady = WaitForAgentReady(5000);
+            }
+            break;
+        case AsyncOperation::kStop:
+            result->service = StopServiceS();
+            break;
+        case AsyncOperation::kUninstall:
+            result->service = UninstallService();
+            break;
+        case AsyncOperation::kRestart:
+            result->service = RestartServiceS();
+            if (result->service.ok) {
+                result->agentReady = WaitForAgentReady(5000);
+            }
+            if (updateFirewall && result->service.ok &&
+                !ConfigurePrivateFirewallRule(ExePath(), g_cfg.port, result->firewallError)) {
+                log::Warn("private firewall rule update failed err=" +
+                          std::to_string(result->firewallError));
+            }
+            break;
+        case AsyncOperation::kUpdateFirewall:
+            if (!ConfigurePrivateFirewallRule(ExePath(), g_cfg.port, result->firewallError)) {
+                log::Warn("private firewall rule update failed err=" +
+                          std::to_string(result->firewallError));
+            }
+            break;
+        }
+        if (!PostMessageW(hwnd, kAsyncOperationCompleted, 0,
+                          reinterpret_cast<LPARAM>(result.get()))) {
+            log::Warn("setup window closed before service operation completed");
+            return;
+        }
+        result.release();
+    }).detach();
+}
+
 bool ReadPort(HWND hwnd, int& port) {
     char text[16] = {};
     GetDlgItemTextA(hwnd, IDC_PORT_EDIT, text, sizeof(text));
@@ -539,8 +650,9 @@ bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
 }
 
 static void UpdateStatus() {
+    const BOOL configValid = !g_cfg.passwordHash.empty() && !g_cfg.salt.empty();
     std::wstring s;
-    if (g_cfg.passwordHash.empty() || g_cfg.salt.empty()) {
+    if (!configValid) {
         s = L"配置文件无效：设置新密码后保存即可修复";
     } else if (!ServiceExists()) {
         s = L"\u670d\u52a1\u672a\u5b89\u88c5";
@@ -555,19 +667,21 @@ static void UpdateStatus() {
 
     BOOL installed = ServiceExists();
     BOOL running = ServiceRunning();
-    EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_INSTALL), !installed);
+    // 无有效访问密码时即使服务进程可启动，Agent 也会主动退出。禁用安装、启动和
+    // 独立 Agent 入口，提示用户先修复配置；停止、卸载仍保留用于恢复已有安装。
+    EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_INSTALL), !installed && configValid);
     EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_UNINSTALL), installed);
-    EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_START), installed && !running);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_START), installed && !running && configValid);
     EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_STOP), installed && running);
     // 服务已经接管当前桌面时不再允许额外启动独立 Agent；停止服务后仍可保留
     // 该调试/临时使用入口，服务再次启动会通过停止事件完成接管。
-    EnableWindow(GetDlgItem(g_hwnd, IDC_RUN_AGENT), !running);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_RUN_AGENT), !running && configValid);
 }
 
 // ---- \u6258\u76d8\u56fe\u6807\u7ba1\u7406 ----
 
 static void AddTrayIcon(HWND hwnd) {
-    if (!g_ownsTray) {
+    if (!g_ownsTray || g_trayAdded) {
         return;
     }
     g_nid.cbSize = sizeof(g_nid);
@@ -577,7 +691,10 @@ static void AddTrayIcon(HWND hwnd) {
     g_nid.uCallbackMessage = kTrayCallback;
     g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(g_nid.szTip, L"RemoteAssist");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid)) {
+        log::Warn("Shell_NotifyIcon(NIM_ADD) failed: " + std::to_string(GetLastError()));
+        return;
+    }
     g_trayAdded = true;
 
     g_trayMenu = CreatePopupMenu();
@@ -610,6 +727,158 @@ static void RelinquishTrayOwnership() {
         g_trayMutex = nullptr;
     }
     g_ownsTray = false;
+}
+
+// 服务停止、卸载或启动失败后，原先由 service 托管的 TrayApp 已不存在。配置窗口
+// 尝试接管同一会话的 Local mutex 并恢复自己的托盘图标，保证“隐藏到托盘”仍可用。
+static void RestoreSetupTrayOwnership() {
+    if (!g_trayMutex) {
+        g_trayMutex = CreateMutexW(nullptr, TRUE, runtime::kTrayMutexName);
+        if (!g_trayMutex) {
+            log::Warn("setup tray mutex recreation failed: " +
+                      std::to_string(GetLastError()));
+            return;
+        }
+        g_ownsTray = GetLastError() != ERROR_ALREADY_EXISTS;
+    } else if (!g_ownsTray) {
+        const DWORD wait = WaitForSingleObject(g_trayMutex, 0);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+            g_ownsTray = true;
+        } else if (wait == WAIT_FAILED) {
+            log::Warn("setup tray mutex wait failed: " + std::to_string(GetLastError()));
+        }
+    }
+    if (g_ownsTray) {
+        AddTrayIcon(g_hwnd);
+    }
+}
+
+static void SetOperationControlsEnabled(HWND hwnd, BOOL enabled) {
+    constexpr int kOperationControls[] = {
+        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
+        IDC_SVC_START, IDC_SVC_STOP, IDC_RUN_AGENT, IDC_HIDE_TRAY, IDC_EXIT,
+    };
+    for (const int id : kOperationControls) {
+        EnableWindow(GetDlgItem(hwnd, id), enabled);
+    }
+}
+
+static void FinishAsyncOperation(HWND hwnd) {
+    g_operationInProgress = false;
+    SetOperationControlsEnabled(hwnd, TRUE);
+    UpdateStatus();
+}
+
+static void HandleAsyncOperationCompleted(HWND hwnd,
+                                          std::unique_ptr<AsyncOperationResult> result) {
+    if (!result) {
+        return;
+    }
+
+    if (result->operation == AsyncOperation::kInstall) {
+        if (!result->install.service.ok) {
+            FinishAsyncOperation(hwnd);
+            if (!result->install.pathSecurityReason.empty()) {
+                const std::wstring message =
+                    L"为防止非管理员改写 LocalSystem 服务，已拒绝从当前目录安装。\n\n" +
+                    result->install.pathSecurityReason +
+                    L"\n\n请将 RemoteAssist.exe 与 web 目录放到仅管理员和 LocalSystem "
+                    L"可写的本机固定磁盘目录，然后重新以管理员身份运行。";
+                MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONWARNING);
+            } else {
+                ShowServiceError(hwnd, L"安装服务", result->install.service.error);
+            }
+            return;
+        }
+
+        // 只有服务创建成功后才让出配置窗口的托盘所有权。这样 ACL 或权限校验失败
+        // 时仍保留当前窗口的隐藏入口；随后启动服务的慢操作继续放到工作线程。
+        g_startAfterInstall = true;
+        g_installFirewallError = result->install.firewallError;
+        g_operationInProgress = false;
+        RelinquishTrayOwnership();
+        StartAsyncOperation(hwnd, AsyncOperation::kStart);
+        return;
+    }
+
+    const bool startedAfterInstall = result->operation == AsyncOperation::kStart &&
+        g_startAfterInstall;
+    const DWORD installFirewallError = g_installFirewallError;
+    if (startedAfterInstall) {
+        g_startAfterInstall = false;
+        g_installFirewallError = ERROR_SUCCESS;
+    }
+
+    FinishAsyncOperation(hwnd);
+    switch (result->operation) {
+    case AsyncOperation::kStart:
+        if (!result->service.ok) {
+            RestoreSetupTrayOwnership();
+            ShowServiceError(hwnd, L"启动服务", result->service.error);
+            return;
+        }
+        {
+            std::wstring message = result->agentReady
+                ? L"服务与 Agent 已启动。浏览器访问 http://<本机IP>:" +
+                    std::to_wstring(g_cfg.port) + L"/"
+                : L"服务已启动。Agent 尚未就绪（等待登录桌面或查看 logs\\service.log）。";
+            if (startedAfterInstall && installFirewallError != ERROR_SUCCESS) {
+                message += L"\n\n未能自动添加专用网络防火墙规则；局域网访问可能被阻止。";
+            }
+            MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    case AsyncOperation::kStop:
+        if (result->service.ok) {
+            RestoreSetupTrayOwnership();
+            MessageBoxW(hwnd, L"服务已停止。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+        } else {
+            ShowServiceError(hwnd, L"停止服务", result->service.error);
+        }
+        return;
+    case AsyncOperation::kUninstall:
+        if (result->service.ok) {
+            RestoreSetupTrayOwnership();
+            MessageBoxW(hwnd, L"服务已卸载。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+        } else {
+            ShowServiceError(hwnd, L"卸载服务", result->service.error);
+        }
+        return;
+    case AsyncOperation::kRestart:
+        if (!result->service.ok) {
+            if (!ServiceRunning()) {
+                RestoreSetupTrayOwnership();
+            }
+            MessageBoxW(hwnd,
+                        L"配置已保存，但服务重启失败；新配置会在下次服务启动时生效。",
+                        L"RemoteAssist", MB_OK | MB_ICONWARNING);
+            ShowServiceError(hwnd, L"重启服务", result->service.error);
+            return;
+        }
+        {
+            std::wstring message = result->agentReady
+                ? L"配置已保存，服务与 Agent 已重启并应用新密码/端口。"
+                : L"配置已保存，服务已重启；Agent 尚未就绪（查看 logs\\service.log）。";
+            if (result->firewallError != ERROR_SUCCESS) {
+                message += L"\n\n未能自动更新专用网络防火墙规则；局域网访问可能被阻止。";
+            }
+            MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    case AsyncOperation::kUpdateFirewall:
+        if (result->firewallError != ERROR_SUCCESS) {
+            MessageBoxW(hwnd,
+                        L"配置已保存，但更新专用网络防火墙规则失败；局域网访问可能被阻止。",
+                        L"RemoteAssist", MB_OK | MB_ICONWARNING);
+            ShowServiceError(hwnd, L"更新专用网络防火墙规则", result->firewallError);
+        } else {
+            MessageBoxW(hwnd, L"配置已保存，将在下次启动 Agent 或服务时生效。",
+                        L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    case AsyncOperation::kInstall:
+        return;
+    }
 }
 
 static void ShowTrayMenu(HWND hwnd) {
@@ -674,6 +943,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    if (msg == kAsyncOperationCompleted) {
+        std::unique_ptr<AsyncOperationResult> result(
+            reinterpret_cast<AsyncOperationResult*>(lp));
+        HandleAsyncOperationCompleted(hwnd, std::move(result));
+        return 0;
+    }
+
     // \u6258\u76d8\u56de\u8c03
     if (msg == kTrayCallback) {
         switch (lp) {
@@ -714,6 +990,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HideToTray();
             break;
         case IDM_TRAY_EXIT:
+            if (g_operationInProgress) {
+                MessageBoxW(hwnd, L"服务操作尚未完成，请稍候。", L"RemoteAssist",
+                            MB_OK | MB_ICONINFORMATION);
+                break;
+            }
             RemoveTrayIcon();
             PostQuitMessage(0);
             break;
@@ -728,27 +1009,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 break;
             }
             if (ServiceRunning()) {
-                const ServiceResult restart = RestartServiceS();
-                if (!restart.ok) {
-                    MessageBoxW(hwnd,
-                                L"配置已保存，但服务重启失败；新配置会在下次服务启动时生效。",
-                                L"RemoteAssist", MB_OK | MB_ICONWARNING);
-                    ShowServiceError(hwnd, L"重启服务", restart.error);
-                } else {
-                    MessageBoxW(hwnd, L"配置已保存，服务已重启并应用新密码/端口。",
-                                L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
-                }
+                StartAsyncOperation(hwnd, AsyncOperation::kRestart, portChanged);
+            } else if (portChanged && ServiceExists()) {
+                StartAsyncOperation(hwnd, AsyncOperation::kUpdateFirewall);
             } else {
                 MessageBoxW(hwnd, L"配置已保存，将在下次启动 Agent 或服务时生效。",
                             L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
+                UpdateStatus();
             }
-            if (portChanged && ServiceExists()) {
-                DWORD firewallError = ERROR_SUCCESS;
-                if (!ConfigurePrivateFirewallRule(ExePath(), g_cfg.port, firewallError)) {
-                    ShowServiceError(hwnd, L"更新专用网络防火墙规则", firewallError);
-                }
-            }
-            UpdateStatus();
             break;
         }
         case IDC_SVC_INSTALL: {
@@ -757,75 +1025,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!SaveSettingsFromControls(hwnd, changed, portChanged)) {
                 break;
             }
-            const InstallServiceResult install = InstallService();
-            if (!install.service.ok) {
-                if (!install.pathSecurityReason.empty()) {
-                    const std::wstring message =
-                        L"为防止非管理员改写 LocalSystem 服务，已拒绝从当前目录安装。\n\n" +
-                        install.pathSecurityReason +
-                        L"\n\n请将 RemoteAssist.exe 与 web 目录放到仅管理员和 LocalSystem "
-                        L"可写的本机固定磁盘目录，然后重新以管理员身份运行。";
-                    MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONWARNING);
-                } else {
-                    ShowServiceError(hwnd, L"安装服务", install.service.error);
-                }
-                UpdateStatus();
-                break;
-            }
-            RelinquishTrayOwnership();
-            const ServiceResult start = StartServiceS();
-            if (!start.ok) {
-                ShowServiceError(hwnd, L"启动服务", start.error);
-            } else {
-                const bool agentReady = WaitForAgentReady(5000);
-                std::wstring message;
-                if (agentReady) {
-                    message = L"服务与 Agent 已启动。浏览器访问 http://<本机IP>:" +
-                        std::to_wstring(g_cfg.port) + L"/";
-                } else {
-                    message = L"服务已启动。Agent 尚未就绪（等待登录桌面或查看 logs\\service.log）。";
-                }
-                if (install.firewallError != ERROR_SUCCESS) {
-                    message += L"\n\n未能自动添加专用网络防火墙规则；局域网访问可能被阻止。";
-                }
-                MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
-            }
-            UpdateStatus();
+            StartAsyncOperation(hwnd, AsyncOperation::kInstall);
             break;
         }
         case IDC_SVC_UNINSTALL: {
-            const ServiceResult uninstall = UninstallService();
-            if (uninstall.ok) {
-                MessageBoxW(hwnd, L"服务已卸载。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
-            } else {
-                ShowServiceError(hwnd, L"卸载服务", uninstall.error);
-            }
-            UpdateStatus();
+            StartAsyncOperation(hwnd, AsyncOperation::kUninstall);
             break;
         }
         case IDC_SVC_START: {
             RelinquishTrayOwnership();
-            const ServiceResult start = StartServiceS();
-            if (start.ok) {
-                const bool agentReady = WaitForAgentReady(5000);
-                MessageBoxW(hwnd,
-                    agentReady ? L"服务与 Agent 已启动。" :
-                                 L"服务已启动。Agent 尚未就绪（等待登录桌面或查看 logs\\service.log）。",
-                    L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
-            } else {
-                ShowServiceError(hwnd, L"启动服务", start.error);
-            }
-            UpdateStatus();
+            StartAsyncOperation(hwnd, AsyncOperation::kStart);
             break;
         }
         case IDC_SVC_STOP: {
-            const ServiceResult stop = StopServiceS();
-            if (stop.ok) {
-                MessageBoxW(hwnd, L"服务已停止。", L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
-            } else {
-                ShowServiceError(hwnd, L"停止服务", stop.error);
-            }
-            UpdateStatus();
+            StartAsyncOperation(hwnd, AsyncOperation::kStop);
             break;
         }
         case IDC_RUN_AGENT: {
@@ -854,6 +1067,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case IDC_EXIT:
+            if (g_operationInProgress) {
+                MessageBoxW(hwnd, L"服务操作尚未完成，请稍候。", L"RemoteAssist",
+                            MB_OK | MB_ICONINFORMATION);
+                break;
+            }
             RemoveTrayIcon();
             PostQuitMessage(0);
             break;
@@ -862,6 +1080,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     // \u5173\u95ed\u7a97\u53e3(X \u6309\u94ae):\u9690\u85cf\u5230\u6258\u76d8\u800c\u4e0d\u9000\u51fa
     case WM_CLOSE:
+        if (g_operationInProgress) {
+            MessageBoxW(hwnd, L"服务操作尚未完成，请稍候。", L"RemoteAssist",
+                        MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
         if (g_ownsTray) {
             HideToTray();
         } else {

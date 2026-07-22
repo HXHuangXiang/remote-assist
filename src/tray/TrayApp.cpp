@@ -84,9 +84,12 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == kCallbackMessage) {
         if (self) {
-            if (lp == WM_RBUTTONUP) {
+            // NOTIFYICON_VERSION_4 将通知消息放在 lParam 的低 16 位，高位携带
+            // 图标 ID。直接比较完整 lParam 会导致 uID=1 时右键菜单永远不触发。
+            const UINT eventMessage = LOWORD(static_cast<DWORD_PTR>(lp));
+            if (eventMessage == WM_RBUTTONUP) {
                 self->ShowMenu();
-            } else if (lp == WM_LBUTTONDBLCLK) {
+            } else if (eventMessage == WM_LBUTTONDBLCLK) {
                 self->OpenSetupWindow();
             }
         }
