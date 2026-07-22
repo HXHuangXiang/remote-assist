@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -78,12 +79,13 @@ public:
     void ResetForDesktop();
 
     // 多显示器:枚举显示器列表。-1=全部(虚拟屏幕),>=0=指定显示器。
-    void EnumMonitors();
+    // 重新枚举显示器并保留当前选中的设备（若仍存在）。返回 true 表示布局、分辨率
+    // 或选择项发生了变化，调用方应重建采集/编码资源并推送新 cfg。
+    bool EnumMonitors();
     static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM);
-    const std::vector<MonitorInfo>& Monitors() const { return monitors_; }
-    void SetMonitor(int index) {
-        selectedMonitor_ = (index >= -1 && index < static_cast<int>(monitors_.size())) ? index : -1;
-    }
+    // 返回稳定副本，避免 WebSocket 线程生成 cfg 时与采集线程的热插拔重枚举竞争。
+    std::vector<MonitorInfo> MonitorsSnapshot() const;
+    void SetMonitor(int index);
     int SelectedMonitor() const { return selectedMonitor_.load(); }
     // 仅由采集线程调用。慢链路时降低输出上限可同时缩短缩放、编码和网络发送时间；
     // 源画面宽高均未超过上限时仍保持原始分辨率。
@@ -140,6 +142,7 @@ private:
     bool pointerDirty_ = false;
 
     // 多显示器
+    mutable std::mutex monitorMu_;
     std::vector<MonitorInfo> monitors_;
     std::atomic<int> selectedMonitor_{-1};  // -1=全部
     // 当前采集资源对应的选择项。-2 表示尚未初始化；即使 DXGI 不可用也记录，

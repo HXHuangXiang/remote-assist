@@ -640,14 +640,20 @@ void Agent::CaptureLoop() {
         const int targetMs = 1000 / std::max(1, effectiveFps);
 
         // 跟随桌面切换(锁屏↔解锁、Winlogon↔Default)。
-        // 桌面检查是较重的系统调用,每秒一次即可覆盖切换场景。
+        // 桌面与显示器布局检查是较重的系统调用,每秒一次即可覆盖锁屏切换、热插拔
+        // 和分辨率调整。布局变化即使输出尺寸未变，也必须重新下发 monitor 列表。
         if (t0 >= nextDesktopCheck) {
             nextDesktopCheck = t0 + std::chrono::seconds(1);
-            if (captureDesktop.CheckRebind()) {
+            const bool desktopChanged = captureDesktop.CheckRebind();
+            const bool displayChanged = capture_.EnumMonitors();
+            if (desktopChanged || displayChanged) {
                 capture_.ResetForDesktop();
                 firstFrame_ = true;
                 streamKeyFrameRequired_ = true;
                 lastFrameSent_ = {};
+                if (displayChanged) {
+                    server_.Broadcaster().BroadcastText(MakeCfgJson());
+                }
             }
         }
 
@@ -866,7 +872,7 @@ std::string Agent::MakeCfgJson() const {
     j["fps"] = streamFps_.load();
     j["stream_id"] = streamId_.load();
     auto mons = nlohmann::json::array();
-    for (const auto& m : capture_.Monitors()) {
+    for (const auto& m : capture_.MonitorsSnapshot()) {
         mons.push_back({{"index", m.index}, {"name", m.name}, {"w", m.w}, {"h", m.h}});
     }
     j["monitors"] = mons;

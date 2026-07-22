@@ -38,6 +38,22 @@ uint64_t FingerprintBgraRegion(const uint8_t* source, size_t sourceStrideBytes,
     return hash ^ (static_cast<uint64_t>(width) << 32) ^ static_cast<uint32_t>(height);
 }
 
+bool SameMonitorLayout(const std::vector<MonitorInfo>& left,
+                       const std::vector<MonitorInfo>& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < left.size(); ++index) {
+        const auto& a = left[index];
+        const auto& b = right[index];
+        if (a.name != b.name || a.x != b.x || a.y != b.y ||
+            a.w != b.w || a.h != b.h) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 // EnumDisplayMonitors 回调:收集每个显示器信息。
@@ -138,9 +154,10 @@ void Capture::UpdatePointerFromDesktop(bool visible, int screenX, int screenY) {
     int offsetY = 0;
     int outputWidth = virtualWidth;
     int outputHeight = virtualHeight;
+    const std::vector<MonitorInfo> monitors = MonitorsSnapshot();
     const int selectedMonitor = selectedMonitor_.load();
-    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors_.size())) {
-        const auto& monitor = monitors_[selectedMonitor];
+    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors.size())) {
+        const auto& monitor = monitors[selectedMonitor];
         offsetX = monitor.x;
         offsetY = monitor.y;
         outputWidth = monitor.w;
@@ -191,10 +208,46 @@ void Capture::UpdatePointerFromSystem() {
                              cursorInfo.ptScreenPos.x, cursorInfo.ptScreenPos.y);
 }
 
-void Capture::EnumMonitors() {
+bool Capture::EnumMonitors() {
+    std::lock_guard<std::mutex> lock(monitorMu_);
+    const std::vector<MonitorInfo> previous = monitors_;
+    const int previousSelection = selectedMonitor_.load();
+    std::string selectedDevice;
+    if (previousSelection >= 0 && previousSelection < static_cast<int>(previous.size())) {
+        selectedDevice = previous[previousSelection].name;
+    }
     monitors_.clear();
     EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(this));
-    log::Info("enumerated " + std::to_string(monitors_.size()) + " monitor(s)");
+    int nextSelection = -1;
+    if (!selectedDevice.empty()) {
+        for (const auto& monitor : monitors_) {
+            if (monitor.name == selectedDevice) {
+                nextSelection = monitor.index;
+                break;
+            }
+        }
+    } else if (previousSelection == -1) {
+        nextSelection = -1;
+    }
+    selectedMonitor_.store(nextSelection);
+
+    const bool layoutChanged = !SameMonitorLayout(previous, monitors_);
+    const bool selectionChanged = previousSelection != nextSelection;
+    if (layoutChanged || selectionChanged) {
+        log::Info("display layout updated: " + std::to_string(monitors_.size()) +
+                  " monitor(s), selected=" + std::to_string(nextSelection));
+    }
+    return layoutChanged || selectionChanged;
+}
+
+std::vector<MonitorInfo> Capture::MonitorsSnapshot() const {
+    std::lock_guard<std::mutex> lock(monitorMu_);
+    return monitors_;
+}
+
+void Capture::SetMonitor(int index) {
+    std::lock_guard<std::mutex> lock(monitorMu_);
+    selectedMonitor_.store(index >= -1 && index < static_cast<int>(monitors_.size()) ? index : -1);
 }
 
 void Capture::SetMaxOutputSize(int width, int height) {
@@ -247,18 +300,19 @@ void Capture::ResetForDesktop() {
 
 bool Capture::InitDXGI() {
     const int selectedMonitor = selectedMonitor_.load();
-    if (selectedMonitor < -1 || selectedMonitor >= static_cast<int>(monitors_.size())) {
+    const std::vector<MonitorInfo> monitors = MonitorsSnapshot();
+    if (selectedMonitor < -1 || selectedMonitor >= static_cast<int>(monitors.size())) {
         return false;
     }
     // “全部屏幕”在多适配器/多输出时仍需合成，保留 GDI 回退；但选择单屏时
     // 直接绑定该输出的 DXGI Desktop Duplication，不再因为机器有多屏而退化。
-    if (selectedMonitor == -1 && monitors_.size() > 1) {
+    if (selectedMonitor == -1 && monitors.size() > 1) {
         return false;
     }
 
     std::wstring targetDevice;
     if (selectedMonitor >= 0) {
-        const auto& name = monitors_[selectedMonitor].name;
+        const auto& name = monitors[selectedMonitor].name;
         targetDevice.assign(name.begin(), name.end());  // \\.\DISPLAYn 为 ASCII 设备名。
     }
 
@@ -323,7 +377,7 @@ CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs) {
         // 切换单屏时重建到对应 adapter/output；切回“全部”时保留 GDI 合成。
         ResetForDesktop();
     }
-    const bool allMonitors = selectedMonitor == -1 && monitors_.size() > 1;
+    const bool allMonitors = selectedMonitor == -1 && MonitorsSnapshot().size() > 1;
     if (use_gdi_ || allMonitors) {
         return CaptureGDI(out);
     }
@@ -474,8 +528,9 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out) {
     // 确定输出区域:全部虚拟屏幕或指定显示器。
     int ox = 0, oy = 0, ow = vw, oh = vh;
     const int selectedMonitor = selectedMonitor_.load();
-    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors_.size())) {
-        const auto& m = monitors_[selectedMonitor];
+    const std::vector<MonitorInfo> monitors = MonitorsSnapshot();
+    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors.size())) {
+        const auto& m = monitors[selectedMonitor];
         ox = m.x; oy = m.y; ow = m.w; oh = m.h;
     }
 
@@ -575,8 +630,9 @@ bool Capture::MapNormalizedToVirtual(double x, double y, double& virtualX, doubl
     int width = virtualWidth;
     int height = virtualHeight;
     const int selectedMonitor = selectedMonitor_.load();
-    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors_.size())) {
-        const auto& monitor = monitors_[selectedMonitor];
+    const std::vector<MonitorInfo> monitors = MonitorsSnapshot();
+    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors.size())) {
+        const auto& monitor = monitors[selectedMonitor];
         offsetX = monitor.x;
         offsetY = monitor.y;
         width = monitor.w;
