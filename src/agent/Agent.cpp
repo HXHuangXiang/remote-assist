@@ -55,6 +55,7 @@ uint64_t FrameFingerprint(const std::vector<uint8_t>& frame) {
 struct CaptureLoopStats {
     uint64_t captureAttempts = 0;
     uint64_t capturedFrames = 0;
+    uint64_t directMappedFrames = 0;
     uint64_t noChangeFrames = 0;
     uint64_t captureFailures = 0;
     uint64_t fingerprintSkipped = 0;
@@ -64,6 +65,30 @@ struct CaptureLoopStats {
     uint64_t encodedBytes = 0;
     uint64_t captureTimeMs = 0;
     uint64_t encodeTimeMs = 0;
+};
+
+// 直接映射的 DXGI staging texture 只在“本轮采集 -> 本轮编码”之间有效。这个 guard
+// 保证初始化失败、异常返回或未来新增的 continue 分支都不会遗留 Map 状态。
+class CapturedFrameLease {
+public:
+    CapturedFrameLease(Capture& capture, CapturedFrame& frame)
+        : capture_(capture), frame_(frame) {}
+    ~CapturedFrameLease() { Release(); }
+
+    CapturedFrameLease(const CapturedFrameLease&) = delete;
+    CapturedFrameLease& operator=(const CapturedFrameLease&) = delete;
+
+    void Release() {
+        if (active_) {
+            capture_.ReleaseFrame(frame_);
+            active_ = false;
+        }
+    }
+
+private:
+    Capture& capture_;
+    CapturedFrame& frame_;
+    bool active_ = true;
 };
 
 uint64_t CounterDelta(uint64_t current, uint64_t previous) {
@@ -365,6 +390,7 @@ void Agent::CaptureLoop() {
                       std::to_string(server_.Broadcaster().Count()) +
                       " capture=" + std::to_string(metrics.capturedFrames) + "/" +
                       std::to_string(metrics.captureAttempts) +
+                      " direct=" + std::to_string(metrics.directMappedFrames) +
                       " unchanged=" + std::to_string(metrics.noChangeFrames) +
                       " sampled_skip=" + std::to_string(metrics.fingerprintSkipped) +
                       " capture_fail=" + std::to_string(metrics.captureFailures) +
@@ -536,18 +562,25 @@ void Agent::CaptureLoop() {
             continue;
         }
         metrics.capturedFrames++;
+        if (frame.IsDirectDxgi()) {
+            metrics.directMappedFrames++;
+        }
+        CapturedFrameLease frameLease(capture_, frame);
 
         const bool needsFreshFrame = firstFrame_;
-        const uint64_t frameFingerprint = FrameFingerprint(frame.data);
-        const bool refreshDue = lastFrameSent_.time_since_epoch().count() == 0 ||
-            t0 - lastFrameSent_ >= std::chrono::seconds(1);
-        if (!firstFrame_ && !streamKeyFrameRequired_ &&
-            frameFingerprint == previousFrameFingerprint_ && !refreshDue) {
-            metrics.fingerprintSkipped++;
-            std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
-            continue;
+        if (!frame.IsDirectDxgi()) {
+            const uint64_t frameFingerprint = FrameFingerprint(frame.data);
+            const bool refreshDue = lastFrameSent_.time_since_epoch().count() == 0 ||
+                t0 - lastFrameSent_ >= std::chrono::seconds(1);
+            if (!firstFrame_ && !streamKeyFrameRequired_ &&
+                frameFingerprint == previousFrameFingerprint_ && !refreshDue) {
+                metrics.fingerprintSkipped++;
+                frameLease.Release();
+                std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
+                continue;
+            }
+            previousFrameFingerprint_ = frameFingerprint;
         }
-        previousFrameFingerprint_ = frameFingerprint;
         firstFrame_ = false;
 
         if (!encoder_ || frame.width != deskWidth_.load() || frame.height != deskHeight_.load()) {
@@ -559,6 +592,7 @@ void Agent::CaptureLoop() {
                 log::Error("encoder init failed for " + std::to_string(frame.width) +
                            "x" + std::to_string(frame.height));
                 encoder_.reset();
+                frameLease.Release();
                 std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
                 continue;
             }
@@ -572,14 +606,14 @@ void Agent::CaptureLoop() {
             server_.Broadcaster().BroadcastText(MakeCfgJson());
         }
 
-        if (encoderReady_ && !frame.data.empty()) {
+        if (encoderReady_ && !frame.Empty()) {
             std::vector<EncodedChunk> chunks;
             const auto encodeStartedAt = std::chrono::steady_clock::now();
             const bool wasH264 = streamH264_.load();
             if (needsFreshFrame && encoder_->IsH264()) {
                 encoder_->RequestKeyFrame();
             }
-            const bool encoded = encoder_->Encode(frame.data.data(), chunks);
+            const bool encoded = encoder_->Encode(frame.Pixels(), frame.StrideBytes(), chunks);
             metrics.encodeAttempts++;
             metrics.encodeTimeMs += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -645,6 +679,8 @@ void Agent::CaptureLoop() {
             }
         }
 
+        // 不要让 staging texture 在帧率节流 sleep 期间保持 Map，下一轮可立即复用。
+        frameLease.Release();
         const auto t1 = std::chrono::steady_clock::now();
         const auto used = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         const int remain = targetMs - static_cast<int>(used);

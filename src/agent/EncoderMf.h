@@ -37,7 +37,9 @@ public:
     EncoderMf(const EncoderMf&) = delete;
     EncoderMf& operator=(const EncoderMf&) = delete;
     bool Init(int width, int height, int fps, int bitrateBps);
-    bool Encode(const uint8_t* bgra, std::vector<EncodedChunk>& out);
+    // bgraStrideBytes 允许 DXGI staging texture 的对齐行距，避免未缩放画面额外拷贝到
+    // 紧凑 CPU 缓冲区。
+    bool Encode(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
     std::string CodecString() const;
     // 由采集线程在新控制端、切屏或解码恢复后调用。请求会保持到编码器实际输出
     // IDR 为止，避免把无法独立解码的增量帧作为新流首帧发送。
@@ -57,12 +59,12 @@ private:
     bool TryCreateSoftwareH264();
     bool ConfigureH264Transform();
     bool ConfigureH264OutputType();
-    bool EncodeH264(const uint8_t* bgra, std::vector<EncodedChunk>& out);
+    bool EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
     bool DrainH264(std::vector<EncodedChunk>& out);
-    bool EncodeJpeg(const uint8_t* bgra, std::vector<EncodedChunk>& out);
+    bool EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
     void ReleaseH264();
     bool ForceH264KeyFrame();
-    void ConvertBgraToNv12(const uint8_t* bgra, uint8_t* nv12) const;
+    void ConvertBgraToNv12(const uint8_t* bgra, size_t bgraStrideBytes, uint8_t* nv12) const;
     void CacheH264ParameterSets(const std::vector<uint8_t>& data);
     void PrependCachedParameterSets(EncodedChunk& chunk) const;
     static void CoalesceH264AccessUnits(std::vector<EncodedChunk>& chunks);

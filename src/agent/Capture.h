@@ -18,7 +18,18 @@ namespace remote_assist {
 struct CapturedFrame {
     int width = 0;
     int height = 0;
+    // GDI 与缩放后的 DXGI 路径持有完整 CPU 副本；未缩放 DXGI 路径直接借用已映射
+    // staging texture，避免再复制一遍 BGRA。该借用仅在 Capture::ReleaseFrame 前有效。
     std::vector<uint8_t> data;
+    const uint8_t* mappedPixels = nullptr;
+    size_t mappedStrideBytes = 0;
+
+    bool IsDirectDxgi() const { return mappedPixels != nullptr; }
+    bool Empty() const { return IsDirectDxgi() ? width <= 0 || height <= 0 : data.empty(); }
+    const uint8_t* Pixels() const { return IsDirectDxgi() ? mappedPixels : data.data(); }
+    size_t StrideBytes() const {
+        return IsDirectDxgi() ? mappedStrideBytes : static_cast<size_t>(width) * 4;
+    }
 };
 
 // 采集结果区分“无变化”和真正失败，避免 DXGI 空闲超时退化为 GDI 全屏抓取。
@@ -47,6 +58,8 @@ public:
     // waitMs 是 DXGI 等待桌面变化的上限；由 Agent 按实际目标帧率传入，避免
     // 固定超时把高帧率配置限制在约 20 FPS。
     CaptureResult CaptureFrame(CapturedFrame& out, DWORD waitMs);
+    // 结束直接映射的 DXGI 帧借用。编码完成后必须调用；对普通 CPU 帧是无操作。
+    void ReleaseFrame(CapturedFrame& frame);
 
     // 输入桌面切换后释放与旧桌面关联的采集资源并重新初始化。
     void ResetForDesktop();
@@ -82,6 +95,7 @@ private:
     Microsoft::WRL::ComPtr<IDXGIOutput1> output_;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> dup_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
+    bool stagingMapped_ = false;
 
     // GDI
     HDC gdi_dc_ = nullptr;

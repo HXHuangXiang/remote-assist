@@ -413,7 +413,8 @@ bool EncoderMf::ForceH264KeyFrame() {
     return SUCCEEDED(hr);
 }
 
-void EncoderMf::ConvertBgraToNv12(const uint8_t* bgra, uint8_t* nv12) const {
+void EncoderMf::ConvertBgraToNv12(const uint8_t* bgra, size_t bgraStrideBytes,
+                                  uint8_t* nv12) const {
     uint8_t* yPlane = nv12;
     uint8_t* uvPlane = nv12 + static_cast<size_t>(width_) * height_;
     const BgraToNv12Tables& tables = BgraToNv12Lookup();
@@ -426,8 +427,8 @@ void EncoderMf::ConvertBgraToNv12(const uint8_t* bgra, uint8_t* nv12) const {
     // 再遍历一次计算 UV，导致源图像完整读取两遍；这里在同一个 2x2 块内同时
     // 生成四个 Y 和一个 UV，显著降低大屏推流的内存带宽压力。
     for (int y = 0; y < height_; y += 2) {
-        const uint8_t* sourceRow0 = bgra + static_cast<size_t>(y) * width_ * 4;
-        const uint8_t* sourceRow1 = sourceRow0 + static_cast<size_t>(width_) * 4;
+        const uint8_t* sourceRow0 = bgra + static_cast<size_t>(y) * bgraStrideBytes;
+        const uint8_t* sourceRow1 = sourceRow0 + bgraStrideBytes;
         uint8_t* yRow0 = yPlane + static_cast<size_t>(y) * width_;
         uint8_t* yRow1 = yRow0 + width_;
         uint8_t* uvRow = uvPlane + static_cast<size_t>(y / 2) * width_;
@@ -673,7 +674,8 @@ bool EncoderMf::DrainH264(std::vector<EncodedChunk>& out) {
     }
 }
 
-bool EncoderMf::EncodeH264(const uint8_t* bgra, std::vector<EncodedChunk>& out) {
+bool EncoderMf::EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes,
+                            std::vector<EncodedChunk>& out) {
     out.clear();
     const size_t nv12Bytes = static_cast<size_t>(width_) * height_ * 3 / 2;
     if (nv12Bytes > std::numeric_limits<DWORD>::max()) {
@@ -686,7 +688,7 @@ bool EncoderMf::EncodeH264(const uint8_t* bgra, std::vector<EncodedChunk>& out) 
     BYTE* nv12 = nullptr;
     DWORD maxLength = 0;
     if (FAILED(inputBuffer->Lock(&nv12, &maxLength, nullptr))) return false;
-    ConvertBgraToNv12(bgra, nv12);
+    ConvertBgraToNv12(bgra, bgraStrideBytes, nv12);
     inputBuffer->Unlock();
     inputBuffer->SetCurrentLength(static_cast<DWORD>(nv12Bytes));
 
@@ -739,7 +741,8 @@ bool EncoderMf::InitJpeg() {
     return true;
 }
 
-bool EncoderMf::EncodeJpeg(const uint8_t* bgra, std::vector<EncodedChunk>& out) {
+bool EncoderMf::EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes,
+                           std::vector<EncodedChunk>& out) {
     auto* stream = new MemoryStream();
     Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
     HRESULT hr = wicFactory_->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder);
@@ -747,9 +750,15 @@ bool EncoderMf::EncodeJpeg(const uint8_t* bgra, std::vector<EncodedChunk>& out) 
     hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
     if (FAILED(hr)) { stream->Release(); return false; }
 
+    if (bgraStrideBytes > std::numeric_limits<UINT>::max() ||
+        static_cast<size_t>(height_) > std::numeric_limits<UINT>::max() / bgraStrideBytes) {
+        stream->Release();
+        return false;
+    }
     Microsoft::WRL::ComPtr<IWICBitmap> bitmap;
     hr = wicFactory_->CreateBitmapFromMemory(width_, height_, GUID_WICPixelFormat32bppBGRA,
-        width_ * 4, width_ * height_ * 4, const_cast<BYTE*>(bgra), &bitmap);
+        static_cast<UINT>(bgraStrideBytes), static_cast<UINT>(bgraStrideBytes * height_),
+        const_cast<BYTE*>(bgra), &bitmap);
     if (FAILED(hr)) { stream->Release(); log::Error("WIC bitmap failed hr=" + std::to_string(hr)); return false; }
 
     Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
@@ -798,14 +807,15 @@ bool EncoderMf::EncodeJpeg(const uint8_t* bgra, std::vector<EncodedChunk>& out) 
     return true;
 }
 
-bool EncoderMf::Encode(const uint8_t* bgra, std::vector<EncodedChunk>& out) {
-    if (!configured_ || !bgra) {
+bool EncoderMf::Encode(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out) {
+    if (!configured_ || !bgra ||
+        bgraStrideBytes < static_cast<size_t>(width_) * 4) {
         return false;
     }
     if (mode_ != EncoderMode::kH264) {
-        return EncodeJpeg(bgra, out);
+        return EncodeJpeg(bgra, bgraStrideBytes, out);
     }
-    if (EncodeH264(bgra, out)) {
+    if (EncodeH264(bgra, bgraStrideBytes, out)) {
         return true;
     }
 
@@ -819,7 +829,7 @@ bool EncoderMf::Encode(const uint8_t* bgra, std::vector<EncodedChunk>& out) {
         configured_ = false;
         return false;
     }
-    return EncodeJpeg(bgra, out);
+    return EncodeJpeg(bgra, bgraStrideBytes, out);
 }
 
 void EncoderMf::ReleaseH264() {

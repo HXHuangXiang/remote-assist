@@ -71,6 +71,10 @@ BOOL CALLBACK Capture::MonitorEnumProc(HMONITOR hMon, HDC, LPRECT lprcMonitor, L
 Capture::~Capture() { ReleaseAll(); }
 
 void Capture::ReleaseAll() {
+    if (stagingMapped_ && ctx_.Get() && staging_.Get()) {
+        ctx_->Unmap(staging_.Get(), 0);
+        stagingMapped_ = false;
+    }
     staging_.Reset();
     dup_.Reset();
     output_.Reset();
@@ -97,6 +101,15 @@ void Capture::ReleaseAll() {
     gdiFingerprint_ = 0;
     hasGdiFingerprint_ = false;
     lastGdiFullFrameAt_ = {};
+}
+
+void Capture::ReleaseFrame(CapturedFrame& frame) {
+    if (stagingMapped_ && ctx_.Get() && staging_.Get()) {
+        ctx_->Unmap(staging_.Get(), 0);
+        stagingMapped_ = false;
+    }
+    frame.mappedPixels = nullptr;
+    frame.mappedStrideBytes = 0;
 }
 
 void Capture::EnumMonitors() {
@@ -201,6 +214,9 @@ bool Capture::InitDXGI() {
 }
 
 CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs) {
+    // 采集线程串行使用同一个 staging texture。即使调用方因编码异常遗漏释放，也不
+    // 能让下一次 Map 保持旧映射；正常路径会在编码后主动调用 ReleaseFrame。
+    ReleaseFrame(out);
     const int selectedMonitor = selectedMonitor_.load();
     if (selectedMonitor != activeMonitor_) {
         // 切换单屏时重建到对应 adapter/output；切回“全部”时保留 GDI 合成。
@@ -264,6 +280,23 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     }
     const int w = static_cast<int>(desc.Width);
     const int h = static_cast<int>(desc.Height);
+    // 未缩放且 NV12 兼容的偶数尺寸可直接借用 staging 映射。原实现会先完整复制
+    // 到 CapturedFrame::data，再由编码器读取一次；此路径每帧省去约一张 BGRA 图像
+    // 的 CPU 内存带宽（1080p 约 8 MB）。
+    const bool canDirectMap = w <= kMaxStreamWidth && h <= kMaxStreamHeight &&
+        (w & 1) == 0 && (h & 1) == 0;
+    if (canDirectMap) {
+        out.width = w;
+        out.height = h;
+        out.data.clear();
+        out.mappedPixels = static_cast<const uint8_t*>(mapped.pData);
+        out.mappedStrideBytes = mapped.RowPitch;
+        stagingMapped_ = true;
+        width_ = out.width;
+        height_ = out.height;
+        return CaptureResult::kFrame;
+    }
+
     const auto* src = static_cast<const uint8_t*>(mapped.pData);
     CopyRegionToFrame(src, mapped.RowPitch, 0, 0, w, h, out);
     ctx_->Unmap(staging_.Get(), 0);
@@ -359,6 +392,8 @@ void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
 
     out.width = outputWidth;
     out.height = outputHeight;
+    out.mappedPixels = nullptr;
+    out.mappedStrideBytes = 0;
     out.data.resize(static_cast<size_t>(outputWidth) * outputHeight * 4);
 
     if (outputWidth == width && outputHeight == height) {
