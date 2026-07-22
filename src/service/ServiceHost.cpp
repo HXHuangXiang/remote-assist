@@ -19,6 +19,7 @@ constexpr DWORD kMonitorIntervalMs = 2000;
 // 避免 SCM 停服务时退化为强制终止 agent。
 constexpr DWORD kAgentStopTimeoutMs = 8000;
 constexpr DWORD kTrayStopTimeoutMs = 1000;
+constexpr DWORD kServiceStopMarginMs = 2000;
 
 struct ServiceState {
     SERVICE_STATUS status{};
@@ -35,12 +36,13 @@ struct ServiceState {
 };
 ServiceState g_state;
 
-void ReportState(DWORD state, DWORD exitCode = NO_ERROR, DWORD hint = 0) {
+void ReportState(DWORD state, DWORD exitCode = NO_ERROR, DWORD hint = 0,
+                 DWORD checkpoint = 0) {
     g_state.status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_state.status.dwCurrentState = state;
     g_state.status.dwWin32ExitCode = exitCode;
     g_state.status.dwServiceSpecificExitCode = 0;
-    g_state.status.dwCheckPoint = 0;
+    g_state.status.dwCheckPoint = checkpoint;
     g_state.status.dwWaitHint = hint;
     g_state.status.dwControlsAccepted =
         (state == SERVICE_RUNNING) ? SERVICE_ACCEPT_STOP : 0;
@@ -52,7 +54,10 @@ void ReportState(DWORD state, DWORD exitCode = NO_ERROR, DWORD hint = 0) {
 void WINAPI ServiceHandler(DWORD ctrl) {
     if (ctrl == SERVICE_CONTROL_STOP) {
         g_state.stopRequested.store(true);
-        ReportState(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+        // agent 的 WebSocket 关闭窗口最长可达 8 秒，不能继续沿用 5 秒 wait hint，
+        // 否则 SCM 或配置窗口可能把仍在优雅退出的服务误判为无响应。
+        ReportState(SERVICE_STOP_PENDING, NO_ERROR,
+                    kAgentStopTimeoutMs + kTrayStopTimeoutMs + kServiceStopMarginMs, 1);
         if (g_state.agentStopEvent) {
             SetEvent(g_state.agentStopEvent);
         }
@@ -249,7 +254,10 @@ void ServiceWorker() {
     if (g_state.agentReadyEvent) {
         ResetEvent(g_state.agentReadyEvent);
     }
+    ReportState(SERVICE_STOP_PENDING, NO_ERROR,
+                kAgentStopTimeoutMs + kTrayStopTimeoutMs + kServiceStopMarginMs, 2);
     StopChild(g_state.agentProcess, "agent", kAgentStopTimeoutMs);
+    ReportState(SERVICE_STOP_PENDING, NO_ERROR, kTrayStopTimeoutMs + kServiceStopMarginMs, 3);
     StopChild(g_state.trayProcess, "tray", kTrayStopTimeoutMs);
     g_state.agentSessionId = kInvalidSessionId;
     g_state.traySessionId = kInvalidSessionId;
