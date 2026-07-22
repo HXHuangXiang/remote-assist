@@ -59,6 +59,13 @@ constexpr StreamResolutionCap kStreamResolutionCaps[] = {
 constexpr int kStreamResolutionCapCount =
     static_cast<int>(sizeof(kStreamResolutionCaps) / sizeof(kStreamResolutionCaps[0]));
 
+// GDI BitBlt 即使画面不变也会把整张虚拟桌面复制进 DIB。锁屏或跨显卡多屏长期
+// 静止时没有必要持续占用 15 FPS；一旦收到有效的键鼠操作，短暂恢复到交互帧率，
+// 让密码输入、点击反馈仍保持及时。
+constexpr int kGdiInteractiveFpsCap = 15;
+constexpr int kGdiIdleFpsCap = 5;
+constexpr uint64_t kGdiInputBoostWindowMs = 1200;
+
 // 直接映射的 DXGI staging texture 只在“本轮采集 -> 本轮编码”之间有效。这个 guard
 // 保证初始化失败、异常返回或未来新增的 continue 分支都不会遗留 Map 状态。
 class CapturedFrameLease {
@@ -379,9 +386,15 @@ void Agent::CaptureLoop() {
     auto effectiveFpsFor = [&](int requestedFps) {
         int effectiveFps = requestedFps;
         if (capture_.IsUsingGdi()) {
-            // BitBlt 即使画面未变也需要整帧复制到 DIB；锁屏和“全部屏幕”路径
-            // 优先保持低延迟与输入响应，15 FPS 已足够避免远端界面出现明显跳变。
-            effectiveFps = std::min(effectiveFps, 15);
+            const uint64_t nowTick = static_cast<uint64_t>(GetTickCount64());
+            const uint64_t lastInputTick =
+                lastRemoteInputTick_.load(std::memory_order_relaxed);
+            const bool interactive = firstFrame_ ||
+                (lastInputTick != 0 && nowTick - lastInputTick <= kGdiInputBoostWindowMs);
+            // BitBlt 即使画面未变也需要整帧复制到 DIB。首帧与远端操作后的短窗口
+            // 保持 15 FPS；锁屏静止画面则降到 5 FPS，光标仍通过独立小消息及时更新。
+            effectiveFps = std::min(effectiveFps,
+                interactive ? kGdiInteractiveFpsCap : kGdiIdleFpsCap);
         } else if ((!encoder_ || !encoder_->IsH264()) &&
                    (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080)) {
             effectiveFps = std::min(effectiveFps, 15);
@@ -1039,6 +1052,8 @@ void Agent::OnMessage(const std::string& msg) {
             !ReadOptionalJsonBool(j, "ext", extended)) {
             return;
         }
+        lastRemoteInputTick_.store(static_cast<uint64_t>(GetTickCount64()),
+                                   std::memory_order_relaxed);
         Input::SendKey(static_cast<USHORT>(scanCode), down, extended);
     } else if (t == "mouse") {
         double x = 0.0;
@@ -1054,6 +1069,8 @@ void Agent::OnMessage(const std::string& msg) {
         if (!capture_.MapNormalizedToVirtual(x, y, virtualX, virtualY)) {
             return;
         }
+        lastRemoteInputTick_.store(static_cast<uint64_t>(GetTickCount64()),
+                                   std::memory_order_relaxed);
         Input::SendMouseAbs(virtualX, virtualY);
         Input::SendMouseButton(button, down);
     } else if (t == "move") {
@@ -1065,6 +1082,8 @@ void Agent::OnMessage(const std::string& msg) {
         double virtualX = 0.0;
         double virtualY = 0.0;
         if (capture_.MapNormalizedToVirtual(x, y, virtualX, virtualY)) {
+            lastRemoteInputTick_.store(static_cast<uint64_t>(GetTickCount64()),
+                                       std::memory_order_relaxed);
             Input::SendMouseAbs(virtualX, virtualY);
         }
     } else if (t == "wheel") {
@@ -1072,6 +1091,8 @@ void Agent::OnMessage(const std::string& msg) {
         if (!ReadJsonIntInRange(j, "delta", -1200, 1200, delta)) {
             return;
         }
+        lastRemoteInputTick_.store(static_cast<uint64_t>(GetTickCount64()),
+                                   std::memory_order_relaxed);
         Input::SendWheel(delta);
     }
 }

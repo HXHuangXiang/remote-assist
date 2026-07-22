@@ -49,6 +49,9 @@ private:
     std::atomic<int> deskWidth_{0};
     std::atomic<int> deskHeight_{0};
     std::atomic<bool> frameResetRequested_{false};
+    // 锁屏/跨显卡等 GDI 路径每次采集都要完整 BitBlt 虚拟桌面。输入线程记录最近
+    // 合法远端操作，采集线程据此仅在交互窗口内保持较高采样率，静止时降低开销。
+    std::atomic<uint64_t> lastRemoteInputTick_{0};
     // 断连回调由 WebSocket 工作线程触发；质量参数只能由采集线程操作，因此用该标志
     // 请求其在下一轮恢复用户配置上限。
     std::atomic<bool> qualityResetRequested_{false};
