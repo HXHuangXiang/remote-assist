@@ -2,6 +2,7 @@
 
 #include "common/Log.h"
 
+#include <mferror.h>
 #include <wmcodecdsp.h>
 
 #include <algorithm>
@@ -250,22 +251,17 @@ bool EncoderMf::TryCreateSoftwareH264() {
 }
 
 bool EncoderMf::ConfigureH264Transform() {
-    if (!h264Mft_) {
+    if (!h264Mft_.Get()) {
         return false;
     }
     h264Mft_.As(&codecApi_);
-    // 常见硬件 MFT 支持这两个属性；不支持时仍由 media type 的平均码率兜底。
+    // 常见硬件 MFT 支持码率属性；不支持时仍由 media type 的平均码率兜底。
+    // Windows SDK 并没有通用的 H.264 profile CodecAPI 属性，因此不能假定编码器
+    // 一定是 Baseline；实际 profile 由后续 SPS 解析后下发给浏览器。
     const HRESULT bitrateResult = SetCodecUInt32(codecApi_.Get(), CODECAPI_AVEncCommonMeanBitRate,
                                                   static_cast<ULONG>(bitrateBps_));
-    const HRESULT profileResult = SetCodecUInt32(codecApi_.Get(), CODECAPI_AVEncH264VProfile,
-                                                  66);  // Baseline
-    if (codecApi_ && FAILED(bitrateResult)) {
+    if (codecApi_.Get() && FAILED(bitrateResult)) {
         log::Warn("H.264 MFT ignored requested bitrate hr=" + std::to_string(bitrateResult));
-    }
-    if (codecApi_ && FAILED(profileResult)) {
-        // 后续会以 SPS 的真实 profile 更新浏览器配置，不能继续假定 Baseline。
-        log::Warn("H.264 MFT ignored requested Baseline profile hr=" +
-                  std::to_string(profileResult));
     }
 
     Microsoft::WRL::ComPtr<IMFMediaType> inputType;
@@ -317,7 +313,7 @@ bool EncoderMf::ConfigureH264OutputType() {
 }
 
 bool EncoderMf::ForceH264KeyFrame() {
-    if (!codecApi_) {
+    if (!codecApi_.Get()) {
         return false;
     }
     VARIANT value;
@@ -726,7 +722,7 @@ bool EncoderMf::Encode(const uint8_t* bgra, std::vector<EncodedChunk>& out) {
 }
 
 void EncoderMf::ReleaseH264() {
-    if (h264Mft_) {
+    if (h264Mft_.Get()) {
         h264Mft_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         h264Mft_.Reset();
     }
