@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -17,6 +18,28 @@ namespace {
 
 constexpr int kMaxStreamWidth = 1920;
 constexpr int kMaxStreamHeight = 1080;
+
+// 每行错开采样相位，避免固定列的细小变化一直漏检。采样比例约为 1/16，
+// 相比完整 4K 帧的缩放/复制开销可忽略。
+uint64_t FingerprintBgraRegion(const uint8_t* source, size_t sourceStrideBytes,
+                               int x, int y, int width, int height) {
+    constexpr size_t kSampleStrideBytes = 64;
+    uint64_t hash = 1469598103934665603ULL;
+    const size_t regionBytes = static_cast<size_t>(width) * 4;
+    for (int row = 0; row < height; ++row) {
+        const uint8_t* sourceRow = source + static_cast<size_t>(y + row) * sourceStrideBytes +
+            static_cast<size_t>(x) * 4;
+        const size_t phase = (static_cast<size_t>(row) * 20) % kSampleStrideBytes;
+        for (size_t offset = phase; offset + sizeof(uint32_t) <= regionBytes;
+             offset += kSampleStrideBytes) {
+            uint32_t pixel = 0;
+            std::memcpy(&pixel, sourceRow + offset, sizeof(pixel));
+            hash ^= pixel;
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash ^ (static_cast<uint64_t>(width) << 32) ^ static_cast<uint32_t>(height);
+}
 
 }  // namespace
 
@@ -71,6 +94,9 @@ void Capture::ReleaseAll() {
     bits_ = nullptr;
     dibW_ = 0;
     dibH_ = 0;
+    gdiFingerprint_ = 0;
+    hasGdiFingerprint_ = false;
+    lastGdiFullFrameAt_ = {};
 }
 
 void Capture::EnumMonitors() {
@@ -182,7 +208,7 @@ CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs) {
     }
     const bool allMonitors = selectedMonitor == -1 && monitors_.size() > 1;
     if (use_gdi_ || allMonitors) {
-        return CaptureGDI(out) ? CaptureResult::kFrame : CaptureResult::kFailed;
+        return CaptureGDI(out);
     }
 
     const CaptureResult result = CaptureDXGI(out, std::max<DWORD>(1, waitMs));
@@ -246,11 +272,11 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     return CaptureResult::kFrame;
 }
 
-bool Capture::CaptureGDI(CapturedFrame& out) {
+CaptureResult Capture::CaptureGDI(CapturedFrame& out) {
     // 虚拟屏幕尺寸(涵盖所有显示器)。
     const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (vw <= 0 || vh <= 0) return false;
+    if (vw <= 0 || vh <= 0) return CaptureResult::kFailed;
 
     // 优先取当前 input desktop 的 DC，锁屏/Winlogon 情况不会误用普通 DISPLAY DC。
     // 创建/复用 DIB 的尺寸仍然覆盖整个虚拟屏幕。
@@ -260,11 +286,11 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
         if (!gdi_dc_) {
             gdi_dc_ = CreateDCW(L"DISPLAY", nullptr, nullptr, nullptr);
         }
-        if (!gdi_dc_) return false;
+        if (!gdi_dc_) return CaptureResult::kFailed;
     }
     if (!mem_dc_) {
         mem_dc_ = CreateCompatibleDC(gdi_dc_);
-        if (!mem_dc_) return false;
+        if (!mem_dc_) return CaptureResult::kFailed;
     }
     if (!bmp_ || dibW_ != vw || dibH_ != vh) {
         if (bmp_) { SelectObject(mem_dc_, old_bmp_); DeleteObject(bmp_); bmp_ = nullptr; }
@@ -276,7 +302,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
         bmp_ = CreateDIBSection(mem_dc_, &bi, DIB_RGB_COLORS, &bits_, nullptr, 0);
-        if (!bmp_) return false;
+        if (!bmp_) return CaptureResult::kFailed;
         old_bmp_ = static_cast<HBITMAP>(SelectObject(mem_dc_, bmp_));
         dibW_ = vw; dibH_ = vh;
     }
@@ -287,7 +313,7 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
     if (!BitBlt(mem_dc_, 0, 0, vw, vh, gdi_dc_, vx, vy, SRCCOPY | CAPTUREBLT)) {
         // GetDIBits 仅会读回当前 DIB 内容，不能作为屏幕采集失败后的替代方案。
         log::Warn("GDI BitBlt failed: " + std::to_string(GetLastError()));
-        return false;
+        return CaptureResult::kFailed;
     }
 
     // 确定输出区域:全部虚拟屏幕或指定显示器。
@@ -298,12 +324,24 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
         ox = m.x; oy = m.y; ow = m.w; oh = m.h;
     }
 
-    // 从 DIB 裁剪并缩放到适合低延迟推流的尺寸。
     const auto* src = static_cast<const uint8_t*>(bits_);
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t fingerprint = FingerprintBgraRegion(src, static_cast<size_t>(vw) * 4,
+                                                       ox, oy, ow, oh);
+    const bool refreshDue = lastGdiFullFrameAt_.time_since_epoch().count() == 0 ||
+        now - lastGdiFullFrameAt_ >= std::chrono::seconds(1);
+    if (hasGdiFingerprint_ && fingerprint == gdiFingerprint_ && !refreshDue) {
+        return CaptureResult::kNoChange;
+    }
+    gdiFingerprint_ = fingerprint;
+    hasGdiFingerprint_ = true;
+
+    // 原始 DIB 已确认有变化（或到达兜底刷新时间）后才裁剪、缩放并分配输出帧。
     CopyRegionToFrame(src, static_cast<size_t>(vw) * 4, ox, oy, ow, oh, out);
+    lastGdiFullFrameAt_ = now;
     width_ = out.width;
     height_ = out.height;
-    return true;
+    return CaptureResult::kFrame;
 }
 
 void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,

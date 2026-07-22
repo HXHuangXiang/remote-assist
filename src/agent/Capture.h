@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -66,7 +67,7 @@ public:
 private:
     bool InitDXGI();
     CaptureResult CaptureDXGI(CapturedFrame& out, DWORD waitMs);
-    bool CaptureGDI(CapturedFrame& out);
+    CaptureResult CaptureGDI(CapturedFrame& out);
     void CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                            int x, int y, int width, int height,
                            CapturedFrame& out);
@@ -89,6 +90,12 @@ private:
 
     int dibW_ = 0;   // DIB 宽(虚拟屏幕宽)
     int dibH_ = 0;   // DIB 高(虚拟屏幕高)
+    // GDI/BitBlt 不提供 DXGI Desktop Duplication 那样的“无变化”通知。对原始
+    // DIB 采样哈希可在静态锁屏/多屏画面时跳过昂贵的缩放与编码；每秒仍强制
+    // 输出一次完整帧，避免极小变化恰好未落入采样点而长期不可见。
+    uint64_t gdiFingerprint_ = 0;
+    bool hasGdiFingerprint_ = false;
+    std::chrono::steady_clock::time_point lastGdiFullFrameAt_{};
 
     // 多显示器
     std::vector<MonitorInfo> monitors_;
