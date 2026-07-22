@@ -12,8 +12,10 @@ namespace remote_assist {
 namespace {
 
 // 浏览器收到 WebSocket 二进制帧后还要经历图片解码和 canvas 绘制。仅靠 TCP
-// 写成功无法说明用户已经看到新画面；超时兜底避免旧浏览器或异常连接永久停流。
-constexpr auto kFrameAckTimeout = std::chrono::seconds(1);
+// 写成功无法说明用户已经看到新画面。窗口过长会在浏览器偶发卡顿后继续发送
+// 已过期的 P 帧，远端画面会明显落后鼠标/键盘；300ms 足以覆盖正常局域网的一次
+// 解码和 rAF 绘制，同时能更快触发 Agent 的自适应降档。
+constexpr auto kFrameAckTimeout = std::chrono::milliseconds(300);
 constexpr size_t kMaxFramesInFlight = 2;
 constexpr size_t kMaxPendingTextMessages = 8;
 constexpr auto kAuthThrottleRetention = std::chrono::minutes(10);

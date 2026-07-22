@@ -2,6 +2,10 @@
 let pendingFrame = null, nextFrameInfo = null, activeFrame = null, imgLoading = false;
 let pendingMove = null, moveQueued = false;
 let ws = null, cfg = null, authed = false;
+// 重复点击“连接”时，必须先等旧 WebSocket 的关闭握手完成；否则服务端仍持有
+// 上一控制端槽位，新连接会被误判为并发控制端而拒绝。
+let reconnectAfterClose = false;
+let reconnectRetriesRemaining = 0;
 let canvas, ctx, cursorCanvas, cursorCtx, logEl, statusEl, pwEl, monSel;
 const pressedKeys = new Map();
 const pressedButtons = new Set();
@@ -39,6 +43,23 @@ function fitCanvas() {
 }
 
 function connect() {
+  if (ws && ws.readyState !== WebSocket.CLOSED) {
+    reconnectAfterClose = true;
+    reconnectRetriesRemaining = 5;
+    setStatus('正在重连');
+    releasePressedInputs();
+    try { ws.close(1000, 'reconnecting'); } catch (_) {}
+    return;
+  }
+  // 用户明确发起的新连接不继承上一轮自动重连的重试次数。
+  reconnectAfterClose = false;
+  reconnectRetriesRemaining = 0;
+  openConnection();
+}
+
+function openConnection() {
+  // 延迟重连计时器与用户再次点击可能交错；已有新会话时不能由旧计时器把它关闭。
+  if (ws && ws.readyState !== WebSocket.CLOSED) return;
   // 直接从当前页面地址派生，端口改成 80/443 等默认端口时也不会错误回退到 7980。
   const endpoint = new URL('/ws', window.location.href);
   endpoint.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -51,12 +72,17 @@ function connect() {
   wheelRemainder = 0;
   authed = false;
   setStatus('连接中');
-  if (ws) { ws.close(); }
   const socket = new WebSocket(url);
   ws = socket;
   socket.binaryType = 'arraybuffer';
   socket.onopen = function() {
-    if (ws === socket) socket.send(JSON.stringify({t:'auth', token: pwEl.value || ''}));
+    if (ws !== socket) return;
+    try {
+      socket.send(JSON.stringify({t:'auth', token: pwEl.value || ''}));
+    } catch (error) {
+      log('auth send failed: ' + error.message);
+      try { socket.close(); } catch (_) {}
+    }
   };
   socket.onmessage = function(ev) {
     if (ws !== socket) return;
@@ -67,6 +93,8 @@ function connect() {
   };
   socket.onclose = function() {
     if (ws !== socket) return;
+    const shouldReconnect = reconnectAfterClose || reconnectRetriesRemaining > 0;
+    reconnectAfterClose = false;
     resetFramePipeline(false);
     pressedKeys.clear();
     pressedButtons.clear();
@@ -77,6 +105,12 @@ function connect() {
     drawRemoteCursor();
     ws = null;
     log('disconnected'); setStatus('未连接'); authed = false;
+    if (shouldReconnect) {
+      if (reconnectRetriesRemaining > 0) --reconnectRetriesRemaining;
+      // 服务端会先释放遗留按键再让出唯一 controller 槽位；给这段收尾留出一个
+      // 短窗口。若仍碰到“controller already connected”，最多再重试五次。
+      window.setTimeout(openConnection, 250);
+    }
   };
   socket.onerror = function() { if (ws === socket) log('ws error'); };
 }
@@ -84,6 +118,7 @@ function connect() {
 function handleText(m) {
   if (m.t === 'auth') {
     authed = m.ok;
+    if (m.ok) reconnectRetriesRemaining = 0;
     setStatus(m.ok ? '已连接' : '鉴权失败');
     log(m.ok ? 'auth ok' : ('auth fail: ' + (m.reason || '')));
     if (m.ok && canvas) canvas.focus();
@@ -469,9 +504,17 @@ function canSendInput() {
 
 function send(obj) {
   if (!canSendInput()) return false;
-  ws.send(JSON.stringify(obj));
-  clientStats.maxWsBuffered = Math.max(clientStats.maxWsBuffered, ws.bufferedAmount);
-  return true;
+  const socket = ws;
+  try {
+    socket.send(JSON.stringify(obj));
+    clientStats.maxWsBuffered = Math.max(clientStats.maxWsBuffered, socket.bufferedAmount);
+    return true;
+  } catch (error) {
+    // readyState 检查与 send 之间仍可能收到 Close 帧。输入失败后交给 onclose
+    // 统一清理本地按键状态，不能让事件回调因 DOMException 冒泡中断。
+    if (ws === socket) log('ws send failed: ' + error.message);
+    return false;
+  }
 }
 
 function recordPresentedFrame(info) {
