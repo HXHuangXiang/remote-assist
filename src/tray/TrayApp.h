@@ -20,6 +20,7 @@ public:
 private:
     void CreateIcon();
     void ShowMenu();
+    void OpenSetupWindow();
     void ShowPasswordDialog();
     void RemoveIcon();
 

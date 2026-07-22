@@ -38,6 +38,9 @@ static NOTIFYICONDATAW g_nid = {};
 static HMENU g_trayMenu = nullptr;
 static UINT g_wmTaskbarRestart = 0;
 static bool g_trayAdded = false;
+// 与 service 拉起的 TrayApp 共用每会话 mutex，避免配置窗口额外创建托盘图标。
+static HANDLE g_trayMutex = nullptr;
+static bool g_ownsTray = false;
 
 static std::wstring ExePath() {
     wchar_t buf[MAX_PATH] = {};
@@ -343,6 +346,9 @@ static void UpdateStatus() {
 // ---- \u6258\u76d8\u56fe\u6807\u7ba1\u7406 ----
 
 static void AddTrayIcon(HWND hwnd) {
+    if (!g_ownsTray) {
+        return;
+    }
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = hwnd;
     g_nid.uID = 1;
@@ -381,6 +387,9 @@ static void ShowTrayMenu(HWND hwnd) {
 
 static void HideToTray() {
     ShowWindow(g_hwnd, SW_HIDE);
+    if (!g_ownsTray || !g_trayAdded) {
+        return;
+    }
     wcscpy_s(g_nid.szTip, L"RemoteAssist (hidden)");
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
@@ -579,7 +588,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case IDC_HIDE_TRAY:
-            HideToTray();
+            if (g_ownsTray || g_trayMutex) {
+                HideToTray();
+            }
             break;
         case IDC_EXIT:
             RemoveTrayIcon();
@@ -590,10 +601,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     // \u5173\u95ed\u7a97\u53e3(X \u6309\u94ae):\u9690\u85cf\u5230\u6258\u76d8\u800c\u4e0d\u9000\u51fa
     case WM_CLOSE:
-        ShowWindow(hwnd, SW_HIDE);
-        wcscpy_s(g_nid.szTip, L"RemoteAssist (hidden)");
-        g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+        if (g_ownsTray) {
+            HideToTray();
+        } else {
+            DestroyWindow(hwnd);
+        }
         return 0;
 
     case WM_DESTROY:
@@ -607,6 +619,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int RunSetupDialog(HINSTANCE hInst) {
     log::Init(LogDir(), L"setup.log");
     log::Info("setup dialog starting");
+
+    g_trayMutex = CreateMutexW(nullptr, FALSE, runtime::kTrayMutexName);
+    if (!g_trayMutex) {
+        log::Warn("setup tray mutex creation failed: " + std::to_string(GetLastError()));
+    } else {
+        g_ownsTray = GetLastError() != ERROR_ALREADY_EXISTS;
+        if (!g_ownsTray) {
+            log::Info("existing session tray detected, setup will not add a second icon");
+        }
+    }
 
     g_wmTaskbarRestart = RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -634,6 +656,12 @@ int RunSetupDialog(HINSTANCE hInst) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    RemoveTrayIcon();
+    if (g_trayMutex) {
+        CloseHandle(g_trayMutex);
+        g_trayMutex = nullptr;
+    }
+    g_ownsTray = false;
     log::Info("setup dialog exit");
     return 0;
 }

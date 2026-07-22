@@ -17,9 +17,10 @@ namespace remote_assist {
 namespace {
 
 constexpr UINT kCallbackMessage = WM_USER + 1;
-constexpr UINT kMenuCommandShowPw = 1001;
-constexpr UINT kMenuCommandAbout = 1002;
-constexpr UINT kMenuCommandExit = 1003;
+constexpr UINT kMenuCommandOpenSetup = 1001;
+constexpr UINT kMenuCommandShowPw = 1002;
+constexpr UINT kMenuCommandAbout = 1003;
+constexpr UINT kMenuCommandExit = 1004;
 constexpr const wchar_t* kClassName = L"RemoteAssistTrayWindow";
 
 // 读取并删除 .initial-password 文件(由 service 首次生成密码时写入)。
@@ -49,8 +50,12 @@ TrayApp::~TrayApp() {
 LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == kCallbackMessage) {
         auto* self = reinterpret_cast<TrayApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-        if (self && lp == WM_RBUTTONUP) {
-            self->ShowMenu();
+        if (self) {
+            if (lp == WM_RBUTTONUP) {
+                self->ShowMenu();
+            } else if (lp == WM_LBUTTONDBLCLK) {
+                self->OpenSetupWindow();
+            }
         }
         return 0;
     }
@@ -60,6 +65,9 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         switch (LOWORD(wp)) {
+            case kMenuCommandOpenSetup:
+                self->OpenSetupWindow();
+                break;
             case kMenuCommandShowPw:
                 self->ShowPasswordDialog();
                 break;
@@ -104,10 +112,11 @@ void TrayApp::CreateIcon() {
     Shell_NotifyIconW(NIM_ADD, &nid_);
 
     hMenu_ = CreatePopupMenu();
-    AppendMenuW(hMenu_, MF_STRING, kMenuCommandShowPw, L"显示访问密码");
+    AppendMenuW(hMenu_, MF_STRING, kMenuCommandOpenSetup, L"打开配置窗口");
+    AppendMenuW(hMenu_, MF_STRING, kMenuCommandShowPw, L"显示首次访问密码");
     AppendMenuW(hMenu_, MF_STRING, kMenuCommandAbout, L"关于 RemoteAssist");
     AppendMenuW(hMenu_, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu_, MF_STRING, kMenuCommandExit, L"退出托盘");
+    AppendMenuW(hMenu_, MF_STRING, kMenuCommandExit, L"退出托盘（服务继续运行）");
 }
 
 void TrayApp::ShowMenu() {
@@ -120,13 +129,28 @@ void TrayApp::ShowMenu() {
     TrackPopupMenu(hMenu_, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd_, nullptr);
 }
 
+void TrayApp::OpenSetupWindow() {
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) {
+        log::Warn("tray cannot resolve executable path: " + std::to_string(GetLastError()));
+        return;
+    }
+    const HINSTANCE result = ShellExecuteW(hwnd_, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(result) <= 32) {
+        log::Warn("tray failed to open setup window: " +
+                  std::to_string(reinterpret_cast<INT_PTR>(result)));
+    }
+}
+
 void TrayApp::ShowPasswordDialog() {
     std::wstring msg;
     if (password_.empty()) {
-        msg = L"密码已展示过或非首次启动。如需重置,请删除当前 exe 同目录的 config.json 后重启服务。";
+        msg = L"首次密码已展示过或非首次启动。选择“打开配置窗口”可设置新密码。";
     } else {
+        const Config cfg = LoadOrCreateConfig();
         msg = L"访问密码(仅本次显示,请妥善保存):\n\n" + password_ +
-              L"\n\n浏览器打开 http://<本机IP>:7980/ 后输入此密码连接。";
+              L"\n\n浏览器打开 http://<本机IP>:" + std::to_wstring(cfg.port) +
+              L"/ 后输入此密码连接。";
     }
     MessageBoxW(hwnd_, msg.c_str(), L"RemoteAssist 访问密码", MB_OK | MB_ICONINFORMATION);
 }
