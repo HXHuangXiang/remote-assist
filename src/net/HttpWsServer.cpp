@@ -60,8 +60,12 @@ void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamI
         if (stopping_) {
             return;
         }
+        if (!pendingFrame_.empty()) {
+            replacedFrames_.fetch_add(1, std::memory_order_relaxed);
+        }
         pendingFrame_ = std::move(frame);
         pendingStreamId_ = streamId;
+        queuedFrames_.fetch_add(1, std::memory_order_relaxed);
     }
     frameCv_.notify_one();
 }
@@ -82,8 +86,21 @@ void WsBroadcaster::AcknowledgeFrame(uint64_t frameId) {
         frameInFlight_ = false;
         inFlightFrameId_ = 0;
         inFlightSince_ = {};
+        acknowledgedFrames_.fetch_add(1, std::memory_order_relaxed);
         frameCv_.notify_one();
     }
+}
+
+BroadcasterStats WsBroadcaster::SnapshotStats() const {
+    BroadcasterStats stats;
+    stats.queuedFrames = queuedFrames_.load(std::memory_order_relaxed);
+    stats.replacedFrames = replacedFrames_.load(std::memory_order_relaxed);
+    stats.sentFrames = sentFrames_.load(std::memory_order_relaxed);
+    stats.sentBytes = sentBytes_.load(std::memory_order_relaxed);
+    stats.acknowledgedFrames = acknowledgedFrames_.load(std::memory_order_relaxed);
+    stats.ackTimeouts = ackTimeouts_.load(std::memory_order_relaxed);
+    stats.sendFailures = sendFailures_.load(std::memory_order_relaxed);
+    return stats;
 }
 
 int WsBroadcaster::Count() {
@@ -142,6 +159,7 @@ void WsBroadcaster::SendLoop() {
                     // 最新待发送帧继续尝试，且帧 id 单调递增避免迟到确认误释放新帧。
                     if (frameInFlight_) {
                         log::Warn("frame ack timed out, replacing in-flight frame");
+                        ackTimeouts_.fetch_add(1, std::memory_order_relaxed);
                         frameInFlight_ = false;
                         inFlightFrameId_ = 0;
                         inFlightSince_ = {};
@@ -164,7 +182,12 @@ void WsBroadcaster::SendLoop() {
                     client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
             }
         }
+        if (sent) {
+            sentFrames_.fetch_add(1, std::memory_order_relaxed);
+            sentBytes_.fetch_add(static_cast<uint64_t>(frame.size()), std::memory_order_relaxed);
+        }
         if (!sent) {
+            sendFailures_.fetch_add(1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> frameLock(frameMu_);
             if (frameInFlight_ && inFlightFrameId_ == frameId) {
                 frameInFlight_ = false;

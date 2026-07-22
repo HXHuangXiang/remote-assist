@@ -16,6 +16,17 @@
 
 namespace remote_assist {
 
+// 推流端累计计数。所有字段均可由采集线程无锁读取，用于写入 agent 诊断日志。
+struct BroadcasterStats {
+    uint64_t queuedFrames = 0;
+    uint64_t replacedFrames = 0;
+    uint64_t sentFrames = 0;
+    uint64_t sentBytes = 0;
+    uint64_t acknowledgedFrames = 0;
+    uint64_t ackTimeouts = 0;
+    uint64_t sendFailures = 0;
+};
+
 // 维护当前已通过鉴权的 WebSocket 连接,供 agent 编码线程广播 JPEG 帧或文本 JSON。
 class WsBroadcaster {
 public:
@@ -31,6 +42,7 @@ public:
     void BroadcastText(const std::string& msg);
     // 浏览器在帧真正绘制（或主动丢弃过期帧）后确认，服务端才会发下一帧。
     void AcknowledgeFrame(uint64_t frameId);
+    BroadcasterStats SnapshotStats() const;
     int Count();
     void Stop();
 
@@ -52,6 +64,14 @@ private:
     bool frameInFlight_ = false;
     bool stopping_ = false;
     std::thread senderThread_;
+
+    std::atomic<uint64_t> queuedFrames_{0};
+    std::atomic<uint64_t> replacedFrames_{0};
+    std::atomic<uint64_t> sentFrames_{0};
+    std::atomic<uint64_t> sentBytes_{0};
+    std::atomic<uint64_t> acknowledgedFrames_{0};
+    std::atomic<uint64_t> ackTimeouts_{0};
+    std::atomic<uint64_t> sendFailures_{0};
 };
 
 // HTTP + WebSocket 服务。HTTP 挂载 web/ 静态页面;WebSocket /ws 承载鉴权、配置下发与键鼠事件。

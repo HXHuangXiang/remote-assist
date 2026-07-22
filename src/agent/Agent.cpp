@@ -49,6 +49,26 @@ uint64_t FrameFingerprint(const std::vector<uint8_t>& frame) {
     return hash ^ static_cast<uint64_t>(frame.size());
 }
 
+// 采集线程私有统计，按窗口输出增量而非每帧打日志，既便于定位性能瓶颈又不会
+// 因日志 I/O 干扰远控体验。
+struct CaptureLoopStats {
+    uint64_t captureAttempts = 0;
+    uint64_t capturedFrames = 0;
+    uint64_t noChangeFrames = 0;
+    uint64_t captureFailures = 0;
+    uint64_t fingerprintSkipped = 0;
+    uint64_t encodeAttempts = 0;
+    uint64_t encodedFrames = 0;
+    uint64_t encodeFailures = 0;
+    uint64_t encodedBytes = 0;
+    uint64_t captureTimeMs = 0;
+    uint64_t encodeTimeMs = 0;
+};
+
+uint64_t CounterDelta(uint64_t current, uint64_t previous) {
+    return current >= previous ? current - previous : 0;
+}
+
 }  // namespace
 
 Agent::~Agent() {
@@ -186,9 +206,69 @@ void Agent::CaptureLoop() {
         log::Error("capture thread: capture init failed");
     }
     auto nextDesktopCheck = std::chrono::steady_clock::now();
+    auto metricsStartedAt = nextDesktopCheck;
+    auto nextMetricsLog = nextDesktopCheck + std::chrono::seconds(10);
+    CaptureLoopStats metrics;
+    BroadcasterStats broadcasterStatsBase = server_.Broadcaster().SnapshotStats();
+
+    auto logMetricsIfDue = [&](std::chrono::steady_clock::time_point now) {
+        if (now < nextMetricsLog) {
+            return;
+        }
+        const BroadcasterStats broadcasterStats = server_.Broadcaster().SnapshotStats();
+        const uint64_t queued = CounterDelta(broadcasterStats.queuedFrames,
+                                             broadcasterStatsBase.queuedFrames);
+        const uint64_t replaced = CounterDelta(broadcasterStats.replacedFrames,
+                                               broadcasterStatsBase.replacedFrames);
+        const uint64_t sent = CounterDelta(broadcasterStats.sentFrames,
+                                           broadcasterStatsBase.sentFrames);
+        const uint64_t sentBytes = CounterDelta(broadcasterStats.sentBytes,
+                                                broadcasterStatsBase.sentBytes);
+        const uint64_t acknowledged = CounterDelta(broadcasterStats.acknowledgedFrames,
+                                                   broadcasterStatsBase.acknowledgedFrames);
+        const uint64_t ackTimeouts = CounterDelta(broadcasterStats.ackTimeouts,
+                                                  broadcasterStatsBase.ackTimeouts);
+        const uint64_t sendFailures = CounterDelta(broadcasterStats.sendFailures,
+                                                   broadcasterStatsBase.sendFailures);
+        const bool active = metrics.captureAttempts != 0 || queued != 0 || sent != 0 ||
+            acknowledged != 0 || ackTimeouts != 0 || sendFailures != 0;
+        if (active) {
+            const auto elapsedMs = std::max<int64_t>(1,
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - metricsStartedAt).count());
+            const uint64_t avgCaptureMs = metrics.captureAttempts == 0 ? 0 :
+                metrics.captureTimeMs / metrics.captureAttempts;
+            const uint64_t avgEncodeMs = metrics.encodeAttempts == 0 ? 0 :
+                metrics.encodeTimeMs / metrics.encodeAttempts;
+            log::Info("stream metrics " + std::to_string(elapsedMs) + "ms clients=" +
+                      std::to_string(server_.Broadcaster().Count()) +
+                      " capture=" + std::to_string(metrics.capturedFrames) + "/" +
+                      std::to_string(metrics.captureAttempts) +
+                      " unchanged=" + std::to_string(metrics.noChangeFrames) +
+                      " sampled_skip=" + std::to_string(metrics.fingerprintSkipped) +
+                      " capture_fail=" + std::to_string(metrics.captureFailures) +
+                      " capture_avg_ms=" + std::to_string(avgCaptureMs) +
+                      " encode=" + std::to_string(metrics.encodedFrames) + "/" +
+                      std::to_string(metrics.encodeAttempts) +
+                      " encode_fail=" + std::to_string(metrics.encodeFailures) +
+                      " encode_avg_ms=" + std::to_string(avgEncodeMs) +
+                      " jpeg_kib=" + std::to_string(metrics.encodedBytes / 1024) +
+                      " queued=" + std::to_string(queued) +
+                      " replaced=" + std::to_string(replaced) +
+                      " sent=" + std::to_string(sent) +
+                      " sent_kib=" + std::to_string(sentBytes / 1024) +
+                      " ack=" + std::to_string(acknowledged) +
+                      " ack_timeout=" + std::to_string(ackTimeouts) +
+                      " send_fail=" + std::to_string(sendFailures));
+        }
+        metrics = {};
+        broadcasterStatsBase = broadcasterStats;
+        metricsStartedAt = now;
+        nextMetricsLog = now + std::chrono::seconds(10);
+    };
 
     while (!stop_.load()) {
         const auto t0 = std::chrono::steady_clock::now();
+        logMetricsIfDue(t0);
 
         // 大屏幕降低帧率,平衡编码时间和带宽
         int effectiveFps = cfg_.fps;
@@ -227,9 +307,15 @@ void Agent::CaptureLoop() {
         CapturedFrame frame;
         // DXGI 空闲时会阻塞等待桌面变化。等待一个目标帧周期即可在静态画面
         // 下避免轮询空转，同时不会再因固定 50ms 把 30FPS 限制为约 20FPS。
+        const auto captureStartedAt = std::chrono::steady_clock::now();
         const CaptureResult captureResult = capture_.CaptureFrame(
             frame, static_cast<DWORD>(std::max(1, targetMs)));
+        metrics.captureAttempts++;
+        metrics.captureTimeMs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - captureStartedAt).count());
         if (captureResult == CaptureResult::kNoChange) {
+            metrics.noChangeFrames++;
             const auto t1 = std::chrono::steady_clock::now();
             const auto used = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
             const int remain = targetMs - static_cast<int>(used);
@@ -239,6 +325,7 @@ void Agent::CaptureLoop() {
             continue;
         }
         if (captureResult == CaptureResult::kFailed) {
+            metrics.captureFailures++;
             static int failCount = 0;
             if (++failCount % 300 == 1) {  // 每 10s(30fps*300)打一次,避免刷屏
                 log::Warn("capture frame failed, count=" + std::to_string(failCount));
@@ -246,11 +333,13 @@ void Agent::CaptureLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
             continue;
         }
+        metrics.capturedFrames++;
 
         const uint64_t frameFingerprint = FrameFingerprint(frame.data);
         const bool refreshDue = lastFrameSent_.time_since_epoch().count() == 0 ||
             t0 - lastFrameSent_ >= std::chrono::seconds(1);
         if (!firstFrame_ && frameFingerprint == previousFrameFingerprint_ && !refreshDue) {
+            metrics.fingerprintSkipped++;
             std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
             continue;
         }
@@ -278,18 +367,28 @@ void Agent::CaptureLoop() {
 
         if (encoderReady_ && !frame.data.empty()) {
             std::vector<EncodedChunk> chunks;
-            if (encoder_->Encode(frame.data.data(), chunks)) {
+            const auto encodeStartedAt = std::chrono::steady_clock::now();
+            const bool encoded = encoder_->Encode(frame.data.data(), chunks);
+            metrics.encodeAttempts++;
+            metrics.encodeTimeMs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - encodeStartedAt).count());
+            if (encoded) {
                 bool sent = false;
                 for (auto& c : chunks) {
                     if (c.data.empty()) {
                         continue;
                     }
+                    metrics.encodedFrames++;
+                    metrics.encodedBytes += c.data.size();
                     server_.Broadcaster().BroadcastBinary(std::move(c.data), streamId_.load());
                     sent = true;
                 }
                 if (sent) {
                     lastFrameSent_ = std::chrono::steady_clock::now();
                 }
+            } else {
+                metrics.encodeFailures++;
             }
         }
 
