@@ -348,7 +348,9 @@ function normXY(e) {
 
 window.addEventListener('DOMContentLoaded', function() {
   canvas = document.getElementById('screen');
-  ctx = canvas.getContext('2d');
+  // desynchronized 是 Chromium 的低延迟呈现提示，可减少 VideoFrame/JPEG 绘制
+  // 等待合成器的机会；不支持时浏览器会忽略选项，后备上下文保证兼容性。
+  ctx = canvas.getContext('2d', { alpha:false, desynchronized:true }) || canvas.getContext('2d');
   logEl = document.getElementById('log');
   statusEl = document.getElementById('status');
   pwEl = document.getElementById('pw');

@@ -76,6 +76,70 @@ std::string AvcCodecString(uint32_t profile) {
     return codec;
 }
 
+bool ReadJsonBool(const nlohmann::json& object, const char* key, bool& value) {
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_boolean()) {
+        return false;
+    }
+    value = it->get<bool>();
+    return true;
+}
+
+bool ReadOptionalJsonBool(const nlohmann::json& object, const char* key, bool& value) {
+    const auto it = object.find(key);
+    if (it == object.end()) {
+        return true;
+    }
+    if (!it->is_boolean()) {
+        return false;
+    }
+    value = it->get<bool>();
+    return true;
+}
+
+bool ReadJsonIntInRange(const nlohmann::json& object, const char* key, int min,
+                        int max, int& value) {
+    const auto it = object.find(key);
+    if (it == object.end()) {
+        return false;
+    }
+    if (it->is_number_unsigned()) {
+        const uint64_t number = it->get<uint64_t>();
+        if (number > static_cast<uint64_t>(max)) {
+            return false;
+        }
+        value = static_cast<int>(number);
+        return value >= min;
+    }
+    if (!it->is_number_integer()) {
+        return false;
+    }
+    const int64_t number = it->get<int64_t>();
+    if (number < min || number > max) {
+        return false;
+    }
+    value = static_cast<int>(number);
+    return true;
+}
+
+bool ReadJsonFiniteNumber(const nlohmann::json& object, const char* key, double& value) {
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_number()) {
+        return false;
+    }
+    value = it->get<double>();
+    return std::isfinite(value);
+}
+
+bool ReadJsonString(const nlohmann::json& object, const char* key, std::string& value) {
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_string()) {
+        return false;
+    }
+    value = it->get<std::string>();
+    return true;
+}
+
 }  // namespace
 
 Agent::~Agent() {
@@ -255,8 +319,10 @@ void Agent::CaptureLoop() {
                                                   broadcasterStatsBase.ackTimeouts);
         const uint64_t sendFailures = CounterDelta(broadcasterStats.sendFailures,
                                                    broadcasterStatsBase.sendFailures);
+        const uint64_t h264Resyncs = CounterDelta(broadcasterStats.h264Resyncs,
+                                                  broadcasterStatsBase.h264Resyncs);
         const bool active = metrics.captureAttempts != 0 || queued != 0 || sent != 0 ||
-            acknowledged != 0 || ackTimeouts != 0 || sendFailures != 0;
+            acknowledged != 0 || ackTimeouts != 0 || sendFailures != 0 || h264Resyncs != 0;
         if (active) {
             const auto elapsedMs = std::max<int64_t>(1,
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - metricsStartedAt).count());
@@ -283,7 +349,8 @@ void Agent::CaptureLoop() {
                       " sent_kib=" + std::to_string(sentBytes / 1024) +
                       " ack=" + std::to_string(acknowledged) +
                       " ack_timeout=" + std::to_string(ackTimeouts) +
-                      " send_fail=" + std::to_string(sendFailures));
+                      " send_fail=" + std::to_string(sendFailures) +
+                      " h264_resync=" + std::to_string(h264Resyncs));
         }
         metrics = {};
         broadcasterStatsBase = broadcasterStats;
@@ -448,9 +515,23 @@ void Agent::CaptureLoop() {
                     }
                     metrics.encodedFrames++;
                     metrics.encodedBytes += c.data.size();
-                    server_.Broadcaster().BroadcastBinary(std::move(c.data), streamId_.load(),
-                                                          c.isKey, c.timestampUs);
-                    sent = true;
+                    const bool h264 = encoder_->IsH264();
+                    const FrameQueueResult queueResult =
+                        server_.Broadcaster().BroadcastBinary(std::move(c.data), streamId_.load(),
+                                                              c.isKey, c.timestampUs, h264);
+                    if (queueResult == FrameQueueResult::kH264ResyncRequired) {
+                        // 待发送 delta 已无法与下一帧构成连续 GOP；必须从新的
+                        // IDR 恢复，不能沿用 JPEG 的“最新帧覆盖”策略。
+                        streamKeyFrameRequired_ = true;
+                        encoder_->RequestKeyFrame();
+                        log::Warn("H.264 pending delta dropped, requesting IDR resync");
+                        // 本轮若此前仅入队了待发送帧，它已经被清空，不能把它
+                        // 计作已输出的新画面。
+                        sent = false;
+                        break;
+                    }
+                    sent = queueResult == FrameQueueResult::kQueued ||
+                        queueResult == FrameQueueResult::kReplaced;
                 }
                 if (sent) {
                     lastFrameSent_ = std::chrono::steady_clock::now();
@@ -492,6 +573,34 @@ std::string Agent::MakeCfgJson() const {
 }
 
 void Agent::OnMessage(const std::string& msg) {
+    const auto j = nlohmann::json::parse(msg, nullptr, false);
+    if (!j.is_object()) {
+        return;
+    }
+    std::string t;
+    if (!ReadJsonString(j, "t", t)) {
+        return;
+    }
+
+    if (t == "keyframe") {
+        // 浏览器在 WebCodecs 状态丢失后请求从独立可解码的 IDR 重新开始。
+        frameResetRequested_.store(true);
+        return;
+    }
+    if (t == "monitor") {
+        int index = -1;
+        if (!ReadJsonIntInRange(j, "index", -1, 1024, index)) {
+            return;
+        }
+        capture_.SetMonitor(index);
+        frameResetRequested_.store(true);
+        log::Info("monitor switched to idx=" + std::to_string(capture_.SelectedMonitor()));
+        return;
+    }
+    if (t != "key" && t != "mouse" && t != "move" && t != "wheel") {
+        return;
+    }
+
     // WebSocket 回调在线程池工作线程中执行。每个线程独立绑定当前输入桌面，
     // 避免把采集线程的 desktop handle 跨线程复用。
     thread_local DesktopAccess inputDesktop;
@@ -507,51 +616,49 @@ void Agent::OnMessage(const std::string& msg) {
         inputDesktop.CheckRebind();
     }
 
-    auto j = nlohmann::json::parse(msg, nullptr, false);
-    if (!j.is_object()) {
-        return;
-    }
-    const std::string t = j.value("t", std::string());
     if (t == "key") {
-        const int scanCode = j.value("sc", 0);
-        if (scanCode <= 0 || scanCode > 0x7F) {
+        int scanCode = 0;
+        bool down = false;
+        bool extended = false;
+        if (!ReadJsonIntInRange(j, "sc", 1, 0x7F, scanCode) ||
+            !ReadJsonBool(j, "down", down) ||
+            !ReadOptionalJsonBool(j, "ext", extended)) {
             return;
         }
-        const USHORT sc = static_cast<USHORT>(scanCode);
-        const bool down = j.value("down", false);
-        const bool extended = j.value("ext", false);
-        Input::SendKey(sc, down, extended);
+        Input::SendKey(static_cast<USHORT>(scanCode), down, extended);
     } else if (t == "mouse") {
-        const double x = j.value("x", 0.0);
-        const double y = j.value("y", 0.0);
-        const std::string btn = j.value("btn", std::string());
-        const bool down = j.value("down", false);
+        double x = 0.0;
+        double y = 0.0;
+        std::string button;
+        bool down = false;
+        if (!ReadJsonFiniteNumber(j, "x", x) || !ReadJsonFiniteNumber(j, "y", y) ||
+            !ReadJsonString(j, "btn", button) || !ReadJsonBool(j, "down", down)) {
+            return;
+        }
         double virtualX = 0.0;
         double virtualY = 0.0;
         if (!capture_.MapNormalizedToVirtual(x, y, virtualX, virtualY)) {
             return;
         }
         Input::SendMouseAbs(virtualX, virtualY);
-        Input::SendMouseButton(btn, down);
+        Input::SendMouseButton(button, down);
     } else if (t == "move") {
-        const double x = j.value("x", 0.0);
-        const double y = j.value("y", 0.0);
+        double x = 0.0;
+        double y = 0.0;
+        if (!ReadJsonFiniteNumber(j, "x", x) || !ReadJsonFiniteNumber(j, "y", y)) {
+            return;
+        }
         double virtualX = 0.0;
         double virtualY = 0.0;
         if (capture_.MapNormalizedToVirtual(x, y, virtualX, virtualY)) {
             Input::SendMouseAbs(virtualX, virtualY);
         }
     } else if (t == "wheel") {
-        const int delta = std::clamp(j.value("delta", 0), -1200, 1200);
+        int delta = 0;
+        if (!ReadJsonIntInRange(j, "delta", -1200, 1200, delta)) {
+            return;
+        }
         Input::SendWheel(delta);
-    } else if (t == "keyframe") {
-        // 浏览器在 WebCodecs 状态丢失后请求从独立可解码的 IDR 重新开始。
-        frameResetRequested_.store(true);
-    } else if (t == "monitor") {
-        const int idx = j.value("index", -1);
-        capture_.SetMonitor(idx);
-        frameResetRequested_.store(true);
-        log::Info("monitor switched to idx=" + std::to_string(capture_.SelectedMonitor()));
     }
 }
 

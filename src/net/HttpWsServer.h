@@ -25,6 +25,18 @@ struct BroadcasterStats {
     uint64_t acknowledgedFrames = 0;
     uint64_t ackTimeouts = 0;
     uint64_t sendFailures = 0;
+    // H.264 的增量帧不能跳帧。此计数表示发送队列检测到将要覆盖增量帧，
+    // 因而主动丢弃并要求 Agent 从下一张 IDR 重新开始的次数。
+    uint64_t h264Resyncs = 0;
+};
+
+// 发送队列的入队结果。JPEG 可以安全地以最新帧覆盖旧帧；H.264 一旦覆盖
+// 未发送的增量帧，后续 P/B 帧就可能失去参考帧，必须等下一张 IDR。
+enum class FrameQueueResult {
+    kQueued,
+    kReplaced,
+    kH264ResyncRequired,
+    kStopped,
 };
 
 // 维护当前已通过鉴权的 WebSocket 连接,供 agent 编码线程广播 JPEG 帧或文本 JSON。
@@ -36,10 +48,11 @@ public:
     // 仅允许一个控制端连接。返回 false 表示已有连接。
     bool Add(httplib::ws::WebSocket* ws);
     void Remove(httplib::ws::WebSocket* ws);
-    // 取得编码器生成的帧所有权，只保留最新一帧。streamId 与配置消息对应，
-    // 用于浏览器在分辨率/编码器切换时丢弃过期图像。
-    void BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId,
-                         bool isKeyFrame, uint64_t timestampUs);
+    // 取得编码器生成的帧所有权。JPEG 只保留最新一帧；H.264 不能跳过中间
+    // 增量帧，若队列已满则清空待发送帧并要求调用方强制下一张 IDR。
+    // streamId 与配置消息对应，用于浏览器丢弃过期图像。
+    FrameQueueResult BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId,
+                                     bool isKeyFrame, uint64_t timestampUs, bool h264);
     void BroadcastText(const std::string& msg);
     // 浏览器在帧真正绘制（或主动丢弃过期帧）后确认，服务端才会发下一帧。
     void AcknowledgeFrame(uint64_t frameId);
@@ -75,6 +88,7 @@ private:
     std::atomic<uint64_t> acknowledgedFrames_{0};
     std::atomic<uint64_t> ackTimeouts_{0};
     std::atomic<uint64_t> sendFailures_{0};
+    std::atomic<uint64_t> h264Resyncs_{0};
 };
 
 // HTTP + WebSocket 服务。HTTP 挂载 web/ 静态页面;WebSocket /ws 承载鉴权、配置下发与键鼠事件。

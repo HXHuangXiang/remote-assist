@@ -15,6 +15,39 @@ namespace {
 // 写成功无法说明用户已经看到新画面；超时兜底避免旧浏览器或异常连接永久停流。
 constexpr auto kFrameAckTimeout = std::chrono::seconds(1);
 
+// WebSocket handler 可能因为第三方回调、内存分配等异常提前离开。连接一旦已
+// 注册到 broadcaster，就必须在所有退出路径移除，避免发送线程持有悬空指针。
+class ControllerSessionGuard {
+public:
+    ControllerSessionGuard(WsBroadcaster& broadcaster, httplib::ws::WebSocket& ws,
+                           std::function<void()> onDisconnected)
+        : broadcaster_(broadcaster), ws_(ws), onDisconnected_(std::move(onDisconnected)) {}
+
+    void Arm() { armed_ = true; }
+
+    ~ControllerSessionGuard() {
+        if (!armed_) {
+            return;
+        }
+        broadcaster_.Remove(&ws_);
+        try {
+            if (onDisconnected_) {
+                onDisconnected_();
+            }
+        } catch (...) {
+            // 析构函数绝不能因业务回调异常终止 WebSocket 工作线程。
+            log::Error("controller disconnect callback threw an exception");
+        }
+        log::Info("ws client disconnected");
+    }
+
+private:
+    WsBroadcaster& broadcaster_;
+    httplib::ws::WebSocket& ws_;
+    std::function<void()> onDisconnected_;
+    bool armed_ = false;
+};
+
 }  // namespace
 
 WsBroadcaster::WsBroadcaster()
@@ -56,15 +89,30 @@ void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
     }
 }
 
-void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId,
-                                    bool isKeyFrame, uint64_t timestampUs) {
+FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
+                                                uint64_t streamId, bool isKeyFrame,
+                                                uint64_t timestampUs, bool h264) {
+    bool replaced = false;
     {
         std::lock_guard<std::mutex> lk(frameMu_);
         if (stopping_) {
-            return;
+            return FrameQueueResult::kStopped;
         }
         if (!pendingFrame_.empty()) {
+            // JPEG 帧没有前后依赖，直接替换可把延迟保持在一帧以内。H.264
+            // delta 帧则会引用被替换的上一帧，若仍把最新 delta 发给浏览器会
+            // 触发解码失败/黑屏。此时清空待发送帧，并让 Agent 请求新的 IDR。
+            if (h264 && !isKeyFrame) {
+                pendingFrame_.clear();
+                pendingStreamId_ = 0;
+                pendingTimestampUs_ = 0;
+                pendingKeyFrame_ = true;
+                replacedFrames_.fetch_add(1, std::memory_order_relaxed);
+                h264Resyncs_.fetch_add(1, std::memory_order_relaxed);
+                return FrameQueueResult::kH264ResyncRequired;
+            }
             replacedFrames_.fetch_add(1, std::memory_order_relaxed);
+            replaced = true;
         }
         pendingFrame_ = std::move(frame);
         pendingStreamId_ = streamId;
@@ -73,6 +121,7 @@ void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamI
         queuedFrames_.fetch_add(1, std::memory_order_relaxed);
     }
     frameCv_.notify_one();
+    return replaced ? FrameQueueResult::kReplaced : FrameQueueResult::kQueued;
 }
 
 void WsBroadcaster::BroadcastText(const std::string& msg) {
@@ -105,6 +154,7 @@ BroadcasterStats WsBroadcaster::SnapshotStats() const {
     stats.acknowledgedFrames = acknowledgedFrames_.load(std::memory_order_relaxed);
     stats.ackTimeouts = ackTimeouts_.load(std::memory_order_relaxed);
     stats.sendFailures = sendFailures_.load(std::memory_order_relaxed);
+    stats.h264Resyncs = h264Resyncs_.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -299,6 +349,8 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "controller already connected");
             return;
         }
+        ControllerSessionGuard controllerGuard(broadcaster_, ws, onControllerDisconnected_);
+        controllerGuard.Arm();
         log::Info("ws client connected, total=" + std::to_string(broadcaster_.Count()));
 
         // 输入消息循环:浏览器回传的键鼠事件 JSON 在此转交 agent 处理。
@@ -322,14 +374,16 @@ bool HttpWsServer::Start(const std::string& host, int port) {
                 }
             }
             if (onMessage_) {
-                onMessage_(m);
+                try {
+                    onMessage_(m);
+                } catch (const std::exception& e) {
+                    // 单个损坏输入报文不能让 handler 跳过 broadcaster_.Remove。
+                    log::Warn(std::string("ws input callback rejected message: ") + e.what());
+                } catch (...) {
+                    log::Warn("ws input callback rejected message with unknown exception");
+                }
             }
         }
-        broadcaster_.Remove(&ws);
-        if (onControllerDisconnected_) {
-            onControllerDisconnected_();
-        }
-        log::Info("ws client disconnected");
     });
 
     if (!svr_.bind_to_port(host, port)) {
