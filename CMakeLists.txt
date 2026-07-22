@@ -35,6 +35,7 @@ include_directories(
 
 set(SOURCES
     src/main.cpp
+    src/RemoteAssist.rc
     src/common/Config.cpp
     src/common/Log.cpp
     src/common/Path.cpp

@@ -10,6 +10,29 @@
 
 namespace {
 
+// 采集获得的是物理像素，鼠标绝对定位也基于物理虚拟桌面。进程若保持 DPI
+// unaware，GetSystemMetrics/GetMonitorInfo 的逻辑坐标会在混合缩放显示器上与
+// DXGI 输出脱节，造成单屏选择、鼠标点击和远端指针位置偏移。资源清单已经
+// 声明 Per-Monitor V2；此处再在任何窗口/桌面对象创建前动态调用，兼容直接
+// 运行、服务拉起和旧安装包缺失资源的情形。
+void EnablePerMonitorDpiAwareness() {
+    using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const auto setContext = user32
+        ? reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext"))
+        : nullptr;
+    if (setContext) {
+        // 已由 manifest 设置时 API 会返回 ERROR_ACCESS_DENIED，不能再降级成
+        // system-aware；Windows 10+ 的 manifest 结果就是此进程的最终 DPI 模式。
+        setContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        return;
+    }
+    // 项目最低系统为 Windows 10，正常不会走到这里；保留旧 API 仅供精简/异常
+    // user32 环境兜底，至少避免完全 DPI unaware 的坐标虚拟化。
+    SetProcessDPIAware();
+}
+
 bool HasArg(int argc, wchar_t* const* argv, const wchar_t* target) {
     for (int index = 1; index < argc; ++index) {
         if (_wcsicmp(argv[index], target) == 0) {
@@ -22,6 +45,7 @@ bool HasArg(int argc, wchar_t* const* argv, const wchar_t* target) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    EnablePerMonitorDpiAwareness();
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) {
