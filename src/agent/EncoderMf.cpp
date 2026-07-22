@@ -226,6 +226,25 @@ void EncoderMf::RequestKeyFrame() {
     }
 }
 
+bool EncoderMf::UpdateBitrate(int bitrateBps) {
+    const int requestedBitrate = std::max(100'000, bitrateBps);
+    if (!configured_ || mode_ != EncoderMode::kH264 || !codecApi_.Get()) {
+        return false;
+    }
+    if (requestedBitrate == bitrateBps_) {
+        return true;
+    }
+    const HRESULT hr = SetCodecUInt32(codecApi_.Get(), CODECAPI_AVEncCommonMeanBitRate,
+                                      static_cast<ULONG>(requestedBitrate));
+    if (FAILED(hr)) {
+        log::Warn("H.264 dynamic bitrate update failed hr=" + std::to_string(hr));
+        return false;
+    }
+    bitrateBps_ = requestedBitrate;
+    log::Info("H.264 target bitrate updated: " + std::to_string(bitrateBps_));
+    return true;
+}
+
 bool EncoderMf::InitH264() {
     const HRESULT startup = MFStartup(MF_VERSION);
     if (FAILED(startup)) {

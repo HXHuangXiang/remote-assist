@@ -42,6 +42,9 @@ public:
     // 由采集线程在新控制端、切屏或解码恢复后调用。请求会保持到编码器实际输出
     // IDR 为止，避免把无法独立解码的增量帧作为新流首帧发送。
     void RequestKeyFrame();
+    // 在支持 ICodecAPI 的 H.264 MFT 上动态调整目标码率。硬件驱动若仅支持初始化
+    // 时设置会返回 false，调用方应安全退回到仅调整采集 FPS。
+    bool UpdateBitrate(int bitrateBps);
     // H.264 SPS 的 profile_idc/profile_compatibility/level_idc，格式为 0xPPCCLL。
     // 仅由采集线程读取；跨线程下发配置时应由 Agent 保存其副本。
     uint32_t H264CodecProfile() const { return h264CodecProfile_; }

@@ -319,6 +319,8 @@ void Agent::CaptureLoop() {
     BroadcasterStats broadcasterStatsBase = server_.Broadcaster().SnapshotStats();
     BroadcasterStats adaptationStatsBase = broadcasterStatsBase;
     int adaptiveFps = cfg_.fps;
+    int adaptiveBitrate = cfg_.bitrate;
+    bool adaptiveBitrateAvailable = true;
     // 采集结果在相邻帧间复用容量。1920x1080 的 BGRA 帧约 8MB，若每轮都创建
     // 局部 CapturedFrame 会触发持续的大块堆分配和释放，直接放大卡顿。
     CapturedFrame frame;
@@ -381,7 +383,8 @@ void Agent::CaptureLoop() {
                       " ack_timeout=" + std::to_string(ackTimeouts) +
                       " send_fail=" + std::to_string(sendFailures) +
                       " h264_resync=" + std::to_string(h264Resyncs) +
-                      " stream_fps=" + std::to_string(adaptiveFps));
+                      " stream_fps=" + std::to_string(adaptiveFps) +
+                      " stream_bitrate=" + std::to_string(adaptiveBitrate));
         }
         metrics = {};
         broadcasterStatsBase = broadcasterStats;
@@ -413,12 +416,18 @@ void Agent::CaptureLoop() {
         const bool healthy = ackSamples >= 4 && averageAckMs <= 65 && ackTimeouts == 0 &&
             h264Resyncs == 0 && sendFailures == 0;
         int nextFps = adaptiveFps;
+        int nextBitrate = adaptiveBitrate;
+        const int minimumBitrate = std::min(cfg_.bitrate,
+            std::max(100'000, cfg_.bitrate / 8));
         if (congested) {
             // 乘法退避能在高延迟 Wi-Fi 下更快逃离“P 帧挤压 -> IDR”的循环。
             nextFps = std::max(5, adaptiveFps * 3 / 4);
+            nextBitrate = std::max(minimumBitrate, adaptiveBitrate * 3 / 4);
         } else if (healthy) {
             // 恢复阶段使用小步上调，避免刚恢复就再次压垮解码/网络窗口。
             nextFps = std::min(cfg_.fps, adaptiveFps + 2);
+            nextBitrate = std::min(cfg_.bitrate,
+                adaptiveBitrate + std::max(100'000, cfg_.bitrate / 20));
         }
         if (nextFps != adaptiveFps) {
             log::Info("adaptive stream fps " + std::to_string(adaptiveFps) + " -> " +
@@ -428,6 +437,17 @@ void Agent::CaptureLoop() {
                       std::to_string(h264Resyncs));
             adaptiveFps = nextFps;
             streamFps_.store(adaptiveFps);
+        }
+        if (nextBitrate != adaptiveBitrate && adaptiveBitrateAvailable && encoder_ &&
+            encoder_->IsH264()) {
+            if (encoder_->UpdateBitrate(nextBitrate)) {
+                adaptiveBitrate = nextBitrate;
+            } else {
+                // 部分 MFT 只能在 SetOutputType 前写入码率。只记录一次，后续仍由
+                // FPS 自适应保持低延迟，避免每秒重复失败和刷日志。
+                adaptiveBitrateAvailable = false;
+                log::Info("H.264 MFT does not support dynamic bitrate; using FPS adaptation only");
+            }
         }
         adaptationStatsBase = stats;
         nextAdaptation = now + std::chrono::seconds(1);
@@ -535,7 +555,7 @@ void Agent::CaptureLoop() {
             deskHeight_.store(frame.height);
             encoderReady_ = false;
             encoder_ = std::make_unique<EncoderMf>();
-            if (!encoder_->Init(frame.width, frame.height, cfg_.fps, cfg_.bitrate)) {
+            if (!encoder_->Init(frame.width, frame.height, cfg_.fps, adaptiveBitrate)) {
                 log::Error("encoder init failed for " + std::to_string(frame.width) +
                            "x" + std::to_string(frame.height));
                 encoder_.reset();
