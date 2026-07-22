@@ -6,6 +6,7 @@
 #include <wmcodecdsp.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -28,6 +29,40 @@ uint8_t ClampToByte(int value) {
     return static_cast<uint8_t>(std::clamp(value, 0, 255));
 }
 
+// BGRA -> NV12 使用固定 BT.601 系数。屏幕编码每秒要处理数百万像素，预先展开
+// 常量乘法能把热循环中的 18 次乘法替换为 L1 缓存内的小查表，同时保持原有的
+// 整数舍入公式和颜色结果完全一致。
+struct BgraToNv12Tables {
+    std::array<int, 256> yR{};
+    std::array<int, 256> yG{};
+    std::array<int, 256> yB{};
+    std::array<int, 256> uR{};
+    std::array<int, 256> uG{};
+    std::array<int, 256> uB{};
+    std::array<int, 256> vR{};
+    std::array<int, 256> vG{};
+    std::array<int, 256> vB{};
+
+    BgraToNv12Tables() {
+        for (int value = 0; value <= 255; ++value) {
+            yR[value] = 66 * value;
+            yG[value] = 129 * value;
+            yB[value] = 25 * value;
+            uR[value] = -38 * value;
+            uG[value] = -74 * value;
+            uB[value] = 112 * value;
+            vR[value] = 112 * value;
+            vG[value] = -94 * value;
+            vB[value] = -18 * value;
+        }
+    }
+};
+
+const BgraToNv12Tables& BgraToNv12Lookup() {
+    static const BgraToNv12Tables tables;
+    return tables;
+}
+
 bool HasAnnexBStartCode(const uint8_t* data, size_t len) {
     return len >= 4 && data[0] == 0 && data[1] == 0 &&
         ((data[2] == 0 && data[3] == 1) || data[2] == 1);
@@ -41,6 +76,19 @@ HRESULT SetCodecUInt32(ICodecAPI* codecApi, const GUID& key, ULONG value) {
     VariantInit(&v);
     v.vt = VT_UI4;
     v.ulVal = value;
+    const HRESULT hr = codecApi->SetValue(&key, &v);
+    VariantClear(&v);
+    return hr;
+}
+
+HRESULT SetCodecBool(ICodecAPI* codecApi, const GUID& key, bool value) {
+    if (!codecApi) {
+        return E_NOINTERFACE;
+    }
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_BOOL;
+    v.boolVal = value ? VARIANT_TRUE : VARIANT_FALSE;
     const HRESULT hr = codecApi->SetValue(&key, &v);
     VariantClear(&v);
     return hr;
@@ -264,6 +312,26 @@ bool EncoderMf::ConfigureH264Transform() {
     if (codecApi_.Get() && FAILED(bitrateResult)) {
         log::Warn("H.264 MFT ignored requested bitrate hr=" + std::to_string(bitrateResult));
     }
+    if (codecApi_.Get()) {
+        // 远控不需要离线编码常见的 B 帧重排序/长缓冲。不同厂商的 MFT 支持集合
+        // 不同，因此属性拒绝只记日志，仍由媒体类型和浏览器 ACK 节流兜底。
+        const HRESULT cbrResult = SetCodecUInt32(codecApi_.Get(),
+            CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+        if (FAILED(cbrResult)) {
+            log::Info("H.264 MFT ignored CBR mode hr=" + std::to_string(cbrResult));
+        }
+        const HRESULT lowLatencyResult = SetCodecBool(codecApi_.Get(),
+            CODECAPI_AVEncCommonLowLatency, true);
+        if (FAILED(lowLatencyResult)) {
+            log::Info("H.264 MFT ignored low-latency mode hr=" +
+                      std::to_string(lowLatencyResult));
+        }
+        const HRESULT bFrameResult = SetCodecUInt32(codecApi_.Get(),
+            CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+        if (FAILED(bFrameResult)) {
+            log::Info("H.264 MFT ignored B-frame count hr=" + std::to_string(bFrameResult));
+        }
+    }
 
     Microsoft::WRL::ComPtr<IMFMediaType> inputType;
     HRESULT hr = MFCreateMediaType(&inputType);
@@ -329,8 +397,10 @@ bool EncoderMf::ForceH264KeyFrame() {
 void EncoderMf::ConvertBgraToNv12(const uint8_t* bgra, uint8_t* nv12) const {
     uint8_t* yPlane = nv12;
     uint8_t* uvPlane = nv12 + static_cast<size_t>(width_) * height_;
-    const auto toY = [](const uint8_t* pixel) {
-        return ClampToByte(((66 * pixel[2] + 129 * pixel[1] + 25 * pixel[0] + 128) >> 8) + 16);
+    const BgraToNv12Tables& tables = BgraToNv12Lookup();
+    const auto toY = [&tables](const uint8_t* pixel) {
+        return ClampToByte(((tables.yR[pixel[2]] + tables.yG[pixel[1]] +
+                             tables.yB[pixel[0]] + 128) >> 8) + 16);
     };
 
     // NV12 每个 UV 样本覆盖 2x2 个 BGRA 像素。原实现先遍历一次整帧生成 Y，
@@ -355,8 +425,10 @@ void EncoderMf::ConvertBgraToNv12(const uint8_t* bgra, uint8_t* nv12) const {
             const int b = (p00[0] + p01[0] + p10[0] + p11[0]) / 4;
             const int g = (p00[1] + p01[1] + p10[1] + p11[1]) / 4;
             const int r = (p00[2] + p01[2] + p10[2] + p11[2]) / 4;
-            uvRow[x] = ClampToByte(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-            uvRow[x + 1] = ClampToByte(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+            uvRow[x] = ClampToByte(((tables.uR[r] + tables.uG[g] + tables.uB[b] + 128) >> 8) +
+                                   128);
+            uvRow[x + 1] = ClampToByte(
+                ((tables.vR[r] + tables.vG[g] + tables.vB[b] + 128) >> 8) + 128);
         }
     }
 }

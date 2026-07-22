@@ -442,8 +442,12 @@ void Agent::CaptureLoop() {
         // 承担，不应仅因分辨率达到 1080p 就被无条件锁在 15 FPS，否则既浪费
         // 硬件能力，也会让编码器的 30 FPS 时间戳和实际采集节奏不一致。
         int effectiveFps = adaptiveFps;
-        if ((!encoder_ || !encoder_->IsH264()) &&
-            (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080)) {
+        if (capture_.IsUsingGdi()) {
+            // BitBlt 即使画面未变也需要整帧复制到 DIB；锁屏和“全部屏幕”路径
+            // 优先保持低延迟与输入响应，15 FPS 已足够避免远端界面出现明显跳变。
+            effectiveFps = std::min(effectiveFps, 15);
+        } else if ((!encoder_ || !encoder_->IsH264()) &&
+                   (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080)) {
             effectiveFps = std::min(effectiveFps, 15);
         }
         const int targetMs = 1000 / std::max(1, effectiveFps);
