@@ -11,7 +11,8 @@
 
     RemoteAssist.exe --agent   (由 winlogon token 启动,绑定当前 input desktop)
       |- DesktopAccess: 每个工作线程独立 OpenInputDesktop + SetThreadDesktop，每秒检查桌面切换
-      |- Capture: DXGI Desktop Duplication(普通桌面)/ GDI BitBlt(锁屏回退、静态首帧兜底，限 15 FPS)
+      |- Capture: DXGI Desktop Duplication（单屏；同 adapter 多屏 GPU 合成）/
+      |           GDI BitBlt（锁屏、跨 adapter/旋转多屏回退、静态首帧兜底，限 15 FPS）
       |- EncoderMf: Media Foundation H.264 MFT（硬件优先）编码；不可用时回退 WIC JPEG
       |- HttpWsServer: cpp-httplib 托管 web/ + /ws
       \- Input: SendInput 注入键鼠(锁屏桌面用 scancode 路径)

@@ -89,6 +89,13 @@ void Capture::ReleaseAll() {
         stagingMapped_ = false;
     }
     staging_.Reset();
+    compositeRtv_.Reset();
+    composite_.Reset();
+    dxgiOutputs_.clear();
+    dxgiComposite_ = false;
+    compositeNeedsGdiFrame_ = false;
+    compositeWidth_ = 0;
+    compositeHeight_ = 0;
     videoProcessor_.Reset();
     videoProcessorEnumerator_.Reset();
     videoContext_.Reset();
@@ -365,10 +372,10 @@ bool Capture::InitDXGI() {
     if (selectedMonitor < -1 || selectedMonitor >= static_cast<int>(monitors.size())) {
         return false;
     }
-    // “全部屏幕”在多适配器/多输出时仍需合成，保留 GDI 回退；但选择单屏时
-    // 直接绑定该输出的 DXGI Desktop Duplication，不再因为机器有多屏而退化。
+    // “全部屏幕”在同一 adapter 的多输出机器上由 GPU 合成；跨 adapter、旋转屏
+    // 或无法完整枚举的拓扑继续回退 GDI。选择单屏则直接绑定该输出。
     if (selectedMonitor == -1 && monitors.size() > 1) {
-        return false;
+        return InitDXGIComposite(monitors);
     }
 
     std::wstring targetDevice;
@@ -446,21 +453,168 @@ bool Capture::InitDXGI() {
     return false;
 }
 
+bool Capture::InitDXGIComposite(const std::vector<MonitorInfo>& monitors) {
+    if (monitors.size() < 2) {
+        return false;
+    }
+    const int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (virtualWidth <= 0 || virtualHeight <= 0) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> selectedAdapter;
+    std::vector<DxgiOutputCapture> selectedOutputs;
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        const HRESULT adapterResult = factory->EnumAdapters1(adapterIndex, &adapter);
+        if (adapterResult == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (FAILED(adapterResult)) {
+            continue;
+        }
+
+        std::vector<DxgiOutputCapture> outputs;
+        bool unsupportedRotation = false;
+        for (UINT outputIndex = 0;; ++outputIndex) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> baseOutput;
+            const HRESULT outputResult = adapter->EnumOutputs(outputIndex, &baseOutput);
+            if (outputResult == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            if (FAILED(outputResult)) {
+                continue;
+            }
+            DXGI_OUTPUT_DESC desc{};
+            if (FAILED(baseOutput->GetDesc(&desc))) {
+                continue;
+            }
+            const auto monitor = std::find_if(monitors.begin(), monitors.end(),
+                [&desc](const MonitorInfo& info) {
+                    const std::wstring name(info.name.begin(), info.name.end());
+                    return _wcsicmp(desc.DeviceName, name.c_str()) == 0;
+                });
+            if (monitor == monitors.end()) {
+                continue;
+            }
+            // Desktop Duplication 在旋转输出上会返回未旋转的 surface；直接 copy
+            // 到虚拟坐标会错位，保留 GDI 路径直至实现 GPU 旋转合成。
+            if (desc.Rotation != DXGI_MODE_ROTATION_IDENTITY) {
+                unsupportedRotation = true;
+                break;
+            }
+            Microsoft::WRL::ComPtr<IDXGIOutput1> output;
+            if (FAILED(baseOutput.As(&output))) {
+                unsupportedRotation = true;
+                break;
+            }
+            DxgiOutputCapture state;
+            state.output = std::move(output);
+            state.x = monitor->x;
+            state.y = monitor->y;
+            state.width = monitor->w;
+            state.height = monitor->h;
+            outputs.push_back(std::move(state));
+        }
+        if (!unsupportedRotation && outputs.size() == monitors.size()) {
+            selectedAdapter = std::move(adapter);
+            selectedOutputs = std::move(outputs);
+            break;
+        }
+    }
+    if (!selectedAdapter.Get()) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+    std::vector<DxgiOutputCapture> outputs;
+    auto createDeviceAndDuplications = [&](UINT flags) {
+        device.Reset();
+        context.Reset();
+        outputs.clear();
+        D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+        if (FAILED(D3D11CreateDevice(selectedAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                     flags, nullptr, 0, D3D11_SDK_VERSION, &device,
+                                     &featureLevel, &context))) {
+            return false;
+        }
+        outputs = selectedOutputs;
+        for (auto& output : outputs) {
+            if (FAILED(output.output->DuplicateOutput(device.Get(), &output.duplication))) {
+                outputs.clear();
+                context.Reset();
+                device.Reset();
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!createDeviceAndDuplications(D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                                     D3D11_CREATE_DEVICE_VIDEO_SUPPORT) &&
+        !createDeviceAndDuplications(D3D11_CREATE_DEVICE_BGRA_SUPPORT)) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC compositeDesc{};
+    compositeDesc.Width = static_cast<UINT>(virtualWidth);
+    compositeDesc.Height = static_cast<UINT>(virtualHeight);
+    compositeDesc.MipLevels = 1;
+    compositeDesc.ArraySize = 1;
+    compositeDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    compositeDesc.SampleDesc.Count = 1;
+    compositeDesc.Usage = D3D11_USAGE_DEFAULT;
+    compositeDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> composite;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> compositeRtv;
+    if (FAILED(device->CreateTexture2D(&compositeDesc, nullptr, &composite)) ||
+        FAILED(device->CreateRenderTargetView(composite.Get(), nullptr, &compositeRtv))) {
+        return false;
+    }
+
+    d3d_ = std::move(device);
+    ctx_ = std::move(context);
+    dxgiOutputs_ = std::move(outputs);
+    composite_ = std::move(composite);
+    compositeRtv_ = std::move(compositeRtv);
+    compositeWidth_ = virtualWidth;
+    compositeHeight_ = virtualHeight;
+    dxgiComposite_ = true;
+    ++deviceGeneration_;
+    log::Info("capture: DXGI multi-output composite ready for " +
+              std::to_string(dxgiOutputs_.size()) + " monitor(s)");
+    return true;
+}
+
 CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs, bool requireFreshFrame) {
     // 采集线程串行使用同一个 staging texture。即使调用方因编码异常遗漏释放，也不
     // 能让下一次 Map 保持旧映射；正常路径会在编码后主动调用 ReleaseFrame。
     ReleaseFrame(out);
     const int selectedMonitor = selectedMonitor_.load();
     if (selectedMonitor != activeMonitor_) {
-        // 切换单屏时重建到对应 adapter/output；切回“全部”时保留 GDI 合成。
+        // 切换单屏时重建到对应 adapter/output；“全部屏幕”会优先尝试同 adapter
+        // 的 DXGI 合成，无法覆盖的拓扑再自动保留 GDI 回退。
         ResetForDesktop();
     }
-    const bool allMonitors = selectedMonitor == -1 && MonitorsSnapshot().size() > 1;
-    if (use_gdi_ || allMonitors) {
+    if (use_gdi_) {
         return CaptureGDI(out, requireFreshFrame);
     }
 
-    const CaptureResult result = CaptureDXGI(out, std::max<DWORD>(1, waitMs));
+    const CaptureResult result = dxgiComposite_
+        ? CaptureDXGIComposite(out, std::max<DWORD>(1, waitMs))
+        : CaptureDXGI(out, std::max<DWORD>(1, waitMs));
+    if (dxgiComposite_ && compositeNeedsGdiFrame_) {
+        compositeNeedsGdiFrame_ = false;
+        log::Info("capture: DXGI composite baseline incomplete, using one-shot GDI fallback");
+        return CaptureGDI(out, true);
+    }
     if (result != CaptureResult::kFailed) {
         // Desktop Duplication 在新订阅的静态桌面上可能只等到超时或 pointer-only
         // 通知。控制端尚未有可绘制画面时不能一直等下一次桌面变化，使用当前 input
@@ -619,6 +773,150 @@ bool Capture::CreateGpuNv12Frame(ID3D11Texture2D* source, int width, int height,
     out.mappedStrideBytes = 0;
     out.nv12Texture = std::move(nv12Texture);
     return true;
+}
+
+CaptureResult Capture::CaptureDXGIComposite(CapturedFrame& out, DWORD waitMs) {
+    if (!dxgiComposite_ || !composite_.Get() || !compositeRtv_.Get() ||
+        dxgiOutputs_.empty() || !ctx_.Get() || !d3d_.Get()) {
+        return CaptureResult::kFailed;
+    }
+
+    bool desktopChanged = false;
+    for (size_t index = 0; index < dxgiOutputs_.size(); ++index) {
+        auto& output = dxgiOutputs_[index];
+        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+        Microsoft::WRL::ComPtr<IDXGIResource> resource;
+        // 第一块输出按帧周期等待，剩余输出零等待轮询。若每个输出都等待一个
+        // 周期，多屏会把 30 FPS 的采集延迟放大到显示器数量倍。
+        const DWORD outputWaitMs = index == 0 ? waitMs : 0;
+        const HRESULT hr = output.duplication->AcquireNextFrame(outputWaitMs, &frameInfo,
+                                                                 &resource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            continue;
+        }
+        if (FAILED(hr)) {
+            log::Warn("DXGI composite AcquireNextFrame failed hr=" + std::to_string(hr));
+            return CaptureResult::kFailed;
+        }
+
+        UpdatePointerFromFrame(frameInfo);
+        const bool pointerOnly = frameInfo.LastPresentTime.QuadPart == 0 &&
+            frameInfo.AccumulatedFrames == 0 && frameInfo.TotalMetadataBufferSize == 0;
+        if (pointerOnly) {
+            output.duplication->ReleaseFrame();
+            continue;
+        }
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        if (FAILED(resource.As(&texture))) {
+            output.duplication->ReleaseFrame();
+            return CaptureResult::kFailed;
+        }
+        D3D11_TEXTURE2D_DESC sourceDesc{};
+        texture->GetDesc(&sourceDesc);
+        if (sourceDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+            sourceDesc.SampleDesc.Count != 1 ||
+            static_cast<int>(sourceDesc.Width) != output.width ||
+            static_cast<int>(sourceDesc.Height) != output.height) {
+            output.duplication->ReleaseFrame();
+            log::Warn("DXGI composite output size or format changed unexpectedly");
+            return CaptureResult::kFailed;
+        }
+
+        D3D11_TEXTURE2D_DESC cachedDesc{};
+        if (output.latestFrame.Get()) {
+            output.latestFrame->GetDesc(&cachedDesc);
+        }
+        if (!output.latestFrame.Get() || cachedDesc.Width != sourceDesc.Width ||
+            cachedDesc.Height != sourceDesc.Height || cachedDesc.Format != sourceDesc.Format) {
+            output.latestFrame.Reset();
+            D3D11_TEXTURE2D_DESC copyDesc = sourceDesc;
+            copyDesc.Usage = D3D11_USAGE_DEFAULT;
+            copyDesc.BindFlags = 0;
+            copyDesc.CPUAccessFlags = 0;
+            copyDesc.MiscFlags = 0;
+            if (FAILED(d3d_->CreateTexture2D(&copyDesc, nullptr, &output.latestFrame))) {
+                output.duplication->ReleaseFrame();
+                return CaptureResult::kFailed;
+            }
+        }
+        ctx_->CopyResource(output.latestFrame.Get(), texture.Get());
+        output.duplication->ReleaseFrame();
+        output.hasFrame = true;
+        desktopChanged = true;
+    }
+
+    if (!desktopChanged) {
+        // 复用单屏路径的首帧行为：静态桌面且尚未有可用画面时由 CaptureFrame
+        // 触发一次 GDI bootstrap；仅光标变化则不必重新编码整张合成帧。
+        if (!pointerKnown_) {
+            UpdatePointerFromSystem();
+        }
+        return pointerDirty_ ? CaptureResult::kPointerOnly : CaptureResult::kNoChange;
+    }
+    for (const auto& output : dxgiOutputs_) {
+        if (!output.hasFrame || !output.latestFrame.Get()) {
+            compositeNeedsGdiFrame_ = true;
+            return CaptureResult::kNoChange;
+        }
+    }
+
+    constexpr float kBlack[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    ctx_->ClearRenderTargetView(compositeRtv_.Get(), kBlack);
+    for (const auto& output : dxgiOutputs_) {
+        ctx_->CopySubresourceRegion(composite_.Get(), 0, static_cast<UINT>(output.x),
+                                    static_cast<UINT>(output.y), 0,
+                                    output.latestFrame.Get(), 0, nullptr);
+    }
+
+    if (CreateGpuNv12Frame(composite_.Get(), compositeWidth_, compositeHeight_, out)) {
+        width_ = out.width;
+        height_ = out.height;
+        return CaptureResult::kFrame;
+    }
+
+    D3D11_TEXTURE2D_DESC compositeDesc{};
+    composite_->GetDesc(&compositeDesc);
+    D3D11_TEXTURE2D_DESC stagingDesc{};
+    if (staging_.Get()) {
+        staging_->GetDesc(&stagingDesc);
+    }
+    if (!staging_.Get() || stagingDesc.Width != compositeDesc.Width ||
+        stagingDesc.Height != compositeDesc.Height || stagingDesc.Format != compositeDesc.Format) {
+        staging_.Reset();
+        D3D11_TEXTURE2D_DESC readbackDesc = compositeDesc;
+        readbackDesc.Usage = D3D11_USAGE_STAGING;
+        readbackDesc.BindFlags = 0;
+        readbackDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        readbackDesc.MiscFlags = 0;
+        if (FAILED(d3d_->CreateTexture2D(&readbackDesc, nullptr, &staging_))) {
+            return CaptureResult::kFailed;
+        }
+    }
+    ctx_->CopyResource(staging_.Get(), composite_.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(ctx_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return CaptureResult::kFailed;
+    }
+
+    const bool canDirectMap = compositeWidth_ <= maxOutputWidth_ &&
+        compositeHeight_ <= maxOutputHeight_ && (compositeWidth_ & 1) == 0 &&
+        (compositeHeight_ & 1) == 0;
+    if (canDirectMap) {
+        out.width = compositeWidth_;
+        out.height = compositeHeight_;
+        out.data.clear();
+        out.mappedPixels = static_cast<const uint8_t*>(mapped.pData);
+        out.mappedStrideBytes = mapped.RowPitch;
+        stagingMapped_ = true;
+    } else {
+        CopyRegionToFrame(static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch, 0, 0,
+                          compositeWidth_, compositeHeight_, out);
+        ctx_->Unmap(staging_.Get(), 0);
+    }
+    width_ = out.width;
+    height_ = out.height;
+    return CaptureResult::kFrame;
 }
 
 CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {

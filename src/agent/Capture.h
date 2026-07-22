@@ -107,7 +107,8 @@ public:
     bool IsGpuOutputEnabled() const { return gpuOutputEnabled_; }
     ID3D11Device* D3DDevice() const { return d3d_.Get(); }
     uint64_t DeviceGeneration() const { return deviceGeneration_; }
-    // GDI 包含锁屏、DXGI 失效与全部多屏合成路径，采集成本显著高于 DXGI。
+    // GDI 包含锁屏、DXGI 失效、跨 adapter 多屏与旋转屏等回退路径，采集成本显著
+    // 高于单输出或同 adapter 的 DXGI 合成路径。
     // 仅由采集线程调用，因此无需额外同步。
     bool IsUsingGdi() const { return use_gdi_; }
 
@@ -116,8 +117,25 @@ public:
     bool MapNormalizedToVirtual(double x, double y, double& virtualX, double& virtualY) const;
 
 private:
+    struct DxgiOutputCapture {
+        Microsoft::WRL::ComPtr<IDXGIOutput1> output;
+        Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication;
+        // Desktop Duplication 返回的 resource 在 ReleaseFrame 后即失效；多屏合成
+        // 保存每个输出的最近完整副本，以便只更新发生变化的那一块。
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> latestFrame;
+        int x = 0;
+        int y = 0;
+        int width = 0;
+        int height = 0;
+        bool hasFrame = false;
+    };
+
     bool InitDXGI();
+    // “全部屏幕”且所有输出位于同一 D3D adapter 时，分别 duplicate 后在 GPU
+    // 合成虚拟桌面；跨 adapter、旋转屏或不完整输出集合继续安全回退 GDI。
+    bool InitDXGIComposite(const std::vector<MonitorInfo>& monitors);
     CaptureResult CaptureDXGI(CapturedFrame& out, DWORD waitMs);
+    CaptureResult CaptureDXGIComposite(CapturedFrame& out, DWORD waitMs);
     CaptureResult CaptureGDI(CapturedFrame& out, bool forceFrame);
     bool CreateGpuNv12Frame(ID3D11Texture2D* source, int width, int height,
                             CapturedFrame& out);
@@ -139,11 +157,20 @@ private:
     Microsoft::WRL::ComPtr<IDXGIOutput1> output_;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> dup_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> composite_;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> compositeRtv_;
     Microsoft::WRL::ComPtr<ID3D11VideoDevice> videoDevice_;
     Microsoft::WRL::ComPtr<ID3D11VideoContext> videoContext_;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> videoProcessorEnumerator_;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessor> videoProcessor_;
     bool stagingMapped_ = false;
+    bool dxgiComposite_ = false;
+    // 多输出刚建立时若只收到其中一块的首帧，缓存尚不能组成完整画面。该标志
+    // 请求一次 GDI 快照填补控制端画面，但不会在静态桌面中每帧退回 GDI。
+    bool compositeNeedsGdiFrame_ = false;
+    int compositeWidth_ = 0;
+    int compositeHeight_ = 0;
+    std::vector<DxgiOutputCapture> dxgiOutputs_;
     bool gpuOutputEnabled_ = false;
     // 记录当前设备是否已发生过 GPU 路径故障。0 表示尚未初始化 DXGI device；
     // InitDXGI 成功时 generation 单调递增，因此旧设备的失败不会阻断新设备重试。
