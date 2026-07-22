@@ -8,6 +8,8 @@
 #include "net/HttpWsServer.h"
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -46,8 +48,10 @@ private:
 
     std::atomic<int> deskWidth_{0};
     std::atomic<int> deskHeight_{0};
+    std::atomic<bool> frameResetRequested_{false};
     bool encoderReady_ = false;
-    std::vector<uint8_t> prevFrame_;  // 帧差检测:上一帧数据
+    uint64_t previousFrameFingerprint_ = 0;
+    std::chrono::steady_clock::time_point lastFrameSent_{};
     bool firstFrame_ = true;
 };
 

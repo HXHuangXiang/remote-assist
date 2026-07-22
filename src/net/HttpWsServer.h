@@ -25,7 +25,8 @@ public:
     // 仅允许一个控制端连接。返回 false 表示已有连接。
     bool Add(httplib::ws::WebSocket* ws);
     void Remove(httplib::ws::WebSocket* ws);
-    void BroadcastBinary(const char* data, size_t len);
+    // 取得编码器生成的帧所有权，只保留最新一帧，避免再次复制完整 JPEG 缓冲。
+    void BroadcastBinary(std::vector<uint8_t> frame);
     void BroadcastText(const std::string& msg);
     int Count();
     void Stop();

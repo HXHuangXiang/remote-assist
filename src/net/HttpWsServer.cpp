@@ -32,14 +32,13 @@ void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
     }
 }
 
-void WsBroadcaster::BroadcastBinary(const char* data, size_t len) {
+void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame) {
     {
         std::lock_guard<std::mutex> lk(frameMu_);
         if (stopping_) {
             return;
         }
-        pendingFrame_.assign(reinterpret_cast<const uint8_t*>(data),
-                             reinterpret_cast<const uint8_t*>(data) + len);
+        pendingFrame_ = std::move(frame);
     }
     frameCv_.notify_one();
 }

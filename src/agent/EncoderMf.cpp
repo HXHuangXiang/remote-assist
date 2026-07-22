@@ -1,5 +1,6 @@
 #include "agent/EncoderMf.h"
 #include "common/Log.h"
+#include <algorithm>
 #include <cstring>
 #pragma comment(lib, "windowscodecs.lib")
 
@@ -20,9 +21,12 @@ public:
         *ppv = nullptr; return E_NOINTERFACE;
     }
     HRESULT STDMETHODCALLTYPE Read(void* pv, ULONG cb, ULONG* pcbRead) override {
-        ULONG avail = (ULONG)(buf_.size() - pos_); ULONG n = (cb < avail) ? cb : avail;
-        if (n) memcpy(pv, buf_.data() + pos_, n); pos_ += n;
-        if (pcbRead) *pcbRead = n; return S_OK;
+        const size_t available = pos_ < buf_.size() ? buf_.size() - pos_ : 0;
+        const ULONG n = static_cast<ULONG>(std::min<size_t>(cb, available));
+        if (n) memcpy(pv, buf_.data() + pos_, n);
+        pos_ += n;
+        if (pcbRead) *pcbRead = n;
+        return n == cb ? S_OK : S_FALSE;
     }
     HRESULT STDMETHODCALLTYPE Write(const void* pv, ULONG cb, ULONG* pcbWritten) override {
         if (pos_ + cb > buf_.size()) buf_.resize(pos_ + cb);
@@ -45,7 +49,7 @@ public:
     HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
     HRESULT STDMETHODCALLTYPE Stat(STATSTG* p, DWORD) override { if (p) { memset(p, 0, sizeof(*p)); p->cbSize.QuadPart = buf_.size(); } return S_OK; }
     HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
-    const std::vector<uint8_t>& Data() const { return buf_; }
+    std::vector<uint8_t> TakeData() { return std::move(buf_); }
 private:
     LONG ref_; size_t pos_; std::vector<uint8_t> buf_;
 };
@@ -92,11 +96,25 @@ bool EncoderMf::Encode(const uint8_t* bgra, std::vector<EncodedChunk>& out) {
     if (FAILED(hr)) { stream->Release(); return false; }
     hr = frame->WriteSource(bmp.Get(), nullptr);
     if (FAILED(hr)) { stream->Release(); log::Error("WIC write failed hr=" + std::to_string(hr)); return false; }
-    frame->Commit();
-    enc->Commit();
+    hr = frame->Commit();
+    if (FAILED(hr)) {
+        stream->Release();
+        log::Error("WIC frame commit failed hr=" + std::to_string(hr));
+        return false;
+    }
+    hr = enc->Commit();
+    if (FAILED(hr)) {
+        stream->Release();
+        log::Error("WIC encoder commit failed hr=" + std::to_string(hr));
+        return false;
+    }
 
     EncodedChunk chunk;
-    chunk.data = stream->Data();
+    chunk.data = stream->TakeData();
+    if (chunk.data.empty()) {
+        stream->Release();
+        return false;
+    }
     chunk.isKey = true;
     out.push_back(std::move(chunk));
     stream->Release();

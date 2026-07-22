@@ -52,7 +52,9 @@ public:
     void EnumMonitors();
     static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM);
     const std::vector<MonitorInfo>& Monitors() const { return monitors_; }
-    void SetMonitor(int index) { selectedMonitor_ = index; }
+    void SetMonitor(int index) {
+        selectedMonitor_ = (index >= -1 && index < static_cast<int>(monitors_.size())) ? index : -1;
+    }
     int SelectedMonitor() const { return selectedMonitor_.load(); }
 
     // 将当前画面中的归一化坐标映射为整个虚拟桌面的归一化坐标。
@@ -89,6 +91,9 @@ private:
     // 多显示器
     std::vector<MonitorInfo> monitors_;
     std::atomic<int> selectedMonitor_{-1};  // -1=全部
+    // 当前采集资源对应的选择项。-2 表示尚未初始化；即使 DXGI 不可用也记录，
+    // 防止 GDI 回退路径在每一帧重复重建资源。
+    int activeMonitor_ = -2;
 
     int width_ = 0;
     int height_ = 0;

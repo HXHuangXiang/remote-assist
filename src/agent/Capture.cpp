@@ -82,11 +82,13 @@ void Capture::EnumMonitors() {
 bool Capture::Init() {
     if (InitDXGI()) {
         use_gdi_ = false;
+        activeMonitor_ = selectedMonitor_.load();
         log::Info("capture: DXGI path ready");
         return true;
     }
     log::Warn("capture: DXGI init failed, fallback to GDI");
     use_gdi_ = true;
+    activeMonitor_ = selectedMonitor_.load();
     return true;
 }
 
@@ -94,38 +96,92 @@ void Capture::ResetForDesktop() {
     ReleaseAll();
     if (InitDXGI()) {
         use_gdi_ = false;
+        activeMonitor_ = selectedMonitor_.load();
         log::Info("capture: DXGI path reinitialized after desktop change");
         return;
     }
     use_gdi_ = true;
+    activeMonitor_ = selectedMonitor_.load();
     log::Warn("capture: DXGI reinit failed after desktop change, fallback to GDI");
 }
 
 bool Capture::InitDXGI() {
-    Microsoft::WRL::ComPtr<IDXGIFactory1> fac;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) return false;
-    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-    if (FAILED(fac->EnumAdapters1(0, &adapter))) return false;
-    Microsoft::WRL::ComPtr<IDXGIOutput> out0;
-    if (FAILED(adapter->EnumOutputs(0, &out0))) return false;
-    if (FAILED(out0.As(&output_))) return false;
-
-    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-            D3D11_SDK_VERSION, &d3d_, &fl, &ctx_))) {
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                D3D11_SDK_VERSION, &d3d_, &fl, &ctx_))) return false;
+    const int selectedMonitor = selectedMonitor_.load();
+    if (selectedMonitor < -1 || selectedMonitor >= static_cast<int>(monitors_.size())) {
+        return false;
     }
-    if (FAILED(output_->DuplicateOutput(d3d_.Get(), &dup_))) return false;
-    return true;
+    // “全部屏幕”在多适配器/多输出时仍需合成，保留 GDI 回退；但选择单屏时
+    // 直接绑定该输出的 DXGI Desktop Duplication，不再因为机器有多屏而退化。
+    if (selectedMonitor == -1 && monitors_.size() > 1) {
+        return false;
+    }
+
+    std::wstring targetDevice;
+    if (selectedMonitor >= 0) {
+        const auto& name = monitors_[selectedMonitor].name;
+        targetDevice.assign(name.begin(), name.end());  // \\.\DISPLAYn 为 ASCII 设备名。
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIFactory1> fac;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) {
+        return false;
+    }
+
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        const HRESULT adapterResult = fac->EnumAdapters1(adapterIndex, &adapter);
+        if (adapterResult == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (FAILED(adapterResult)) {
+            continue;
+        }
+        for (UINT outputIndex = 0;; ++outputIndex) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> baseOutput;
+            const HRESULT outputResult = adapter->EnumOutputs(outputIndex, &baseOutput);
+            if (outputResult == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            if (FAILED(outputResult)) {
+                continue;
+            }
+            DXGI_OUTPUT_DESC desc{};
+            if (FAILED(baseOutput->GetDesc(&desc)) ||
+                (!targetDevice.empty() && _wcsicmp(desc.DeviceName, targetDevice.c_str()) != 0)) {
+                continue;
+            }
+
+            Microsoft::WRL::ComPtr<IDXGIOutput1> output;
+            Microsoft::WRL::ComPtr<ID3D11Device> device;
+            Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+            Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication;
+            D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+            if (FAILED(baseOutput.As(&output)) ||
+                FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+                    &device, &featureLevel, &context)) ||
+                FAILED(output->DuplicateOutput(device.Get(), &duplication))) {
+                continue;
+            }
+
+            d3d_ = std::move(device);
+            ctx_ = std::move(context);
+            output_ = std::move(output);
+            dup_ = std::move(duplication);
+            return true;
+        }
+    }
+    return false;
 }
 
 CaptureResult Capture::CaptureFrame(CapturedFrame& out) {
-    // 当前 DXGI 实现只复制一个 output；选择单屏或存在多屏时走 GDI，
-    // 保证“全部屏幕/指定屏幕”的图像与浏览器选择项一致。
-    if (use_gdi_ || selectedMonitor_.load() >= 0 || monitors_.size() > 1) {
+    const int selectedMonitor = selectedMonitor_.load();
+    if (selectedMonitor != activeMonitor_) {
+        // 切换单屏时重建到对应 adapter/output；切回“全部”时保留 GDI 合成。
+        ResetForDesktop();
+    }
+    const bool allMonitors = selectedMonitor == -1 && monitors_.size() > 1;
+    if (use_gdi_ || allMonitors) {
         return CaptureGDI(out) ? CaptureResult::kFrame : CaptureResult::kFailed;
     }
 
@@ -196,12 +252,13 @@ bool Capture::CaptureGDI(CapturedFrame& out) {
     const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     if (vw <= 0 || vh <= 0) return false;
 
-    // 创建/复用 DC 和 DIB(DIB 尺寸 = 虚拟屏幕)。
+    // 优先取当前 input desktop 的 DC，锁屏/Winlogon 情况不会误用普通 DISPLAY DC。
+    // 创建/复用 DIB 的尺寸仍然覆盖整个虚拟屏幕。
     if (!gdi_dc_) {
-        gdi_dc_ = CreateDCW(L"DISPLAY", nullptr, nullptr, nullptr);
+        gdi_dc_ = GetDC(nullptr);
+        gdi_dc_from_getdc_ = (gdi_dc_ != nullptr);
         if (!gdi_dc_) {
-            gdi_dc_ = GetDC(nullptr);
-            gdi_dc_from_getdc_ = (gdi_dc_ != nullptr);
+            gdi_dc_ = CreateDCW(L"DISPLAY", nullptr, nullptr, nullptr);
         }
         if (!gdi_dc_) return false;
     }

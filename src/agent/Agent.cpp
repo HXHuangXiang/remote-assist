@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <string>
 
 #pragma comment(lib, "ole32.lib")
@@ -31,6 +33,20 @@ std::string WideToUtf8(const std::wstring& w) {
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
                         s.data(), n, nullptr, nullptr);
     return s;
+}
+
+// 对缩放后的 BGRA 帧做等步长采样哈希。相比保存完整上一帧，避免每个 1080p
+// 帧额外复制约 8MB；一秒一次的强制刷新兜底极小区域恰好未被采样的情况。
+uint64_t FrameFingerprint(const std::vector<uint8_t>& frame) {
+    constexpr size_t kStride = 64;
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t offset = 0; offset + sizeof(uint32_t) <= frame.size(); offset += kStride) {
+        uint32_t pixel = 0;
+        std::memcpy(&pixel, frame.data() + offset, sizeof(pixel));
+        hash ^= pixel;
+        hash *= 1099511628211ULL;
+    }
+    return hash ^ static_cast<uint64_t>(frame.size());
 }
 
 }  // namespace
@@ -187,20 +203,25 @@ void Agent::CaptureLoop() {
             nextDesktopCheck = t0 + std::chrono::seconds(1);
             if (captureDesktop.CheckRebind()) {
                 capture_.ResetForDesktop();
-                prevFrame_.clear();
                 firstFrame_ = true;
+                lastFrameSent_ = {};
             }
         }
 
         // 没有控制端时不做抓屏、缩放和 JPEG 编码，既避免空转占用 CPU，
         // 也在下一次客户端连接时强制重新输出首帧。
         if (server_.Broadcaster().Count() == 0) {
-            if (!firstFrame_ || !prevFrame_.empty()) {
+            if (!firstFrame_) {
                 firstFrame_ = true;
-                prevFrame_.clear();
             }
+            lastFrameSent_ = {};
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
+        }
+
+        if (frameResetRequested_.exchange(false)) {
+            firstFrame_ = true;
+            lastFrameSent_ = {};
         }
 
         CapturedFrame frame;
@@ -223,19 +244,14 @@ void Agent::CaptureLoop() {
             continue;
         }
 
-        // 帧差检测:采样比较,相同则跳过编码发送
-        if (!firstFrame_ && frame.data.size() == prevFrame_.size()) {
-            bool changed = false;
-            const size_t step = 256;  // 每 256 字节采样(64 像素)
-            for (size_t i = 0; i < frame.data.size(); i += step) {
-                if (frame.data[i] != prevFrame_[i]) { changed = true; break; }
-            }
-            if (!changed) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
-                continue;
-            }
+        const uint64_t frameFingerprint = FrameFingerprint(frame.data);
+        const bool refreshDue = lastFrameSent_.time_since_epoch().count() == 0 ||
+            t0 - lastFrameSent_ >= std::chrono::seconds(1);
+        if (!firstFrame_ && frameFingerprint == previousFrameFingerprint_ && !refreshDue) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
+            continue;
         }
-        prevFrame_ = frame.data;
+        previousFrameFingerprint_ = frameFingerprint;
         firstFrame_ = false;
 
         if (!encoder_ || frame.width != deskWidth_.load() || frame.height != deskHeight_.load()) {
@@ -258,9 +274,16 @@ void Agent::CaptureLoop() {
         if (encoderReady_ && !frame.data.empty()) {
             std::vector<EncodedChunk> chunks;
             if (encoder_->Encode(frame.data.data(), chunks)) {
-                for (const auto& c : chunks) {
-                    server_.Broadcaster().BroadcastBinary(
-                        reinterpret_cast<const char*>(c.data.data()), c.data.size());
+                bool sent = false;
+                for (auto& c : chunks) {
+                    if (c.data.empty()) {
+                        continue;
+                    }
+                    server_.Broadcaster().BroadcastBinary(std::move(c.data));
+                    sent = true;
+                }
+                if (sent) {
+                    lastFrameSent_ = std::chrono::steady_clock::now();
                 }
             }
         }
@@ -348,7 +371,8 @@ void Agent::OnMessage(const std::string& msg) {
     } else if (t == "monitor") {
         const int idx = j.value("index", -1);
         capture_.SetMonitor(idx);
-        log::Info("monitor switched to idx=" + std::to_string(idx));
+        frameResetRequested_.store(true);
+        log::Info("monitor switched to idx=" + std::to_string(capture_.SelectedMonitor()));
     }
 }
 
