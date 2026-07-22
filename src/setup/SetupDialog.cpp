@@ -3,10 +3,14 @@
 #include "common/Log.h"
 #include "common/RuntimeNames.h"
 
+#include <netfw.h>
+#include <wrl/client.h>
+
 #include <shellapi.h>
 #include <cstdlib>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #pragma comment(lib, "advapi32.lib")
@@ -40,6 +44,10 @@ static NOTIFYICONDATAW g_nid = {};
 static HMENU g_trayMenu = nullptr;
 static UINT g_wmTaskbarRestart = 0;
 static bool g_trayAdded = false;
+static HFONT g_font = nullptr;
+constexpr wchar_t kFirewallRuleName[] = L"RemoteAssist 局域网控制（专用网络）";
+constexpr wchar_t kFirewallRuleDescription[] =
+    L"允许 RemoteAssist 在专用局域网接收浏览器远程协助连接。";
 // 与 service 拉起的 TrayApp 共用每会话 mutex，避免配置窗口额外创建托盘图标。
 static HANDLE g_trayMutex = nullptr;
 static bool g_ownsTray = false;
@@ -54,6 +62,121 @@ struct ServiceResult {
     bool ok = false;
     DWORD error = ERROR_GEN_FAILURE;
 };
+
+struct InstallServiceResult {
+    ServiceResult service;
+    // 防火墙策略可能被企业策略锁定。服务安装不因该项失败回滚，但 UI 必须明确提示。
+    DWORD firewallError = ERROR_SUCCESS;
+};
+
+// COM 防火墙接口接收 BSTR。此小型 RAII 包装避免每个错误分支遗漏 SysFreeString。
+class ScopedBstr {
+public:
+    explicit ScopedBstr(std::wstring_view value)
+        : value_(SysAllocStringLen(value.data(), static_cast<UINT>(value.size()))) {}
+    ~ScopedBstr() { SysFreeString(value_); }
+
+    ScopedBstr(const ScopedBstr&) = delete;
+    ScopedBstr& operator=(const ScopedBstr&) = delete;
+
+    BSTR Get() const { return value_; }
+    bool Valid() const { return value_ != nullptr; }
+
+private:
+    BSTR value_ = nullptr;
+};
+
+DWORD ErrorFromHresult(HRESULT hr) {
+    if (HRESULT_FACILITY(hr) == FACILITY_WIN32) {
+        return HRESULT_CODE(hr);
+    }
+    return static_cast<DWORD>(hr);
+}
+
+// 为当前 exe 与端口创建一个仅作用于 Windows“专用”网络配置文件的入站规则。
+// 规则按名称替换，因此改端口或升级 exe 后不会累积旧规则。
+bool ConfigurePrivateFirewallRule(const std::wstring& exePath, int port, DWORD& error) {
+    error = ERROR_SUCCESS;
+    const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool shouldUninitialize = SUCCEEDED(comHr);
+    if (FAILED(comHr) && comHr != RPC_E_CHANGED_MODE) {
+        error = ErrorFromHresult(comHr);
+        return false;
+    }
+    auto fail = [&](HRESULT hr) {
+        if (shouldUninitialize) {
+            CoUninitialize();
+        }
+        error = ErrorFromHresult(hr);
+        return false;
+    };
+
+    Microsoft::WRL::ComPtr<INetFwPolicy2> policy;
+    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&policy));
+    if (FAILED(hr)) {
+        return fail(hr);
+    }
+    Microsoft::WRL::ComPtr<INetFwRules> rules;
+    hr = policy->get_Rules(rules.GetAddressOf());
+    if (FAILED(hr)) {
+        return fail(hr);
+    }
+
+    ScopedBstr name(kFirewallRuleName);
+    const std::wstring portText = std::to_wstring(port);
+    ScopedBstr ports(portText);
+    ScopedBstr application(exePath);
+    ScopedBstr description(kFirewallRuleDescription);
+    if (!name.Valid() || !ports.Valid() || !application.Valid() || !description.Valid()) {
+        return fail(E_OUTOFMEMORY);
+    }
+
+    // 旧规则不存在时通常会返回“文件未找到”，这不是错误。
+    rules->Remove(name.Get());
+
+    Microsoft::WRL::ComPtr<INetFwRule> rule;
+    hr = CoCreateInstance(__uuidof(NetFwRule), nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&rule));
+    if (FAILED(hr) || FAILED(hr = rule->put_Name(name.Get())) ||
+        FAILED(hr = rule->put_Description(description.Get())) ||
+        FAILED(hr = rule->put_ApplicationName(application.Get())) ||
+        FAILED(hr = rule->put_Protocol(NET_FW_IP_PROTOCOL_TCP)) ||
+        FAILED(hr = rule->put_LocalPorts(ports.Get())) ||
+        FAILED(hr = rule->put_Direction(NET_FW_RULE_DIR_IN)) ||
+        FAILED(hr = rule->put_Action(NET_FW_ACTION_ALLOW)) ||
+        FAILED(hr = rule->put_Profiles(NET_FW_PROFILE2_PRIVATE)) ||
+        FAILED(hr = rule->put_Enabled(VARIANT_TRUE)) ||
+        FAILED(hr = rules->Add(rule.Get()))) {
+        return fail(hr);
+    }
+
+    if (shouldUninitialize) {
+        CoUninitialize();
+    }
+    return true;
+}
+
+void RemovePrivateFirewallRule() {
+    const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool shouldUninitialize = SUCCEEDED(comHr);
+    if (FAILED(comHr) && comHr != RPC_E_CHANGED_MODE) {
+        return;
+    }
+    Microsoft::WRL::ComPtr<INetFwPolicy2> policy;
+    Microsoft::WRL::ComPtr<INetFwRules> rules;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(NetFwPolicy2), nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&policy))) &&
+        SUCCEEDED(policy->get_Rules(rules.GetAddressOf()))) {
+        ScopedBstr name(kFirewallRuleName);
+        if (name.Valid()) {
+            rules->Remove(name.Get());
+        }
+    }
+    if (shouldUninitialize) {
+        CoUninitialize();
+    }
+}
 
 ServiceResult ServiceSuccess() {
     return {true, ERROR_SUCCESS};
@@ -178,12 +301,12 @@ static bool WaitForAgentReady(DWORD timeoutMs) {
     return result == WAIT_OBJECT_0;
 }
 
-static ServiceResult InstallService() {
+static InstallServiceResult InstallService() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (!scm) {
         const DWORD error = GetLastError();
         log::Error("OpenSCManager failed err=" + std::to_string(error));
-        return ServiceFailure(error);
+        return {ServiceFailure(error)};
     }
     std::wstring binPath = L"\"" + ExePath() + L"\" --service";
     SC_HANDLE svc = CreateServiceW(scm, runtime::kServiceName, L"RemoteAssist",
@@ -199,16 +322,21 @@ static ServiceResult InstallService() {
             DeleteService(svc);
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
-            return configured;
+            return {configured};
         }
         CloseServiceHandle(svc);
         CloseServiceHandle(scm);
-        return ServiceSuccess();
+        DWORD firewallError = ERROR_SUCCESS;
+        if (!ConfigurePrivateFirewallRule(ExePath(), g_cfg.port, firewallError)) {
+            log::Warn("private firewall rule update failed err=" +
+                      std::to_string(firewallError));
+        }
+        return {ServiceSuccess(), firewallError};
     }
     const DWORD error = GetLastError();
     log::Error("CreateService failed err=" + std::to_string(error));
     CloseServiceHandle(scm);
-    return ServiceFailure(error);
+    return {ServiceFailure(error)};
 }
 
 static ServiceResult StartServiceS() {
@@ -308,12 +436,20 @@ static ServiceResult UninstallService() {
     if (!svc) {
         const DWORD error = GetLastError();
         CloseServiceHandle(scm);
-        return error == ERROR_SERVICE_DOES_NOT_EXIST ? ServiceSuccess() : ServiceFailure(error);
+        if (error == ERROR_SERVICE_DOES_NOT_EXIST) {
+            // 遗留规则也必须清理，例如服务曾被手工删除的情况。
+            RemovePrivateFirewallRule();
+            return ServiceSuccess();
+        }
+        return ServiceFailure(error);
     }
     const bool ok = DeleteService(svc) != FALSE;
     const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
+    if (ok) {
+        RemovePrivateFirewallRule();
+    }
     return ok ? ServiceSuccess() : ServiceFailure(error);
 }
 
@@ -330,7 +466,7 @@ bool ReadPort(HWND hwnd, int& port) {
     return true;
 }
 
-bool SaveSettingsFromControls(HWND hwnd, bool& changed) {
+bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
     int port = 0;
     if (!ReadPort(hwnd, port)) {
         return false;
@@ -339,7 +475,7 @@ bool SaveSettingsFromControls(HWND hwnd, bool& changed) {
     char password[256] = {};
     GetDlgItemTextA(hwnd, IDC_PW_EDIT, password, sizeof(password));
     const bool passwordChanged = password[0] != '\0';
-    const bool portChanged = g_cfg.port != port;
+    portChanged = g_cfg.port != port;
     changed = passwordChanged || portChanged;
     if (!changed) {
         return true;
@@ -448,13 +584,15 @@ static void HideToTray() {
 }
 
 static void CreateControls(HWND hwnd) {
-    HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    g_font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
 
     auto mk = [&](int id, const wchar_t* cls, const wchar_t* text, int x, int y, int w, int h, DWORD style) {
         HWND hw = CreateWindowExW(0, cls, text, style | WS_CHILD | WS_VISIBLE,
             x, y, w, h, hwnd, (HMENU)(LONG_PTR)id, nullptr, nullptr);
-        SendMessageW(hw, WM_SETFONT, (WPARAM)hFont, TRUE);
+        if (g_font) {
+            SendMessageW(hw, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        }
         return hw;
     };
 
@@ -534,7 +672,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case IDC_PW_SAVE: {
             bool changed = false;
-            if (!SaveSettingsFromControls(hwnd, changed)) {
+            bool portChanged = false;
+            if (!SaveSettingsFromControls(hwnd, changed, portChanged)) {
                 break;
             }
             if (!changed) {
@@ -556,17 +695,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 MessageBoxW(hwnd, L"配置已保存，将在下次启动 Agent 或服务时生效。",
                             L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             }
+            if (portChanged && ServiceExists()) {
+                DWORD firewallError = ERROR_SUCCESS;
+                if (!ConfigurePrivateFirewallRule(ExePath(), g_cfg.port, firewallError)) {
+                    ShowServiceError(hwnd, L"更新专用网络防火墙规则", firewallError);
+                }
+            }
             UpdateStatus();
             break;
         }
         case IDC_SVC_INSTALL: {
             bool changed = false;
-            if (!SaveSettingsFromControls(hwnd, changed)) {
+            bool portChanged = false;
+            if (!SaveSettingsFromControls(hwnd, changed, portChanged)) {
                 break;
             }
-            const ServiceResult install = InstallService();
-            if (!install.ok) {
-                ShowServiceError(hwnd, L"安装服务", install.error);
+            const InstallServiceResult install = InstallService();
+            if (!install.service.ok) {
+                ShowServiceError(hwnd, L"安装服务", install.service.error);
                 UpdateStatus();
                 break;
             }
@@ -582,6 +728,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         std::to_wstring(g_cfg.port) + L"/";
                 } else {
                     message = L"服务已启动。Agent 尚未就绪（等待登录桌面或查看 logs\\service.log）。";
+                }
+                if (install.firewallError != ERROR_SUCCESS) {
+                    message += L"\n\n未能自动添加专用网络防火墙规则；局域网访问可能被阻止。";
                 }
                 MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
             }
@@ -666,6 +815,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         RemoveTrayIcon();
+        if (g_font) {
+            DeleteObject(g_font);
+            g_font = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     }

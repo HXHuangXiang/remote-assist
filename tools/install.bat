@@ -4,6 +4,8 @@ setlocal EnableExtensions
 
 set "SERVICE=remote-assist"
 set "EXE=%~dp0RemoteAssist.exe"
+set "FIREWALL_RULE=RemoteAssist 局域网控制（专用网络）"
+set "PORT=7980"
 
 if not exist "%EXE%" (
   echo 找不到 "%EXE%"，请把 install.bat 与 RemoteAssist.exe 放在同一目录。
@@ -38,6 +40,13 @@ if errorlevel 1 goto :service_error
 sc description "%SERVICE%" "RemoteAssist 远控被控端(LocalSystem)" >nul
 rem 服务进程异常退出时由 SCM 自动重试；正常 stop 不受此策略影响。
 sc failure "%SERVICE%" reset= 86400 actions= restart/5000/restart/10000/""/0 >nul
+
+rem 如果已存在 config.json，按当前端口放行；读取失败时安全回退到默认 7980。
+set "REMOTE_ASSIST_CONFIG=%~dp0config.json"
+for /f %%P in ('powershell -NoProfile -Command "$p=$env:REMOTE_ASSIST_CONFIG; try {$c=Get-Content -Raw -LiteralPath $p ^| ConvertFrom-Json; if ($c.port -ge 1 -and $c.port -le 65535) {[Console]::Write($c.port)}} catch {}"') do set "PORT=%%P"
+netsh advfirewall firewall delete rule name="%FIREWALL_RULE%" >nul 2>&1
+netsh advfirewall firewall add rule name="%FIREWALL_RULE%" dir=in action=allow profile=private program="%EXE%" protocol=TCP localport=%PORT% >nul
+if errorlevel 1 echo 警告：未能添加专用网络防火墙规则，其他电脑可能无法访问。
 
 echo 正在启动服务...
 sc start "%SERVICE%"

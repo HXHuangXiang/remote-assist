@@ -74,5 +74,7 @@ else()
     target_compile_options(RemoteAssist PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-install(TARGETS RemoteAssist RUNTIME DESTINATION bin)
-install(DIRECTORY web/ DESTINATION share/remote-assist/web)
+# 安装包保持与 CI 的 dist 目录相同：exe、web、配置与日志都位于同一根目录，
+# 既满足便携部署，也避免 service 从 bin/ 启动后找不到 share/ 下的网页资源。
+install(TARGETS RemoteAssist RUNTIME DESTINATION .)
+install(DIRECTORY web/ DESTINATION web)

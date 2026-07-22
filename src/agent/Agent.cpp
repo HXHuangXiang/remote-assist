@@ -166,8 +166,9 @@ std::string Agent::WebDirFromExe() {
     std::wstring dir = (pos != std::wstring::npos) ? exe.substr(0, pos) : exe;
     dir += L"\\web";
     if (!PathFileExistsW(dir.c_str())) {
-        // 退回到 share/remote-assist/web(便于 install 部署形态)
-        std::wstring alt = dir + L"\\..\\share\\remote-assist\\web";
+        // 兼容早期 CMake install 目录：exe 位于 bin/，网页在 prefix/share/。
+        // 当前安装布局已统一为 exe 同级 web/，此分支仅用于平滑升级旧安装。
+        std::wstring alt = dir + L"\\..\\..\\share\\remote-assist\\web";
         wchar_t full[MAX_PATH] = {};
         if (GetFullPathNameW(alt.c_str(), MAX_PATH, full, nullptr)) {
             if (PathFileExistsW(full)) {
@@ -226,13 +227,20 @@ int Agent::Run(bool serviceManaged) {
         CoUninitialize();
         return 1;
     }
+    Input::Enable();
     log::Info("agent config port=" + std::to_string(cfg_.port) +
               " fps=" + std::to_string(cfg_.fps));
+    streamFps_.store(cfg_.fps);
 
     // 显示器清单在启动网络服务前完成,后续仅由采集线程读取。
     capture_.EnumMonitors();
 
-    server_.SetWebDir(WebDirFromExe());
+    const std::string webDir = WebDirFromExe();
+    if (!server_.SetWebDir(webDir)) {
+        log::Error("agent: web resource directory unavailable: " + webDir);
+        CoUninitialize();
+        return 1;
+    }
     server_.SetAuthVerifier([this](const std::string& token) {
         return VerifyPassword(cfg_, token);
     });
@@ -275,8 +283,9 @@ void Agent::Stop() {
     if (readyEvent_) {
         ResetEvent(readyEvent_);
     }
-    // 服务停止不应依赖浏览器正常发送 keyup。主线程临时绑定当前输入桌面，
+    // 先拒绝在途 WebSocket 回调的新输入，再释放已按下状态。主线程临时绑定当前输入桌面，
     // 尽早释放控制端遗留的修饰键和鼠标按键，再等待 WebSocket 工作线程退出。
+    Input::Disable();
     DesktopAccess shutdownDesktop;
     if (shutdownDesktop.Bind()) {
         Input::ReleaseAll();
@@ -305,8 +314,11 @@ void Agent::CaptureLoop() {
     auto nextDesktopCheck = std::chrono::steady_clock::now();
     auto metricsStartedAt = nextDesktopCheck;
     auto nextMetricsLog = nextDesktopCheck + std::chrono::seconds(10);
+    auto nextAdaptation = nextDesktopCheck + std::chrono::seconds(1);
     CaptureLoopStats metrics;
     BroadcasterStats broadcasterStatsBase = server_.Broadcaster().SnapshotStats();
+    BroadcasterStats adaptationStatsBase = broadcasterStatsBase;
+    int adaptiveFps = cfg_.fps;
     // 采集结果在相邻帧间复用容量。1920x1080 的 BGRA 帧约 8MB，若每轮都创建
     // 局部 CapturedFrame 会触发持续的大块堆分配和释放，直接放大卡顿。
     CapturedFrame frame;
@@ -326,6 +338,10 @@ void Agent::CaptureLoop() {
                                                 broadcasterStatsBase.sentBytes);
         const uint64_t acknowledged = CounterDelta(broadcasterStats.acknowledgedFrames,
                                                    broadcasterStatsBase.acknowledgedFrames);
+        const uint64_t ackLatencyUs = CounterDelta(broadcasterStats.ackLatencyUs,
+                                                   broadcasterStatsBase.ackLatencyUs);
+        const uint64_t ackLatencySamples = CounterDelta(broadcasterStats.ackLatencySamples,
+                                                        broadcasterStatsBase.ackLatencySamples);
         const uint64_t ackTimeouts = CounterDelta(broadcasterStats.ackTimeouts,
                                                   broadcasterStatsBase.ackTimeouts);
         const uint64_t sendFailures = CounterDelta(broadcasterStats.sendFailures,
@@ -341,6 +357,8 @@ void Agent::CaptureLoop() {
                 metrics.captureTimeMs / metrics.captureAttempts;
             const uint64_t avgEncodeMs = metrics.encodeAttempts == 0 ? 0 :
                 metrics.encodeTimeMs / metrics.encodeAttempts;
+            const uint64_t avgAckMs = ackLatencySamples == 0 ? 0 :
+                ackLatencyUs / ackLatencySamples / 1000;
             log::Info("stream metrics " + std::to_string(elapsedMs) + "ms clients=" +
                       std::to_string(server_.Broadcaster().Count()) +
                       " capture=" + std::to_string(metrics.capturedFrames) + "/" +
@@ -359,9 +377,11 @@ void Agent::CaptureLoop() {
                       " sent=" + std::to_string(sent) +
                       " sent_kib=" + std::to_string(sentBytes / 1024) +
                       " ack=" + std::to_string(acknowledged) +
+                      " ack_avg_ms=" + std::to_string(avgAckMs) +
                       " ack_timeout=" + std::to_string(ackTimeouts) +
                       " send_fail=" + std::to_string(sendFailures) +
-                      " h264_resync=" + std::to_string(h264Resyncs));
+                      " h264_resync=" + std::to_string(h264Resyncs) +
+                      " stream_fps=" + std::to_string(adaptiveFps));
         }
         metrics = {};
         broadcasterStatsBase = broadcasterStats;
@@ -369,14 +389,59 @@ void Agent::CaptureLoop() {
         nextMetricsLog = now + std::chrono::seconds(10);
     };
 
+    // 发送队列只能安全保留很少的 H.264 增量帧；一旦浏览器绘制确认追不上，继续
+    // 以固定 FPS 编码只会反复触发 IDR 重同步。依据一秒窗口的 ACK 端到端延迟
+    // 快速降帧，网络恢复后再平滑回升到用户配置上限。
+    auto adaptFrameRateIfDue = [&](std::chrono::steady_clock::time_point now) {
+        if (now < nextAdaptation) {
+            return;
+        }
+        const BroadcasterStats stats = server_.Broadcaster().SnapshotStats();
+        const uint64_t ackLatencyUs = CounterDelta(stats.ackLatencyUs,
+                                                   adaptationStatsBase.ackLatencyUs);
+        const uint64_t ackSamples = CounterDelta(stats.ackLatencySamples,
+                                                 adaptationStatsBase.ackLatencySamples);
+        const uint64_t ackTimeouts = CounterDelta(stats.ackTimeouts,
+                                                  adaptationStatsBase.ackTimeouts);
+        const uint64_t h264Resyncs = CounterDelta(stats.h264Resyncs,
+                                                  adaptationStatsBase.h264Resyncs);
+        const uint64_t sendFailures = CounterDelta(stats.sendFailures,
+                                                   adaptationStatsBase.sendFailures);
+        const uint64_t averageAckMs = ackSamples == 0 ? 0 : ackLatencyUs / ackSamples / 1000;
+        const bool congested = ackTimeouts != 0 || h264Resyncs != 0 || sendFailures != 0 ||
+            (ackSamples != 0 && averageAckMs >= 120);
+        const bool healthy = ackSamples >= 4 && averageAckMs <= 65 && ackTimeouts == 0 &&
+            h264Resyncs == 0 && sendFailures == 0;
+        int nextFps = adaptiveFps;
+        if (congested) {
+            // 乘法退避能在高延迟 Wi-Fi 下更快逃离“P 帧挤压 -> IDR”的循环。
+            nextFps = std::max(5, adaptiveFps * 3 / 4);
+        } else if (healthy) {
+            // 恢复阶段使用小步上调，避免刚恢复就再次压垮解码/网络窗口。
+            nextFps = std::min(cfg_.fps, adaptiveFps + 2);
+        }
+        if (nextFps != adaptiveFps) {
+            log::Info("adaptive stream fps " + std::to_string(adaptiveFps) + " -> " +
+                      std::to_string(nextFps) + " ack_avg_ms=" +
+                      std::to_string(averageAckMs) + " ack_timeout=" +
+                      std::to_string(ackTimeouts) + " h264_resync=" +
+                      std::to_string(h264Resyncs));
+            adaptiveFps = nextFps;
+            streamFps_.store(adaptiveFps);
+        }
+        adaptationStatsBase = stats;
+        nextAdaptation = now + std::chrono::seconds(1);
+    };
+
     while (!stop_.load()) {
         const auto t0 = std::chrono::steady_clock::now();
         logMetricsIfDue(t0);
+        adaptFrameRateIfDue(t0);
 
         // JPEG 回退需要 CPU 全帧压缩，大屏时保守限帧；H.264 模式的压缩由 MFT
         // 承担，不应仅因分辨率达到 1080p 就被无条件锁在 15 FPS，否则既浪费
         // 硬件能力，也会让编码器的 30 FPS 时间戳和实际采集节奏不一致。
-        int effectiveFps = cfg_.fps;
+        int effectiveFps = adaptiveFps;
         if ((!encoder_ || !encoder_->IsH264()) &&
             (deskWidth_.load() >= 1920 || deskHeight_.load() >= 1080)) {
             effectiveFps = std::min(effectiveFps, 15);
@@ -404,6 +469,10 @@ void Agent::CaptureLoop() {
             // 编码器仍会保留上一控制端的参考帧；新控制端绝不能从 delta 帧接续。
             streamKeyFrameRequired_ = true;
             lastFrameSent_ = {};
+            if (adaptiveFps != cfg_.fps) {
+                adaptiveFps = cfg_.fps;
+                streamFps_.store(adaptiveFps);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
@@ -572,7 +641,7 @@ std::string Agent::MakeCfgJson() const {
     }
     j["w"] = deskWidth_.load();
     j["h"] = deskHeight_.load();
-    j["fps"] = cfg_.fps;
+    j["fps"] = streamFps_.load();
     j["stream_id"] = streamId_.load();
     auto mons = nlohmann::json::array();
     for (const auto& m : capture_.Monitors()) {

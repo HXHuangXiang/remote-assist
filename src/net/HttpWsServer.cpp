@@ -163,8 +163,13 @@ void WsBroadcaster::AcknowledgeFrame(uint64_t frameId) {
     const auto it = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
         [frameId](const InFlightFrame& frame) { return frame.id == frameId; });
     if (it != inFlightFrames_.end()) {
+        const auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - it->sentAt).count();
         inFlightFrames_.erase(it);
         acknowledgedFrames_.fetch_add(1, std::memory_order_relaxed);
+        ackLatencyUs_.fetch_add(static_cast<uint64_t>(std::max<int64_t>(0, latency)),
+                                std::memory_order_relaxed);
+        ackLatencySamples_.fetch_add(1, std::memory_order_relaxed);
         frameCv_.notify_one();
     }
 }
@@ -176,6 +181,8 @@ BroadcasterStats WsBroadcaster::SnapshotStats() const {
     stats.sentFrames = sentFrames_.load(std::memory_order_relaxed);
     stats.sentBytes = sentBytes_.load(std::memory_order_relaxed);
     stats.acknowledgedFrames = acknowledgedFrames_.load(std::memory_order_relaxed);
+    stats.ackLatencyUs = ackLatencyUs_.load(std::memory_order_relaxed);
+    stats.ackLatencySamples = ackLatencySamples_.load(std::memory_order_relaxed);
     stats.ackTimeouts = ackTimeouts_.load(std::memory_order_relaxed);
     stats.sendFailures = sendFailures_.load(std::memory_order_relaxed);
     stats.h264Resyncs = h264Resyncs_.load(std::memory_order_relaxed);
@@ -293,8 +300,8 @@ HttpWsServer::~HttpWsServer() {
     Stop();
 }
 
-void HttpWsServer::SetWebDir(const std::string& dir) {
-    svr_.set_mount_point("/", dir);
+bool HttpWsServer::SetWebDir(const std::string& dir) {
+    return svr_.set_mount_point("/", dir);
 }
 
 void HttpWsServer::SetAuthVerifier(AuthVerifier v) { authVerifier_ = std::move(v); }

@@ -19,6 +19,9 @@ struct InputState {
     bool leftDown = false;
     bool rightDown = false;
     bool middleDown = false;
+    // 所有 SendInput 与状态修改均在 mutex 内串行化。Agent 停止时先关闭该开关，
+    // 再释放状态，可消除 SendInput 已执行但 ReleaseAll 尚未观察到状态的卡键竞态。
+    bool accepting = false;
     std::mutex mutex;
 };
 
@@ -51,15 +54,30 @@ bool SendRawMouseButton(DWORD flag) {
 
 }  // namespace
 
+void Input::Enable() {
+    std::lock_guard<std::mutex> lock(g_inputState.mutex);
+    g_inputState.accepting = true;
+}
+
+void Input::Disable() {
+    std::lock_guard<std::mutex> lock(g_inputState.mutex);
+    g_inputState.accepting = false;
+}
+
 bool Input::SendKey(USHORT sc, bool down, bool extended) {
+    std::lock_guard<std::mutex> lock(g_inputState.mutex);
+    if (!g_inputState.accepting) {
+        return false;
+    }
+    const size_t index = KeyIndex(sc, extended);
+    if (g_inputState.keys[index] == down) {
+        return true;
+    }
     if (!SendRawKey(sc, down, extended)) {
         log::Warn("SendInput key failed: " + std::to_string(GetLastError()));
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(g_inputState.mutex);
-        g_inputState.keys[KeyIndex(sc, extended)] = down;
-    }
+    g_inputState.keys[index] = down;
     return true;
 }
 
@@ -69,6 +87,10 @@ bool Input::SendMouseAbs(double x, double y) {
     }
     x = std::clamp(x, 0.0, 1.0);
     y = std::clamp(y, 0.0, 1.0);
+    std::lock_guard<std::mutex> lock(g_inputState.mutex);
+    if (!g_inputState.accepting) {
+        return false;
+    }
     INPUT in{};
     in.type = INPUT_MOUSE;
     in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
@@ -92,18 +114,26 @@ bool Input::SendMouseButton(const std::string& button, bool down) {
     } else {
         return false;
     }
+    std::lock_guard<std::mutex> lock(g_inputState.mutex);
+    if (!g_inputState.accepting) {
+        return false;
+    }
+    if (*state == down) {
+        return true;
+    }
     if (!SendRawMouseButton(flag)) {
         log::Warn("SendInput mouse button failed: " + std::to_string(GetLastError()));
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(g_inputState.mutex);
-        *state = down;
-    }
+    *state = down;
     return true;
 }
 
 bool Input::SendWheel(int delta) {
+    std::lock_guard<std::mutex> lock(g_inputState.mutex);
+    if (!g_inputState.accepting) {
+        return false;
+    }
     INPUT in{};
     in.type = INPUT_MOUSE;
     in.mi.dwFlags = MOUSEEVENTF_WHEEL;
@@ -112,24 +142,9 @@ bool Input::SendWheel(int delta) {
 }
 
 void Input::ReleaseAll() {
-    std::array<bool, 256> keys{};
-    bool leftDown = false;
-    bool rightDown = false;
-    bool middleDown = false;
-    {
-        std::lock_guard<std::mutex> lock(g_inputState.mutex);
-        keys = g_inputState.keys;
-        leftDown = g_inputState.leftDown;
-        rightDown = g_inputState.rightDown;
-        middleDown = g_inputState.middleDown;
-        g_inputState.keys.fill(false);
-        g_inputState.leftDown = false;
-        g_inputState.rightDown = false;
-        g_inputState.middleDown = false;
-    }
-
-    for (size_t index = 0; index < keys.size(); ++index) {
-        if (!keys[index]) {
+    std::lock_guard<std::mutex> lock(g_inputState.mutex);
+    for (size_t index = 0; index < g_inputState.keys.size(); ++index) {
+        if (!g_inputState.keys[index]) {
             continue;
         }
         const bool extended = index >= 128;
@@ -137,16 +152,20 @@ void Input::ReleaseAll() {
         if (!SendRawKey(scancode, false, extended)) {
             log::Warn("SendInput key release failed: " + std::to_string(GetLastError()));
         }
+        g_inputState.keys[index] = false;
     }
-    if (leftDown && !SendRawMouseButton(MOUSEEVENTF_LEFTUP)) {
+    if (g_inputState.leftDown && !SendRawMouseButton(MOUSEEVENTF_LEFTUP)) {
         log::Warn("SendInput left release failed: " + std::to_string(GetLastError()));
     }
-    if (rightDown && !SendRawMouseButton(MOUSEEVENTF_RIGHTUP)) {
+    if (g_inputState.rightDown && !SendRawMouseButton(MOUSEEVENTF_RIGHTUP)) {
         log::Warn("SendInput right release failed: " + std::to_string(GetLastError()));
     }
-    if (middleDown && !SendRawMouseButton(MOUSEEVENTF_MIDDLEUP)) {
+    if (g_inputState.middleDown && !SendRawMouseButton(MOUSEEVENTF_MIDDLEUP)) {
         log::Warn("SendInput middle release failed: " + std::to_string(GetLastError()));
     }
+    g_inputState.leftDown = false;
+    g_inputState.rightDown = false;
+    g_inputState.middleDown = false;
 }
 
 }  // namespace remote_assist

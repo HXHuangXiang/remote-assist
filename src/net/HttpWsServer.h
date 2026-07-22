@@ -25,6 +25,10 @@ struct BroadcasterStats {
     uint64_t sentFrames = 0;
     uint64_t sentBytes = 0;
     uint64_t acknowledgedFrames = 0;
+    // 从发送线程完成写入到浏览器绘制确认的累计延迟，用于 Agent 在不堆积 H.264
+    // 参考帧的前提下自适应降低采集帧率。
+    uint64_t ackLatencyUs = 0;
+    uint64_t ackLatencySamples = 0;
     uint64_t ackTimeouts = 0;
     uint64_t sendFailures = 0;
     // H.264 的增量帧不能跳帧。此计数表示发送队列检测到将要覆盖增量帧，
@@ -92,6 +96,8 @@ private:
     std::atomic<uint64_t> sentFrames_{0};
     std::atomic<uint64_t> sentBytes_{0};
     std::atomic<uint64_t> acknowledgedFrames_{0};
+    std::atomic<uint64_t> ackLatencyUs_{0};
+    std::atomic<uint64_t> ackLatencySamples_{0};
     std::atomic<uint64_t> ackTimeouts_{0};
     std::atomic<uint64_t> sendFailures_{0};
     std::atomic<uint64_t> h264Resyncs_{0};
@@ -111,7 +117,9 @@ public:
     HttpWsServer(const HttpWsServer&) = delete;
     HttpWsServer& operator=(const HttpWsServer&) = delete;
 
-    void SetWebDir(const std::string& dir);
+    // 挂载控制端静态资源。目录不存在时返回 false，避免服务端口已监听但浏览器
+    // 只能得到 404 的半可用状态。
+    bool SetWebDir(const std::string& dir);
     void SetAuthVerifier(AuthVerifier v);
     void SetCfgProvider(CfgProvider p);
     void SetOnMessage(OnMessage cb);

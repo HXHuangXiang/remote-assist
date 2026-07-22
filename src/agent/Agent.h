@@ -56,6 +56,9 @@ private:
     std::atomic<bool> streamH264_{false};
     // 从 SPS 提取的 avc1.PPCCLL，供 WebSocket 线程安全生成浏览器解码配置。
     std::atomic<uint32_t> streamH264Profile_{0x42E01E};
+    // cfg_.fps 是用户配置的上限。采集线程按浏览器 ACK 与 H.264 重同步状态动态下调，
+    // 防止慢链路堆满两帧窗口后反复丢弃增量帧。
+    std::atomic<int> streamFps_{30};
     bool encoderReady_ = false;
     // 连接重建、切屏和解码器恢复后，在看到真正的 H.264 IDR 前不发送增量帧。
     // 仅由采集线程访问。

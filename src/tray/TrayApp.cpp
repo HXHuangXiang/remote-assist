@@ -48,8 +48,19 @@ TrayApp::~TrayApp() {
 }
 
 LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lp);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+    }
+    auto* self = reinterpret_cast<TrayApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (self && self->taskbarCreatedMessage_ != 0 &&
+        msg == self->taskbarCreatedMessage_) {
+        // Explorer 重启会清空通知区域图标，但 Tray 进程本身仍存活；必须重新添加。
+        self->AddIconToTaskbar();
+        return 0;
+    }
     if (msg == kCallbackMessage) {
-        auto* self = reinterpret_cast<TrayApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (self) {
             if (lp == WM_RBUTTONUP) {
                 self->ShowMenu();
@@ -60,7 +71,6 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_COMMAND) {
-        auto* self = reinterpret_cast<TrayApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (!self) {
             return 0;
         }
@@ -90,17 +100,38 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void TrayApp::CreateIcon() {
+bool TrayApp::AddIconToTaskbar() {
+    if (!hwnd_) {
+        return false;
+    }
+    if (!Shell_NotifyIconW(NIM_ADD, &nid_)) {
+        log::Error("Shell_NotifyIcon(NIM_ADD) failed: " + std::to_string(GetLastError()));
+        return false;
+    }
+    iconAdded_ = true;
+    // 使用当前 Shell 支持的现代回调约定；旧系统会安全忽略该请求。
+    nid_.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &nid_);
+    return true;
+}
+
+bool TrayApp::CreateIcon() {
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = &TrayApp::WndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = kClassName;
-    RegisterClassExW(&wc);
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        log::Error("RegisterClassExW failed: " + std::to_string(GetLastError()));
+        return false;
+    }
 
     hwnd_ = CreateWindowExW(0, kClassName, L"RemoteAssist Tray", 0,
-                            0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
-    SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+                            0, 0, 0, 0, nullptr, nullptr, wc.hInstance, this);
+    if (!hwnd_) {
+        log::Error("CreateWindowExW(tray) failed: " + std::to_string(GetLastError()));
+        return false;
+    }
 
     nid_.cbSize = sizeof(nid_);
     nid_.hWnd = hwnd_;
@@ -109,14 +140,26 @@ void TrayApp::CreateIcon() {
     nid_.uCallbackMessage = kCallbackMessage;
     nid_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(nid_.szTip, L"RemoteAssist");
-    Shell_NotifyIconW(NIM_ADD, &nid_);
-
     hMenu_ = CreatePopupMenu();
+    if (!hMenu_) {
+        log::Error("CreatePopupMenu failed: " + std::to_string(GetLastError()));
+        DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+        return false;
+    }
     AppendMenuW(hMenu_, MF_STRING, kMenuCommandOpenSetup, L"打开配置窗口");
     AppendMenuW(hMenu_, MF_STRING, kMenuCommandShowPw, L"显示首次访问密码");
     AppendMenuW(hMenu_, MF_STRING, kMenuCommandAbout, L"关于 RemoteAssist");
     AppendMenuW(hMenu_, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu_, MF_STRING, kMenuCommandExit, L"退出托盘（服务继续运行）");
+    if (!AddIconToTaskbar()) {
+        DestroyMenu(hMenu_);
+        hMenu_ = nullptr;
+        DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+        return false;
+    }
+    return true;
 }
 
 void TrayApp::ShowMenu() {
@@ -127,6 +170,7 @@ void TrayApp::ShowMenu() {
     GetCursorPos(&pt);
     SetForegroundWindow(hwnd_);
     TrackPopupMenu(hMenu_, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd_, nullptr);
+    PostMessageW(hwnd_, WM_NULL, 0, 0);
 }
 
 void TrayApp::OpenSetupWindow() {
@@ -156,10 +200,11 @@ void TrayApp::ShowPasswordDialog() {
 }
 
 void TrayApp::RemoveIcon() {
-    if (nid_.hWnd) {
+    if (iconAdded_) {
         Shell_NotifyIconW(NIM_DELETE, &nid_);
-        nid_.hWnd = nullptr;
+        iconAdded_ = false;
     }
+    nid_.hWnd = nullptr;
     if (hMenu_) {
         DestroyMenu(hMenu_);
         hMenu_ = nullptr;
@@ -187,7 +232,13 @@ int TrayApp::Run() {
 
     password_ = ReadAndDeleteInitialPassword();
 
-    CreateIcon();
+    taskbarCreatedMessage_ = RegisterWindowMessageW(L"TaskbarCreated");
+    if (!CreateIcon()) {
+        ReleaseMutex(instanceMutex_);
+        CloseHandle(instanceMutex_);
+        instanceMutex_ = nullptr;
+        return 1;
+    }
     if (!password_.empty()) {
         // 首次启动弹一次密码,降低用户漏看的概率。
         ShowPasswordDialog();
