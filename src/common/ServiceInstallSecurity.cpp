@@ -309,7 +309,7 @@ bool ValidateDirectoryTree(const std::wstring& directory, const wchar_t* resourc
     const std::wstring pattern = JoinPath(directory, L"*");
     HANDLE find = FindFirstFileW(pattern.c_str(), &data);
     if (find == INVALID_HANDLE_VALUE) {
-        reason = L"无法枚举" + resourceName + L"：" + directory;
+        reason = std::wstring(L"无法枚举") + resourceName + L"：" + directory;
         return false;
     }
     bool valid = true;
