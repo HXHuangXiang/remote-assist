@@ -8,7 +8,6 @@
 #include "net/HttpWsServer.h"
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -75,8 +74,6 @@ private:
     // 连接重建、切屏和解码器恢复后，在看到真正的 H.264 IDR 前不发送增量帧。
     // 仅由采集线程访问。
     bool streamKeyFrameRequired_ = true;
-    uint64_t previousFrameFingerprint_ = 0;
-    std::chrono::steady_clock::time_point lastFrameSent_{};
     bool firstFrame_ = true;
 };
 

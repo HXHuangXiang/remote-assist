@@ -15,7 +15,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
-#include <cstring>
 #include <string>
 
 #pragma comment(lib, "ole32.lib")
@@ -37,20 +36,6 @@ std::string WideToUtf8(const std::wstring& w) {
     return s;
 }
 
-// 对缩放后的 BGRA 帧做等步长采样哈希。相比保存完整上一帧，避免每个 1080p
-// 帧额外复制约 8MB；一秒一次的强制刷新兜底极小区域恰好未被采样的情况。
-uint64_t FrameFingerprint(const std::vector<uint8_t>& frame) {
-    constexpr size_t kStride = 64;
-    uint64_t hash = 1469598103934665603ULL;
-    for (size_t offset = 0; offset + sizeof(uint32_t) <= frame.size(); offset += kStride) {
-        uint32_t pixel = 0;
-        std::memcpy(&pixel, frame.data() + offset, sizeof(pixel));
-        hash ^= pixel;
-        hash *= 1099511628211ULL;
-    }
-    return hash ^ static_cast<uint64_t>(frame.size());
-}
-
 // 采集线程私有统计，按窗口输出增量而非每帧打日志，既便于定位性能瓶颈又不会
 // 因日志 I/O 干扰远控体验。
 struct CaptureLoopStats {
@@ -60,7 +45,6 @@ struct CaptureLoopStats {
     uint64_t noChangeFrames = 0;
     uint64_t pointerOnlyFrames = 0;
     uint64_t captureFailures = 0;
-    uint64_t fingerprintSkipped = 0;
     uint64_t encodeAttempts = 0;
     uint64_t encodedFrames = 0;
     uint64_t encodeFailures = 0;
@@ -519,7 +503,6 @@ void Agent::CaptureLoop() {
                       " direct=" + std::to_string(metrics.directMappedFrames) +
                       " unchanged=" + std::to_string(metrics.noChangeFrames) +
                       " pointer_only=" + std::to_string(metrics.pointerOnlyFrames) +
-                      " sampled_skip=" + std::to_string(metrics.fingerprintSkipped) +
                       " capture_fail=" + std::to_string(metrics.captureFailures) +
                       " capture_avg_ms=" + std::to_string(avgCaptureMs) +
                       " encode=" + std::to_string(metrics.encodedFrames) + "/" +
@@ -690,7 +673,6 @@ void Agent::CaptureLoop() {
                 capture_.ResetForDesktop();
                 firstFrame_ = true;
                 streamKeyFrameRequired_ = true;
-                lastFrameSent_ = {};
                 if (displayChanged) {
                     server_.Broadcaster().BroadcastText(MakeCfgJson());
                 }
@@ -705,7 +687,6 @@ void Agent::CaptureLoop() {
             }
             // 编码器仍会保留上一控制端的参考帧；新控制端绝不能从 delta 帧接续。
             streamKeyFrameRequired_ = true;
-            lastFrameSent_ = {};
             restoreQualityForNextController();
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
@@ -719,7 +700,6 @@ void Agent::CaptureLoop() {
         if (frameResetRequested_.exchange(false)) {
             firstFrame_ = true;
             streamKeyFrameRequired_ = true;
-            lastFrameSent_ = {};
         }
 
         // H.264 delta 之间有参考关系。发送槽位已经存在一张尚未发出的 delta 时，
@@ -789,19 +769,9 @@ void Agent::CaptureLoop() {
         CapturedFrameLease frameLease(capture_, frame);
 
         const bool needsFreshFrame = firstFrame_;
-        if (!frame.IsDirectDxgi()) {
-            const uint64_t frameFingerprint = FrameFingerprint(frame.data);
-            const bool refreshDue = lastFrameSent_.time_since_epoch().count() == 0 ||
-                t0 - lastFrameSent_ >= std::chrono::seconds(1);
-            if (!firstFrame_ && !streamKeyFrameRequired_ &&
-                frameFingerprint == previousFrameFingerprint_ && !refreshDue) {
-                metrics.fingerprintSkipped++;
-                frameLease.Release();
-                std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
-                continue;
-            }
-            previousFrameFingerprint_ = frameFingerprint;
-        }
+        // DXGI 已经以 kNoChange/kPointerOnly 过滤静态桌面；GDI 则在原始 DIB 上
+        // 完成一次采样过滤。不要在缩放后的帧上做第二次哈希：它会额外读取整张
+        // CPU 帧，且采样碰撞会把已确认变化的画面推迟到下一次强制刷新。
         firstFrame_ = false;
 
         if (!encoder_ || frame.width != deskWidth_.load() || frame.height != deskHeight_.load()) {
@@ -864,7 +834,6 @@ void Agent::CaptureLoop() {
                         server_.Broadcaster().BroadcastText(MakeCfgJson());
                     }
                 }
-                bool sent = false;
                 for (auto& c : chunks) {
                     if (c.data.empty()) {
                         continue;
@@ -887,16 +856,8 @@ void Agent::CaptureLoop() {
                         streamKeyFrameRequired_ = true;
                         encoder_->RequestKeyFrame();
                         log::Warn("H.264 pending delta dropped, requesting IDR resync");
-                        // 本轮若此前仅入队了待发送帧，它已经被清空，不能把它
-                        // 计作已输出的新画面。
-                        sent = false;
                         break;
                     }
-                    sent = queueResult == FrameQueueResult::kQueued ||
-                        queueResult == FrameQueueResult::kReplaced;
-                }
-                if (sent) {
-                    lastFrameSent_ = std::chrono::steady_clock::now();
                 }
             } else {
                 metrics.encodeFailures++;
