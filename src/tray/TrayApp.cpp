@@ -2,6 +2,7 @@
 
 #include "common/Config.h"
 #include "common/Log.h"
+#include "common/RuntimeNames.h"
 
 #include <fstream>
 #include <iterator>
@@ -39,6 +40,10 @@ std::wstring ReadAndDeleteInitialPassword() {
 
 TrayApp::~TrayApp() {
     RemoveIcon();
+    if (instanceMutex_) {
+        CloseHandle(instanceMutex_);
+        instanceMutex_ = nullptr;
+    }
 }
 
 LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -57,6 +62,10 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
             case kMenuCommandShowPw:
                 self->ShowPasswordDialog();
+                break;
+            case kMenuCommandAbout:
+                MessageBoxW(hwnd, L"RemoteAssist 局域网远程协助\n服务运行状态请在配置窗口查看。",
+                            L"关于 RemoteAssist", MB_OK | MB_ICONINFORMATION);
                 break;
             case kMenuCommandExit:
                 DestroyWindow(hwnd);
@@ -137,6 +146,19 @@ int TrayApp::Run() {
     log::Init(LogDir());
     log::Info("tray starting");
 
+    instanceMutex_ = CreateMutexW(nullptr, FALSE, runtime::kTrayMutexName);
+    const DWORD mutexError = GetLastError();
+    if (!instanceMutex_) {
+        log::Error("tray mutex creation failed: " + std::to_string(mutexError));
+        return 1;
+    }
+    if (mutexError == ERROR_ALREADY_EXISTS) {
+        log::Info("tray already running in this session, skip duplicate launch");
+        CloseHandle(instanceMutex_);
+        instanceMutex_ = nullptr;
+        return 0;
+    }
+
     password_ = ReadAndDeleteInitialPassword();
 
     CreateIcon();
@@ -152,6 +174,8 @@ int TrayApp::Run() {
     }
 
     RemoveIcon();
+    CloseHandle(instanceMutex_);
+    instanceMutex_ = nullptr;
     log::Info("tray exit");
     return 0;
 }

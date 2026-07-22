@@ -12,7 +12,7 @@ GET / 返回 web/index.html;GET /app.js、/app.css 返回静态资源。
 
     {"t":"auth","token":"<明文密码>"}
 
-agent 校验 SHA-256(salt + token) == password_hash,失败则发送 {"t":"auth","ok":false,"reason":"bad token"} 并断开;成功发 {"t":"auth","ok":true} 并进入流模式。
+agent 按 config.json 的 password_iterations 使用 PBKDF2-SHA256 校验 token；缺少该字段的历史配置兼容 SHA-256(salt + token)。失败则发送 {"t":"auth","ok":false,"reason":"bad token"} 并断开;成功发 {"t":"auth","ok":true} 并进入流模式。
 
 ### 下行(agent -> 浏览器)
 

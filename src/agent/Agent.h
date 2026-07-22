@@ -31,6 +31,7 @@ public:
 private:
     void CaptureLoop();
     void OnMessage(const std::string& msg);
+    void OnControllerDisconnected();
     std::string MakeCfgJson() const;
     static std::string WebDirFromExe();
 

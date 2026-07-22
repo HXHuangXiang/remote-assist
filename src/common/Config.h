@@ -8,6 +8,8 @@ struct Config {
     int port = 7980;
     std::string passwordHash;
     std::string salt;
+    // 0 表示兼容历史 SHA-256；正数表示 PBKDF2-SHA256 的迭代次数。
+    int passwordIterations = 0;
     int bitrate = 4'000'000;
     int fps = 30;
     std::string initialPassword;

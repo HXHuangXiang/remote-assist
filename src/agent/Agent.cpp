@@ -111,6 +111,7 @@ int Agent::Run(bool serviceManaged) {
     });
     server_.SetCfgProvider([this]() { return MakeCfgJson(); });
     server_.SetOnMessage([this](const std::string& msg) { OnMessage(msg); });
+    server_.SetOnControllerDisconnected([this]() { OnControllerDisconnected(); });
 
     if (!server_.Start("0.0.0.0", cfg_.port)) {
         log::Error("agent: server start failed");
@@ -140,6 +141,14 @@ int Agent::Run(bool serviceManaged) {
 void Agent::Stop() {
     if (stop_.exchange(true)) {
         return;
+    }
+    // 服务停止不应依赖浏览器正常发送 keyup。主线程临时绑定当前输入桌面，
+    // 尽早释放控制端遗留的修饰键和鼠标按键，再等待 WebSocket 工作线程退出。
+    DesktopAccess shutdownDesktop;
+    if (shutdownDesktop.Bind()) {
+        Input::ReleaseAll();
+    } else {
+        log::Warn("agent stop: unable to bind input desktop for input release");
     }
     server_.Stop();
     if (captureThread_.joinable()) {
@@ -181,6 +190,17 @@ void Agent::CaptureLoop() {
                 prevFrame_.clear();
                 firstFrame_ = true;
             }
+        }
+
+        // 没有控制端时不做抓屏、缩放和 JPEG 编码，既避免空转占用 CPU，
+        // 也在下一次客户端连接时强制重新输出首帧。
+        if (server_.Broadcaster().Count() == 0) {
+            if (!firstFrame_ || !prevFrame_.empty()) {
+                firstFrame_ = true;
+                prevFrame_.clear();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
         }
 
         CapturedFrame frame;
@@ -268,6 +288,7 @@ std::string Agent::MakeCfgJson() const {
         mons.push_back({{"index", m.index}, {"name", m.name}, {"w", m.w}, {"h", m.h}});
     }
     j["monitors"] = mons;
+    j["selected_monitor"] = capture_.SelectedMonitor();
     return j.dump();
 }
 
@@ -329,6 +350,12 @@ void Agent::OnMessage(const std::string& msg) {
         capture_.SetMonitor(idx);
         log::Info("monitor switched to idx=" + std::to_string(idx));
     }
+}
+
+void Agent::OnControllerDisconnected() {
+    // 该回调在接收输入的 WebSocket 工作线程中运行。若本连接曾注入过输入，
+    // 线程已经绑定了对应 desktop，可直接释放远端残留的按下状态。
+    Input::ReleaseAll();
 }
 
 }  // namespace remote_assist

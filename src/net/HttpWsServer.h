@@ -5,6 +5,7 @@
 #include <httplib.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <condition_variable>
 #include <functional>
@@ -48,6 +49,7 @@ private:
 class HttpWsServer {
 public:
     using OnMessage = std::function<void(const std::string& msg)>;
+    using OnControllerDisconnected = std::function<void()>;
     using AuthVerifier = std::function<bool(const std::string& token)>;
     using CfgProvider = std::function<std::string()>;
 
@@ -61,17 +63,26 @@ public:
     void SetAuthVerifier(AuthVerifier v);
     void SetCfgProvider(CfgProvider p);
     void SetOnMessage(OnMessage cb);
+    void SetOnControllerDisconnected(OnControllerDisconnected cb);
     WsBroadcaster& Broadcaster() { return broadcaster_; }
 
     bool Start(const std::string& host, int port);
     void Stop();
 
 private:
+    bool CanAttemptAuth();
+    void RecordAuthFailure();
+    void ResetAuthFailures();
+
     httplib::Server svr_;
     WsBroadcaster broadcaster_;
     AuthVerifier authVerifier_;
     CfgProvider cfgProvider_;
     OnMessage onMessage_;
+    OnControllerDisconnected onControllerDisconnected_;
+    std::mutex authMu_;
+    int authFailures_ = 0;
+    std::chrono::steady_clock::time_point nextAuthAt_{};
     std::atomic<bool> running_{false};
     std::thread thread_;
 };

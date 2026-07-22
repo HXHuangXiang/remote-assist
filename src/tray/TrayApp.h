@@ -29,7 +29,7 @@ private:
     HMENU hMenu_ = nullptr;
     NOTIFYICONDATAW nid_ = {};
     std::wstring password_;  // 从 .initial-password 读到的明文,读后文件删除
+    HANDLE instanceMutex_ = nullptr;
 };
 
 }  // namespace remote_assist
-

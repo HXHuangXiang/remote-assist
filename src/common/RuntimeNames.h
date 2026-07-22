@@ -6,5 +6,6 @@ namespace remote_assist::runtime {
 inline constexpr wchar_t kServiceName[] = L"remote-assist";
 inline constexpr wchar_t kAgentMutexName[] = L"Global\\RemoteAssistAgent";
 inline constexpr wchar_t kAgentStopEventName[] = L"Global\\RemoteAssistAgentStop";
+inline constexpr wchar_t kTrayMutexName[] = L"Local\\RemoteAssistTray";
 
 }  // namespace remote_assist::runtime

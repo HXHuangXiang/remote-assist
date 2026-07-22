@@ -28,6 +28,8 @@ constexpr int kMinFps = 1;
 constexpr int kMaxFps = 60;
 constexpr int kMinBitrate = 100'000;
 constexpr int kMaxBitrate = 50'000'000;
+constexpr int kPasswordIterations = 210'000;
+constexpr int kMaxPasswordIterations = 1'000'000;
 
 int HexValue(char ch) {
     if (ch >= '0' && ch <= '9') return ch - '0';
@@ -43,6 +45,19 @@ bool IsHex(const std::string& value, size_t expectedLength) {
     });
 }
 
+bool HexToBytes(const std::string& value, std::vector<uint8_t>& bytes) {
+    if (!IsHex(value, 32)) {
+        return false;
+    }
+    bytes.clear();
+    bytes.reserve(value.size() / 2);
+    for (size_t i = 0; i < value.size(); i += 2) {
+        bytes.push_back(static_cast<uint8_t>((HexValue(value[i]) << 4) |
+                                             HexValue(value[i + 1])));
+    }
+    return true;
+}
+
 std::string ToHex(const uint8_t* data, size_t len) {
     static const char* kHex = "0123456789abcdef";
     std::string s;
@@ -56,15 +71,9 @@ std::string ToHex(const uint8_t* data, size_t len) {
 
 // 用 CNG BCrypt 计算 SHA-256(saltBytes || tokenUtf8),返回 hex 小写。
 std::string Sha256Hex(const std::string& saltHex, const std::string& token) {
-    if (!IsHex(saltHex, 32)) {
-        return {};
-    }
     std::vector<uint8_t> saltBytes;
-    saltBytes.reserve(saltHex.size() / 2);
-    for (size_t i = 0; i + 1 < saltHex.size(); i += 2) {
-        const auto v = static_cast<uint8_t>((HexValue(saltHex[i]) << 4) |
-                                            HexValue(saltHex[i + 1]));
-        saltBytes.push_back(v);
+    if (!HexToBytes(saltHex, saltBytes)) {
+        return {};
     }
     std::vector<uint8_t> input = saltBytes;
     input.insert(input.end(), token.begin(), token.end());
@@ -92,6 +101,30 @@ std::string Sha256Hex(const std::string& saltHex, const std::string& token) {
     return ToHex(hash, sizeof(hash));
 }
 
+// 通过 PBKDF2-SHA256 拉伸密码，降低局域网口令被离线/在线猜测的速度。
+std::string Pbkdf2Sha256Hex(const std::string& saltHex, const std::string& token,
+                            int iterations) {
+    std::vector<uint8_t> saltBytes;
+    if (!HexToBytes(saltHex, saltBytes) || iterations <= 0) {
+        return {};
+    }
+
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+        return {};
+    }
+    uint8_t hash[32] = {};
+    const NTSTATUS status = BCryptDeriveKeyPBKDF2(
+        hAlg,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(token.data())),
+        static_cast<ULONG>(token.size()),
+        saltBytes.data(), static_cast<ULONG>(saltBytes.size()),
+        static_cast<ULONGLONG>(iterations),
+        hash, sizeof(hash), 0);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return status == 0 ? ToHex(hash, sizeof(hash)) : std::string();
+}
+
 std::string GenRandomHex(size_t bytes) {
     std::vector<uint8_t> buf(bytes);
     if (BCryptGenRandom(nullptr, buf.data(), static_cast<ULONG>(buf.size()),
@@ -114,6 +147,9 @@ bool IsConfigValid(const Config& cfg) {
     return cfg.port >= kMinPort && cfg.port <= kMaxPort &&
            cfg.fps >= kMinFps && cfg.fps <= kMaxFps &&
            cfg.bitrate >= kMinBitrate && cfg.bitrate <= kMaxBitrate &&
+           (cfg.passwordIterations == 0 ||
+               (cfg.passwordIterations >= kPasswordIterations &&
+                cfg.passwordIterations <= kMaxPasswordIterations)) &&
            IsHex(cfg.salt, 32) && IsHex(cfg.passwordHash, 64);
 }
 
@@ -122,6 +158,7 @@ bool WriteConfigAtomically(const Config& cfg) {
     j["port"] = cfg.port;
     j["password_hash"] = cfg.passwordHash;
     j["salt"] = cfg.salt;
+    j["password_iterations"] = cfg.passwordIterations;
     j["bitrate"] = cfg.bitrate;
     j["fps"] = cfg.fps;
 
@@ -190,6 +227,7 @@ Config LoadOrCreateConfig() {
                 cfg.port = j.value("port", cfg.port);
                 cfg.passwordHash = j.value("password_hash", cfg.passwordHash);
                 cfg.salt = j.value("salt", cfg.salt);
+                cfg.passwordIterations = j.value("password_iterations", 0);
                 cfg.bitrate = j.value("bitrate", cfg.bitrate);
                 cfg.fps = j.value("fps", cfg.fps);
                 loaded = IsConfigValid(cfg);
@@ -209,7 +247,9 @@ Config LoadOrCreateConfig() {
     if (cfg.passwordHash.empty() || cfg.salt.empty()) {
         cfg.salt = GenRandomHex(16);
         cfg.initialPassword = GenReadablePassword();
-        cfg.passwordHash = Sha256Hex(cfg.salt, cfg.initialPassword);
+        cfg.passwordIterations = kPasswordIterations;
+        cfg.passwordHash = Pbkdf2Sha256Hex(cfg.salt, cfg.initialPassword,
+                                           cfg.passwordIterations);
 
         if (!IsConfigValid(cfg)) {
             log::Error("config generation failed");
@@ -242,7 +282,10 @@ bool VerifyPassword(const Config& cfg, const std::string& token) {
     if (!IsConfigValid(cfg) || token.empty()) {
         return false;
     }
-    return ConstantTimeEquals(Sha256Hex(cfg.salt, token), cfg.passwordHash);
+    const std::string calculated = cfg.passwordIterations > 0
+        ? Pbkdf2Sha256Hex(cfg.salt, token, cfg.passwordIterations)
+        : Sha256Hex(cfg.salt, token);
+    return ConstantTimeEquals(calculated, cfg.passwordHash);
 }
 
 bool SaveConfig(const Config& cfg) {
@@ -255,7 +298,8 @@ bool SaveConfig(const Config& cfg) {
 
 bool SetPassword(Config& cfg, const std::string& password) {
     if (!IsHex(cfg.salt, 32)) cfg.salt = GenRandomHex(16);
-    cfg.passwordHash = Sha256Hex(cfg.salt, password);
+    cfg.passwordIterations = kPasswordIterations;
+    cfg.passwordHash = Pbkdf2Sha256Hex(cfg.salt, password, cfg.passwordIterations);
     return SaveConfig(cfg);
 }
 

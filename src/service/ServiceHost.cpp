@@ -14,7 +14,9 @@ namespace remote_assist {
 namespace {
 
 constexpr DWORD kMonitorIntervalMs = 2000;
-constexpr DWORD kAgentStopTimeoutMs = 5000;
+// httplib 的 WebSocket 读超时被收敛到 5 秒；为正常的关闭收尾额外预留空间，
+// 避免 SCM 停服务时退化为强制终止 agent。
+constexpr DWORD kAgentStopTimeoutMs = 8000;
 constexpr DWORD kTrayStopTimeoutMs = 1000;
 
 struct ServiceState {

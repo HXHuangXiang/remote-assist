@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 
 namespace remote_assist {
 
@@ -102,8 +103,34 @@ void HttpWsServer::SetWebDir(const std::string& dir) {
 void HttpWsServer::SetAuthVerifier(AuthVerifier v) { authVerifier_ = std::move(v); }
 void HttpWsServer::SetCfgProvider(CfgProvider p) { cfgProvider_ = std::move(p); }
 void HttpWsServer::SetOnMessage(OnMessage cb) { onMessage_ = std::move(cb); }
+void HttpWsServer::SetOnControllerDisconnected(OnControllerDisconnected cb) {
+    onControllerDisconnected_ = std::move(cb);
+}
+
+bool HttpWsServer::CanAttemptAuth() {
+    std::lock_guard<std::mutex> lk(authMu_);
+    return std::chrono::steady_clock::now() >= nextAuthAt_;
+}
+
+void HttpWsServer::RecordAuthFailure() {
+    std::lock_guard<std::mutex> lk(authMu_);
+    authFailures_ = std::min(authFailures_ + 1, 6);
+    const int backoffSeconds = 1 << (authFailures_ - 1);
+    nextAuthAt_ = std::chrono::steady_clock::now() +
+        std::chrono::seconds(backoffSeconds);
+}
+
+void HttpWsServer::ResetAuthFailures() {
+    std::lock_guard<std::mutex> lk(authMu_);
+    authFailures_ = 0;
+    nextAuthAt_ = {};
+}
 
 bool HttpWsServer::Start(const std::string& host, int port) {
+    // 远控报文很小且延迟敏感，禁用 Nagle；同时限制 HTTP 请求体，避免未使用的
+    // 上传路径被大请求占用内存。WebSocket 报文上限由 CMake 宏单独收紧。
+    svr_.set_tcp_nodelay(true);
+    svr_.set_payload_max_length(64 * 1024);
     // 发送超时保护发送线程，避免失联浏览器长期占用 socket 写操作。
     svr_.set_write_timeout(2, 0);
     svr_.WebSocket("/ws", [this](const httplib::Request&, httplib::ws::WebSocket& ws) {
@@ -113,6 +140,11 @@ bool HttpWsServer::Start(const std::string& host, int port) {
         if (r != httplib::ws::Text) {
             ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"need auth first\"}");
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "no auth");
+            return;
+        }
+        if (!CanAttemptAuth()) {
+            ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"retry later\"}");
+            ws.close(httplib::ws::CloseStatus::PolicyViolation, "retry later");
             return;
         }
         bool ok = false;
@@ -128,10 +160,12 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             ok = false;
         }
         if (!ok) {
+            RecordAuthFailure();
             ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"bad token\"}");
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "bad token");
             return;
         }
+        ResetAuthFailures();
         ws.send("{\"t\":\"auth\",\"ok\":true}");
         if (cfgProvider_) {
             ws.send(cfgProvider_());
@@ -155,6 +189,9 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             }
         }
         broadcaster_.Remove(&ws);
+        if (onControllerDisconnected_) {
+            onControllerDisconnected_();
+        }
         log::Info("ws client disconnected");
     });
 

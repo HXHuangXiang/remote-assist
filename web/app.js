@@ -3,6 +3,9 @@ let pendingFrame = null, imgLoading = false;
 let pendingMove = null, moveQueued = false;
 let ws = null, cfg = null, authed = false;
 let canvas, ctx, logEl, statusEl, pwEl, monSel;
+const pressedKeys = new Map();
+const pressedButtons = new Set();
+let lastPointer = { x: 0.5, y: 0.5 };
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
@@ -22,6 +25,7 @@ function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const url = proto + '://' + host + ':' + port + '/ws';
   log('connecting ' + url);
+  releasePressedInputs();
   if (ws) { ws.close(); ws = null; }
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
@@ -32,7 +36,11 @@ function connect() {
       handleText(m);
     } else { handleBinary(new Uint8Array(ev.data)); }
   };
-  ws.onclose = function() { log('disconnected'); setStatus('未连接'); authed = false; };
+  ws.onclose = function() {
+    pressedKeys.clear();
+    pressedButtons.clear();
+    log('disconnected'); setStatus('未连接'); authed = false;
+  };
   ws.onerror = function() { log('ws error'); };
 }
 
@@ -53,12 +61,11 @@ function setupCfg(c) {
   cfg = c;
     canvas.width = c.w; canvas.height = c.h;
     fitCanvas();
-    if (c.monitors) populateMonitors(c.monitors);
+    if (c.monitors) populateMonitors(c.monitors, c.selected_monitor);
     log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps);
 }
 
-function populateMonitors(list) {
-  monSel.onchange = null;
+function populateMonitors(list, selectedMonitor) {
   monSel.innerHTML = '';
   const all = document.createElement('option');
   all.value = '-1'; all.textContent = '全部屏幕';
@@ -68,7 +75,7 @@ function populateMonitors(list) {
     o.value = m.index; o.textContent = m.name + ' (' + m.w + 'x' + m.h + ')';
     monSel.appendChild(o);
   });
-  monSel.onchange = function() { send({t:'monitor', index: parseInt(monSel.value)}); };
+  monSel.value = String(Number.isInteger(selectedMonitor) ? selectedMonitor : -1);
 }
 
 function handleBinary(data) {
@@ -98,12 +105,25 @@ function send(obj) { if (ws && ws.readyState === WebSocket.OPEN && authed) ws.se
 function btnName(b) { return b === 1 ? 'middle' : b === 2 ? 'right' : 'left'; }
 function queueMove(e) {
   pendingMove = normXY(e);
+  lastPointer = pendingMove;
   if (moveQueued) return;
   moveQueued = true;
   requestAnimationFrame(function() {
     moveQueued = false;
     if (pendingMove) { send({t:'move', x:pendingMove.x, y:pendingMove.y}); pendingMove = null; }
   });
+}
+
+function releasePressedInputs() {
+  if (!authed) return;
+  pressedKeys.forEach(function(v) {
+    send({t:'key', sc:v.sc, ext:v.ext, down:false});
+  });
+  pressedKeys.clear();
+  pressedButtons.forEach(function(button) {
+    send({t:'mouse', x:lastPointer.x, y:lastPointer.y, btn:button, down:false});
+  });
+  pressedButtons.clear();
 }
 
 const codeToSc = {
@@ -140,21 +160,54 @@ window.addEventListener('DOMContentLoaded', function() {
   monSel = document.getElementById('monitor');
   document.getElementById('connect').addEventListener('click', connect);
   pwEl.addEventListener('keydown', function(e) { if (e.key === 'Enter') connect(); });
-  monSel.addEventListener('change', function() { send({t:'monitor', index: parseInt(monSel.value)}); });
+  monSel.addEventListener('change', function() { send({t:'monitor', index: parseInt(monSel.value, 10)}); });
   window.addEventListener('resize', fitCanvas);
   window.addEventListener('keydown', function(e) {
     if (!authed) return;
     const sc = codeToSc[e.code];
-    if (sc !== undefined) { e.preventDefault(); send({t:'key', sc: sc, ext:extendedKeys.has(e.code), down: true}); }
+    if (sc !== undefined) {
+      e.preventDefault();
+      if (!pressedKeys.has(e.code)) {
+        const key = {sc:sc, ext:extendedKeys.has(e.code)};
+        pressedKeys.set(e.code, key);
+        send({t:'key', sc:key.sc, ext:key.ext, down:true});
+      }
+    }
   });
   window.addEventListener('keyup', function(e) {
     if (!authed) return;
     const sc = codeToSc[e.code];
-    if (sc !== undefined) { e.preventDefault(); send({t:'key', sc: sc, ext:extendedKeys.has(e.code), down: false}); }
+    if (sc !== undefined) {
+      e.preventDefault();
+      const key = pressedKeys.get(e.code);
+      if (key) {
+        pressedKeys.delete(e.code);
+        send({t:'key', sc:key.sc, ext:key.ext, down:false});
+      }
+    }
   });
   canvas.addEventListener('mousemove', function(e) { if(!authed) return; queueMove(e); });
-  canvas.addEventListener('mousedown', function(e) { if(!authed) return; const p = normXY(e); send({t:'mouse', x:p.x, y:p.y, btn:btnName(e.button), down:true}); e.preventDefault(); });
-  canvas.addEventListener('mouseup', function(e) { if(!authed) return; const p = normXY(e); send({t:'mouse', x:p.x, y:p.y, btn:btnName(e.button), down:false}); });
+  canvas.addEventListener('mousedown', function(e) {
+    if (!authed) return;
+    const p = normXY(e);
+    const button = btnName(e.button);
+    lastPointer = p;
+    pressedButtons.add(button);
+    canvas.focus();
+    send({t:'mouse', x:p.x, y:p.y, btn:button, down:true});
+    e.preventDefault();
+  });
+  window.addEventListener('mouseup', function(e) {
+    if (!authed) return;
+    const button = btnName(e.button);
+    if (pressedButtons.delete(button)) {
+      send({t:'mouse', x:lastPointer.x, y:lastPointer.y, btn:button, down:false});
+    }
+  });
   canvas.addEventListener('contextmenu', function(e) { e.preventDefault(); });
   canvas.addEventListener('wheel', function(e) { if(!authed) return; send({t:'wheel', delta: Math.round(e.deltaY)}); e.preventDefault(); });
+  window.addEventListener('blur', releasePressedInputs);
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) releasePressedInputs();
+  });
 });

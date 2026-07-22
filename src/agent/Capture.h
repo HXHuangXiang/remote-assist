@@ -53,6 +53,7 @@ public:
     static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM);
     const std::vector<MonitorInfo>& Monitors() const { return monitors_; }
     void SetMonitor(int index) { selectedMonitor_ = index; }
+    int SelectedMonitor() const { return selectedMonitor_.load(); }
 
     // 将当前画面中的归一化坐标映射为整个虚拟桌面的归一化坐标。
     // 选择单屏时会加上该显示器在虚拟桌面中的偏移。
