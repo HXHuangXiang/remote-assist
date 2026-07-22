@@ -381,7 +381,14 @@ void ServiceWorker() {
         EnsureAgent();
         EnsureTray();
         if (g_state.agentStopEvent) {
-            WaitForSingleObject(g_state.agentStopEvent, kMonitorIntervalMs);
+            const DWORD waitResult = WaitForSingleObject(g_state.agentStopEvent,
+                                                         kMonitorIntervalMs);
+            // 接管独立运行的 Agent 时该手动重置事件会一直保持有信号，直到旧
+            // Agent 退出并由下一轮 EnsureAgent 重置。不能在这段窗口内无限快
+            // 轮询 mutex/进程状态，否则服务进程会占满一个 CPU 核。
+            if (waitResult == WAIT_OBJECT_0 && !g_state.stopRequested.load()) {
+                Sleep(kMonitorIntervalMs);
+            }
         } else {
             Sleep(kMonitorIntervalMs);
         }
