@@ -11,6 +11,7 @@ let h264Decoder = null;
 const h264Frames = new Map();
 let h264NeedsKeyFrame = true;
 let lastKeyFrameRequestAt = 0;
+let wheelRemainder = 0;
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
@@ -25,10 +26,10 @@ function fitCanvas() {
 }
 
 function connect() {
-  const host = location.hostname || '127.0.0.1';
-  const port = location.port || (location.protocol === 'https:' ? '443' : '7980');
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = proto + '://' + host + ':' + port + '/ws';
+  // 直接从当前页面地址派生，端口改成 80/443 等默认端口时也不会错误回退到 7980。
+  const endpoint = new URL('/ws', window.location.href);
+  endpoint.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = endpoint.href;
   log('connecting ' + url);
   releasePressedInputs();
   resetFramePipeline(false);
@@ -298,6 +299,21 @@ function drawNext() {
 
 function send(obj) { if (ws && ws.readyState === WebSocket.OPEN && authed) ws.send(JSON.stringify(obj)); }
 function btnName(b) { return b === 1 ? 'middle' : b === 2 ? 'right' : 'left'; }
+
+function normalizedWheelDelta(e) {
+  // 浏览器的 deltaY 可能是像素、行或页，Windows SendInput 则使用 WHEEL_DELTA
+  // (120) 单位。累积精细触控板的零散像素增量，并反向匹配浏览器“向下为正”。
+  let scale = 120 / 100;
+  if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) scale = 120;
+  else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) scale = 360;
+  wheelRemainder += -e.deltaY * scale;
+  const requested = Math.trunc(wheelRemainder);
+  if (requested === 0) return 0;
+  const delta = Math.max(-1200, Math.min(1200, requested));
+  wheelRemainder -= delta;
+  return delta;
+}
+
 function queueMove(e) {
   pendingMove = normXY(e);
   lastPointer = pendingMove;
@@ -334,16 +350,23 @@ const codeToSc = {
   Numpad7:0x47, Numpad8:0x48, Numpad9:0x49, NumpadSubtract:0x4A, Numpad4:0x4B, Numpad5:0x4C,
   Numpad6:0x4D, NumpadAdd:0x4E, Numpad1:0x4F, Numpad2:0x50, Numpad3:0x51, Numpad0:0x52, NumpadDecimal:0x53,
   ArrowLeft:0x4B, ArrowUp:0x48, ArrowRight:0x4D, ArrowDown:0x50,
-  ControlRight:0x1D, AltRight:0x38, Delete:0x53, Insert:0x52, Home:0x47, End:0x4F, PageUp:0x49, PageDown:0x51
+  F11:0x57, F12:0x58, NumpadEnter:0x1C, NumpadDivide:0x35,
+  ControlRight:0x1D, AltRight:0x38, Delete:0x53, Insert:0x52, Home:0x47, End:0x4F, PageUp:0x49, PageDown:0x51,
+  MetaLeft:0x5B, MetaRight:0x5C, ContextMenu:0x5D
 };
 const extendedKeys = new Set([
   'ControlRight', 'AltRight', 'ArrowLeft', 'ArrowUp', 'ArrowRight', 'ArrowDown',
-  'Delete', 'Insert', 'Home', 'End', 'PageUp', 'PageDown'
+  'Delete', 'Insert', 'Home', 'End', 'PageUp', 'PageDown', 'NumpadEnter', 'NumpadDivide',
+  'MetaLeft', 'MetaRight', 'ContextMenu'
 ]);
 
 function normXY(e) {
   const r = canvas.getBoundingClientRect();
-  return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+  if (!r.width || !r.height) return lastPointer;
+  return {
+    x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+    y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height))
+  };
 }
 
 window.addEventListener('DOMContentLoaded', function() {
@@ -402,7 +425,12 @@ window.addEventListener('DOMContentLoaded', function() {
     }
   });
   canvas.addEventListener('contextmenu', function(e) { e.preventDefault(); });
-  canvas.addEventListener('wheel', function(e) { if(!authed) return; send({t:'wheel', delta: Math.round(e.deltaY)}); e.preventDefault(); });
+  canvas.addEventListener('wheel', function(e) {
+    if (!authed) return;
+    const delta = normalizedWheelDelta(e);
+    if (delta) send({t:'wheel', delta:delta});
+    e.preventDefault();
+  }, { passive:false });
   window.addEventListener('blur', releasePressedInputs);
   document.addEventListener('visibilitychange', function() {
     if (document.hidden) releasePressedInputs();
