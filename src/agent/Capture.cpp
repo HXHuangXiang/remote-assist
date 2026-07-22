@@ -98,6 +98,9 @@ void Capture::ReleaseAll() {
     gdiFingerprint_ = 0;
     hasGdiFingerprint_ = false;
     lastGdiFullFrameAt_ = {};
+    pointer_ = {};
+    pointerKnown_ = false;
+    pointerDirty_ = false;
 }
 
 void Capture::ReleaseFrame(CapturedFrame& frame) {
@@ -107,6 +110,85 @@ void Capture::ReleaseFrame(CapturedFrame& frame) {
     }
     frame.mappedPixels = nullptr;
     frame.mappedStrideBytes = 0;
+}
+
+bool Capture::TakePointerUpdate(PointerUpdate& out) {
+    if (!pointerDirty_) {
+        return false;
+    }
+    out = pointer_;
+    pointerDirty_ = false;
+    return true;
+}
+
+void Capture::UpdatePointerFromDesktop(bool visible, int screenX, int screenY) {
+    const int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (virtualWidth <= 0 || virtualHeight <= 0) {
+        return;
+    }
+
+    // 与采集、输入使用同一“相对虚拟桌面原点”坐标系。单屏模式中，指针离开被
+    // 选择的显示器时明确下发 hidden，避免浏览器把旧箭头遗留在画面上。
+    const int relativeX = screenX - virtualLeft;
+    const int relativeY = screenY - virtualTop;
+    int offsetX = 0;
+    int offsetY = 0;
+    int outputWidth = virtualWidth;
+    int outputHeight = virtualHeight;
+    const int selectedMonitor = selectedMonitor_.load();
+    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors_.size())) {
+        const auto& monitor = monitors_[selectedMonitor];
+        offsetX = monitor.x;
+        offsetY = monitor.y;
+        outputWidth = monitor.w;
+        outputHeight = monitor.h;
+    }
+    const bool insideOutput = relativeX >= offsetX && relativeY >= offsetY &&
+        relativeX < offsetX + outputWidth && relativeY < offsetY + outputHeight;
+    PointerUpdate next;
+    next.visible = visible && insideOutput;
+    if (next.visible) {
+        next.x = std::clamp(static_cast<double>(relativeX - offsetX) /
+                                std::max(1, outputWidth - 1),
+                            0.0, 1.0);
+        next.y = std::clamp(static_cast<double>(relativeY - offsetY) /
+                                std::max(1, outputHeight - 1),
+                            0.0, 1.0);
+    }
+
+    constexpr double kPositionEpsilon = 0.00001;
+    const bool changed = !pointerKnown_ || next.visible != pointer_.visible ||
+        (next.visible && (std::abs(next.x - pointer_.x) > kPositionEpsilon ||
+                          std::abs(next.y - pointer_.y) > kPositionEpsilon));
+    if (changed) {
+        pointer_ = next;
+        pointerKnown_ = true;
+        pointerDirty_ = true;
+    }
+}
+
+void Capture::UpdatePointerFromFrame(const DXGI_OUTDUPL_FRAME_INFO& frameInfo) {
+    // LastMouseUpdateTime 为零代表本次桌面帧没有新的鼠标状态；首次帧仍读取一次，
+    // 这样控制端刚连接时即可得到当前指针位置。
+    if (frameInfo.LastMouseUpdateTime.QuadPart == 0 && pointerKnown_) {
+        return;
+    }
+    UpdatePointerFromDesktop(frameInfo.PointerPosition.Visible != FALSE,
+                             frameInfo.PointerPosition.Position.x,
+                             frameInfo.PointerPosition.Position.y);
+}
+
+void Capture::UpdatePointerFromSystem() {
+    CURSORINFO cursorInfo{};
+    cursorInfo.cbSize = sizeof(cursorInfo);
+    if (!GetCursorInfo(&cursorInfo)) {
+        return;
+    }
+    UpdatePointerFromDesktop((cursorInfo.flags & CURSOR_SHOWING) != 0,
+                             cursorInfo.ptScreenPos.x, cursorInfo.ptScreenPos.y);
 }
 
 void Capture::EnumMonitors() {
@@ -262,6 +344,11 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     Microsoft::WRL::ComPtr<IDXGIResource> res;
     HRESULT hr = dup_->AcquireNextFrame(waitMs, &fi, &res);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        // 刚连接到静态桌面时未必立刻获得首个 duplication frame；仍从当前 input
+        // desktop 读取一次指针，避免浏览器长时间没有任何远端鼠标反馈。
+        if (!pointerKnown_) {
+            UpdatePointerFromSystem();
+        }
         return CaptureResult::kNoChange;
     }
     if (FAILED(hr)) {
@@ -269,9 +356,11 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
         return CaptureResult::kFailed;
     }
 
+    UpdatePointerFromFrame(fi);
+
     // Microsoft 文档保证：仅鼠标指针更新时，AccumulatedFrames、
-    // TotalMetadataBufferSize 与 LastPresentTime 均为零。此时返回的资源仍是上一张
-    // 桌面图像；当前控制端仅展示视频帧，重编码它只会占用 CPU/GPU 和网络窗口。
+    // TotalMetadataBufferSize 与 LastPresentTime 均为零。指针位置已通过独立状态
+    // 更新，本次资源仍是上一张桌面图像，重编码它只会占用 CPU/GPU 和网络窗口。
     const bool pointerOnly = fi.LastPresentTime.QuadPart == 0 &&
         fi.AccumulatedFrames == 0 && fi.TotalMetadataBufferSize == 0;
     if (pointerOnly) {
@@ -378,6 +467,9 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out) {
         log::Warn("GDI BitBlt failed: " + std::to_string(GetLastError()));
         return CaptureResult::kFailed;
     }
+    // GDI 不提供 Desktop Duplication 的 pointer metadata；读取当前输入桌面的系统
+    // 指针即可保持锁屏和多屏回退路径也有相同的浏览器叠加反馈。
+    UpdatePointerFromSystem();
 
     // 确定输出区域:全部虚拟屏幕或指定显示器。
     int ox = 0, oy = 0, ow = vw, oh = vh;

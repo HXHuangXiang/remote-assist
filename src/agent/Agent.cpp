@@ -685,6 +685,20 @@ void Agent::CaptureLoop() {
         metrics.captureTimeMs += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - captureStartedAt).count());
+        PointerUpdate pointer;
+        if (capture_.TakePointerUpdate(pointer)) {
+            // 指针使用独立小消息发送。DXGI 的 pointer-only 通知不再触发整帧 H.264
+            // 编码，浏览器仍能立即看到远端鼠标位置。
+            nlohmann::json cursor = {
+                {"t", "cursor"},
+                {"visible", pointer.visible},
+            };
+            if (pointer.visible) {
+                cursor["x"] = pointer.x;
+                cursor["y"] = pointer.y;
+            }
+            server_.Broadcaster().BroadcastText(cursor.dump());
+        }
         if (captureResult == CaptureResult::kNoChange ||
             captureResult == CaptureResult::kPointerOnly) {
             if (captureResult == CaptureResult::kPointerOnly) {

@@ -2,7 +2,7 @@
 let pendingFrame = null, nextFrameInfo = null, activeFrame = null, imgLoading = false;
 let pendingMove = null, moveQueued = false;
 let ws = null, cfg = null, authed = false;
-let canvas, ctx, logEl, statusEl, pwEl, monSel;
+let canvas, ctx, cursorCanvas, cursorCtx, logEl, statusEl, pwEl, monSel;
 const pressedKeys = new Map();
 const pressedButtons = new Set();
 let lastPointer = { x: 0.5, y: 0.5 };
@@ -21,6 +21,7 @@ const clientStats = {
   drawn: 0, dropped: 0, drawMsTotal: 0, drawMsSamples: 0,
   decodeErrors: 0, maxDecodeQueue: 0, maxWsBuffered: 0
 };
+let remoteCursor = { visible:false, x:0, y:0 };
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
@@ -69,6 +70,8 @@ function connect() {
     pendingMove = null;
     pendingWheelDelta = 0;
     wheelRemainder = 0;
+    remoteCursor.visible = false;
+    drawRemoteCursor();
     ws = null;
     log('disconnected'); setStatus('未连接'); authed = false;
   };
@@ -84,6 +87,7 @@ function handleText(m) {
     return;
   }
   if (m.t === 'cfg') { setupCfg(m); return; }
+  if (m.t === 'cursor') { updateRemoteCursor(m); return; }
   if (m.t === 'frame') {
     const id = Number(m.id), streamId = Number(m.stream_id), timestamp = Number(m.ts);
     if (Number.isSafeInteger(id) && id > 0 && Number.isSafeInteger(streamId) && streamId >= 0 &&
@@ -104,10 +108,60 @@ function setupCfg(c) {
   if (!cfg || cfg.stream_id !== c.stream_id) resetFramePipeline(true);
   cfg = c;
     canvas.width = c.w; canvas.height = c.h;
+    cursorCanvas.width = c.w; cursorCanvas.height = c.h;
     fitCanvas();
+    drawRemoteCursor();
     if (c.monitors) populateMonitors(c.monitors, c.selected_monitor);
     if (isH264Codec()) setupH264Decoder(c);
     log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps);
+}
+
+function updateRemoteCursor(m) {
+  const visible = m.visible === true;
+  if (!visible) {
+    remoteCursor.visible = false;
+    drawRemoteCursor();
+    return;
+  }
+  const x = Number(m.x), y = Number(m.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  remoteCursor = {
+    visible:true,
+    x:Math.max(0, Math.min(1, x)),
+    y:Math.max(0, Math.min(1, y))
+  };
+  drawRemoteCursor();
+}
+
+function drawRemoteCursor() {
+  if (!cursorCanvas || !cursorCtx) return;
+  cursorCtx.clearRect(0, 0, cursorCanvas.width, cursorCanvas.height);
+  canvas.style.cursor = remoteCursor.visible ? 'none' : 'default';
+  if (!remoteCursor.visible || !cursorCanvas.width || !cursorCanvas.height) return;
+
+  const x = remoteCursor.x * Math.max(0, cursorCanvas.width - 1);
+  const y = remoteCursor.y * Math.max(0, cursorCanvas.height - 1);
+  const size = Math.max(14, Math.min(30,
+    Math.round(Math.min(cursorCanvas.width, cursorCanvas.height) / 36)));
+  cursorCtx.save();
+  cursorCtx.translate(x, y);
+  cursorCtx.lineJoin = 'round';
+  cursorCtx.lineCap = 'round';
+  cursorCtx.beginPath();
+  cursorCtx.moveTo(0, 0);
+  cursorCtx.lineTo(0, size);
+  cursorCtx.lineTo(size * 0.28, size * 0.72);
+  cursorCtx.lineTo(size * 0.52, size * 1.12);
+  cursorCtx.lineTo(size * 0.70, size);
+  cursorCtx.lineTo(size * 0.45, size * 0.60);
+  cursorCtx.lineTo(size, size * 0.60);
+  cursorCtx.closePath();
+  cursorCtx.fillStyle = '#fff';
+  cursorCtx.strokeStyle = '#000';
+  cursorCtx.lineWidth = Math.max(1, size / 12);
+  cursorCtx.stroke();
+  cursorCtx.fill();
+  cursorCtx.restore();
 }
 
 function populateMonitors(list, selectedMonitor) {
@@ -529,6 +583,8 @@ window.addEventListener('DOMContentLoaded', function() {
   // desynchronized 是 Chromium 的低延迟呈现提示，可减少 VideoFrame/JPEG 绘制
   // 等待合成器的机会；不支持时浏览器会忽略选项，后备上下文保证兼容性。
   ctx = canvas.getContext('2d', { alpha:false, desynchronized:true }) || canvas.getContext('2d');
+  cursorCanvas = document.getElementById('cursor');
+  cursorCtx = cursorCanvas.getContext('2d');
   logEl = document.getElementById('log');
   statusEl = document.getElementById('status');
   pwEl = document.getElementById('pw');

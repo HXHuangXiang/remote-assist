@@ -14,7 +14,10 @@
   <span id="status">未连接</span>
 </div>
 <div id="screen-wrap">
-  <canvas id="screen" tabindex="0"></canvas>
+  <div id="screen-stack">
+    <canvas id="screen" tabindex="0"></canvas>
+    <canvas id="cursor" aria-hidden="true"></canvas>
+  </div>
 </div>
 <div id="log"></div>
 <script src="app.js"></script>

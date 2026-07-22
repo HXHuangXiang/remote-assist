@@ -36,10 +36,18 @@ struct CapturedFrame {
 enum class CaptureResult {
     kFrame,
     kNoChange,
-    // DXGI Desktop Duplication 会因指针位置/形状变化返回上一张桌面图像；当前 MVP
-    // 不单独传输鼠标指针图层，因此无需对相同像素再次回读、编码和发送。
+    // DXGI Desktop Duplication 会因指针位置/形状变化返回上一张桌面图像。指针位置
+    // 会由独立的 cursor 协议下发，无需对相同像素再次回读、编码和发送。
     kPointerOnly,
     kFailed,
+};
+
+// 指针坐标相对于当前视频画面归一化。当前版本在浏览器端叠加低成本通用箭头，避免
+// Desktop Duplication 将指针更新误当成整帧桌面变化，后续可在此基础上补充原生形状。
+struct PointerUpdate {
+    bool visible = false;
+    double x = 0.0;
+    double y = 0.0;
 };
 
 // 显示器信息(矩形坐标相对于虚拟屏幕原点)。
@@ -63,6 +71,8 @@ public:
     CaptureResult CaptureFrame(CapturedFrame& out, DWORD waitMs);
     // 结束直接映射的 DXGI 帧借用。编码完成后必须调用；对普通 CPU 帧是无操作。
     void ReleaseFrame(CapturedFrame& frame);
+    // 取得自上次调用后最新的指针可见性/位置变化。仅由 CaptureLoop 调用。
+    bool TakePointerUpdate(PointerUpdate& out);
 
     // 输入桌面切换后释放与旧桌面关联的采集资源并重新初始化。
     void ResetForDesktop();
@@ -94,6 +104,9 @@ private:
                            int x, int y, int width, int height,
                            CapturedFrame& out);
     void ReleaseAll();
+    void UpdatePointerFromDesktop(bool visible, int screenX, int screenY);
+    void UpdatePointerFromFrame(const DXGI_OUTDUPL_FRAME_INFO& frameInfo);
+    void UpdatePointerFromSystem();
 
     // DXGI
     Microsoft::WRL::ComPtr<ID3D11Device> d3d_;
@@ -119,6 +132,12 @@ private:
     uint64_t gdiFingerprint_ = 0;
     bool hasGdiFingerprint_ = false;
     std::chrono::steady_clock::time_point lastGdiFullFrameAt_{};
+
+    // 指针状态与画面只由采集线程访问，无需同步。pointerDirty_ 允许 pointer-only
+    // DXGI 通知通过独立 WebSocket 消息立即到达浏览器，而不会触发整帧编码。
+    PointerUpdate pointer_{};
+    bool pointerKnown_ = false;
+    bool pointerDirty_ = false;
 
     // 多显示器
     std::vector<MonitorInfo> monitors_;
