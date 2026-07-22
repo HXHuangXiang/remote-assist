@@ -115,9 +115,15 @@ void Agent::Stop() {
 
 void Agent::CaptureLoop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const int targetMs = 1000 / std::max(1, cfg_.fps);
     while (!stop_.load()) {
         const auto t0 = std::chrono::steady_clock::now();
+
+        // 大屏幕降低帧率,平衡编码时间和带宽
+        int effectiveFps = cfg_.fps;
+        if (deskWidth_ * deskHeight_ > 1920 * 1080) {
+            effectiveFps = std::min(effectiveFps, 15);
+        }
+        const int targetMs = 1000 / std::max(1, effectiveFps);
 
         // 跟随桌面切换(锁屏↔解锁、Winlogon↔Default)。
         desktop_.CheckRebind();
@@ -131,6 +137,21 @@ void Agent::CaptureLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
             continue;
         }
+
+        // 帧差检测:采样比较,相同则跳过编码发送
+        if (!firstFrame_ && frame.data.size() == prevFrame_.size()) {
+            bool changed = false;
+            const size_t step = 256;  // 每 256 字节采样(64 像素)
+            for (size_t i = 0; i < frame.data.size(); i += step) {
+                if (frame.data[i] != prevFrame_[i]) { changed = true; break; }
+            }
+            if (!changed) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
+                continue;
+            }
+        }
+        prevFrame_ = frame.data;
+        firstFrame_ = false;
 
         if (!encoder_ || frame.width != deskWidth_ || frame.height != deskHeight_) {
             deskWidth_ = frame.width;

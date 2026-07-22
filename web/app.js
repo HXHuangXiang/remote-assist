@@ -1,4 +1,5 @@
 'use strict';
+let pendingFrame = null, imgLoading = false;
 let ws = null, cfg = null, authed = false;
 let canvas, ctx, logEl, statusEl, pwEl, monSel;
 
@@ -71,11 +72,24 @@ function populateMonitors(list) {
 
 function handleBinary(data) {
   if (!cfg) return;
+  pendingFrame = data;
+  if (!imgLoading) drawNext();
+}
+function drawNext() {
+  if (!pendingFrame) return;
+  const data = pendingFrame;
+  pendingFrame = null;
+  imgLoading = true;
   const blob = new Blob([data], { type: 'image/jpeg' });
   const url = URL.createObjectURL(blob);
   const img = new Image();
-  img.onload = function() { ctx.drawImage(img, 0, 0, canvas.width, canvas.height); URL.revokeObjectURL(url); };
-  img.onerror = function() { URL.revokeObjectURL(url); };
+  img.onload = function() {
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    URL.revokeObjectURL(url);
+    imgLoading = false;
+    drawNext();
+  };
+  img.onerror = function() { URL.revokeObjectURL(url); imgLoading = false; drawNext(); };
   img.src = url;
 }
 

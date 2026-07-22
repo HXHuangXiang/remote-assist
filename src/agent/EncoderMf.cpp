@@ -54,9 +54,7 @@ EncoderMf::~EncoderMf() { Release(); }
 
 bool EncoderMf::Init(int width, int height, int fps, int bitrateBps) {
     width_ = width; height_ = height;
-    quality_ = 50 + (bitrateBps / 100000);
-    if (quality_ > 95) quality_ = 95;
-    if (quality_ < 40) quality_ = 40;
+    quality_ = 55;  // 低延迟远控:固定较低质量,减小帧体积
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wicFactory_));
     if (FAILED(hr)) { log::Error("WIC factory failed hr=" + std::to_string(hr)); return false; }
     configured_ = true;

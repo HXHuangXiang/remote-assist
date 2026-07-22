@@ -9,6 +9,7 @@
 #include <atomic>
 #include <memory>
 #include <thread>
+#include <vector>
 
 namespace remote_assist {
 
@@ -43,7 +44,8 @@ private:
     int deskWidth_ = 0;
     int deskHeight_ = 0;
     bool encoderReady_ = false;
+    std::vector<uint8_t> prevFrame_;  // 帧差检测:上一帧数据
+    bool firstFrame_ = true;
 };
 
 }  // namespace remote_assist
-

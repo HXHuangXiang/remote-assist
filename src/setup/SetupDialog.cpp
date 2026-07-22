@@ -24,6 +24,7 @@ enum {
     IDC_EXIT,
     IDC_PORT_EDIT,
     IDM_TRAY_SHOW = 2001,
+    IDM_TRAY_HIDE,
     IDM_TRAY_EXIT,
 };
 
@@ -150,6 +151,7 @@ static void AddTrayIcon(HWND hwnd) {
 
     g_trayMenu = CreatePopupMenu();
     AppendMenuW(g_trayMenu, MF_STRING, IDM_TRAY_SHOW, L"\u663e\u793a\u7a97\u53e3");
+    AppendMenuW(g_trayMenu, MF_STRING, IDM_TRAY_HIDE, L"\u9690\u85cf\u7a97\u53e3");
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(g_trayMenu, MF_STRING, IDM_TRAY_EXIT, L"\u9000\u51fa");
 }
@@ -256,6 +258,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_TRAY_SHOW:
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
+            break;
+        case IDM_TRAY_HIDE:
+            HideToTray();
             break;
         case IDM_TRAY_EXIT:
             RemoveTrayIcon();
