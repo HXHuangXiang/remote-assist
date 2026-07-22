@@ -2,7 +2,7 @@
 
 #include <windows.h>
 #include <codecapi.h>
-#include <icodecapi.h>
+#include <strmif.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mftransform.h>
