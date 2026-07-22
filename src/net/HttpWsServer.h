@@ -38,7 +38,8 @@ public:
     void Remove(httplib::ws::WebSocket* ws);
     // 取得编码器生成的帧所有权，只保留最新一帧。streamId 与配置消息对应，
     // 用于浏览器在分辨率/编码器切换时丢弃过期图像。
-    void BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId);
+    void BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId,
+                         bool isKeyFrame, uint64_t timestampUs);
     void BroadcastText(const std::string& msg);
     // 浏览器在帧真正绘制（或主动丢弃过期帧）后确认，服务端才会发下一帧。
     void AcknowledgeFrame(uint64_t frameId);
@@ -58,6 +59,8 @@ private:
     std::condition_variable frameCv_;
     std::vector<uint8_t> pendingFrame_;
     uint64_t pendingStreamId_ = 0;
+    uint64_t pendingTimestampUs_ = 0;
+    bool pendingKeyFrame_ = true;
     uint64_t nextFrameId_ = 1;
     uint64_t inFlightFrameId_ = 0;
     std::chrono::steady_clock::time_point inFlightSince_{};

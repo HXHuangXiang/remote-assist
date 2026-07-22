@@ -47,6 +47,8 @@ void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
         // 新控制端连接后由采集线程生成首帧；不要把断连前的旧图像带过去。
         pendingFrame_.clear();
         pendingStreamId_ = 0;
+        pendingTimestampUs_ = 0;
+        pendingKeyFrame_ = true;
         frameInFlight_ = false;
         inFlightFrameId_ = 0;
         inFlightSince_ = {};
@@ -54,7 +56,8 @@ void WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
     }
 }
 
-void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId) {
+void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId,
+                                    bool isKeyFrame, uint64_t timestampUs) {
     {
         std::lock_guard<std::mutex> lk(frameMu_);
         if (stopping_) {
@@ -65,6 +68,8 @@ void WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamI
         }
         pendingFrame_ = std::move(frame);
         pendingStreamId_ = streamId;
+        pendingKeyFrame_ = isKeyFrame;
+        pendingTimestampUs_ = timestampUs;
         queuedFrames_.fetch_add(1, std::memory_order_relaxed);
     }
     frameCv_.notify_one();
@@ -117,6 +122,8 @@ void WsBroadcaster::Stop() {
         stopping_ = true;
         pendingFrame_.clear();
         pendingStreamId_ = 0;
+        pendingTimestampUs_ = 0;
+        pendingKeyFrame_ = true;
         frameInFlight_ = false;
         inFlightFrameId_ = 0;
         inFlightSince_ = {};
@@ -132,6 +139,8 @@ void WsBroadcaster::SendLoop() {
         std::vector<uint8_t> frame;
         uint64_t streamId = 0;
         uint64_t frameId = 0;
+        uint64_t timestampUs = 0;
+        bool isKeyFrame = true;
         {
             std::unique_lock<std::mutex> lk(frameMu_);
             for (;;) {
@@ -142,6 +151,10 @@ void WsBroadcaster::SendLoop() {
                     frame.swap(pendingFrame_);
                     streamId = pendingStreamId_;
                     pendingStreamId_ = 0;
+                    isKeyFrame = pendingKeyFrame_;
+                    pendingKeyFrame_ = true;
+                    timestampUs = pendingTimestampUs_;
+                    pendingTimestampUs_ = 0;
                     frameId = nextFrameId_++;
                     frameInFlight_ = true;
                     inFlightFrameId_ = frameId;
@@ -177,7 +190,9 @@ void WsBroadcaster::SendLoop() {
             std::lock_guard<std::mutex> lk(clientMu_);
             if (client_ && client_->is_open()) {
                 const std::string header = "{\"t\":\"frame\",\"id\":" +
-                    std::to_string(frameId) + ",\"stream_id\":" + std::to_string(streamId) + "}";
+                    std::to_string(frameId) + ",\"stream_id\":" + std::to_string(streamId) +
+                    ",\"key\":" + (isKeyFrame ? "true" : "false") +
+                    ",\"ts\":" + std::to_string(timestampUs) + "}";
                 sent = client_->send(header) &&
                     client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
             }

@@ -7,6 +7,10 @@ const pressedKeys = new Map();
 const pressedButtons = new Set();
 let lastPointer = { x: 0.5, y: 0.5 };
 let decodeGeneration = 0;
+let h264Decoder = null;
+const h264Frames = new Map();
+let h264NeedsKeyFrame = true;
+let lastKeyFrameRequestAt = 0;
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
@@ -65,9 +69,10 @@ function handleText(m) {
   }
   if (m.t === 'cfg') { setupCfg(m); return; }
   if (m.t === 'frame') {
-    const id = Number(m.id), streamId = Number(m.stream_id);
-    if (Number.isSafeInteger(id) && id > 0 && Number.isSafeInteger(streamId) && streamId >= 0) {
-      nextFrameInfo = { id:id, streamId:streamId };
+    const id = Number(m.id), streamId = Number(m.stream_id), timestamp = Number(m.ts);
+    if (Number.isSafeInteger(id) && id > 0 && Number.isSafeInteger(streamId) && streamId >= 0 &&
+        Number.isSafeInteger(timestamp) && timestamp >= 0) {
+      nextFrameInfo = { id:id, streamId:streamId, timestamp:timestamp, key:m.key === true };
     } else {
       nextFrameInfo = null;
     }
@@ -85,6 +90,7 @@ function setupCfg(c) {
     canvas.width = c.w; canvas.height = c.h;
     fitCanvas();
     if (c.monitors) populateMonitors(c.monitors, c.selected_monitor);
+    if (isH264Codec()) setupH264Decoder(c);
     log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps);
 }
 
@@ -105,10 +111,95 @@ function acknowledgeFrame(id) {
   send({t:'ack', id:id});
 }
 
+function acknowledgeH264Frames() {
+  h264Frames.forEach(function(infos) {
+    infos.forEach(function(info) { if (info.socket === ws) acknowledgeFrame(info.id); });
+  });
+}
+
+function requestKeyFrame() {
+  if (!authed) return;
+  const now = performance.now();
+  // 防止损坏连接或不兼容浏览器每个增量帧都触发一次控制报文。
+  if (now - lastKeyFrameRequestAt < 250) return;
+  lastKeyFrameRequestAt = now;
+  send({t:'keyframe'});
+}
+
+function isH264Codec() {
+  return cfg && typeof cfg.codec === 'string' && cfg.codec.toLowerCase().indexOf('avc1.') === 0;
+}
+
+function setupH264Decoder(c) {
+  if (!window.VideoDecoder || !window.EncodedVideoChunk) {
+    setStatus('浏览器不支持 H.264 WebCodecs');
+    log('H.264 WebCodecs unavailable');
+    return false;
+  }
+  if (h264Decoder) {
+    h264Decoder.close();
+    h264Decoder = null;
+  }
+  const streamId = c.stream_id;
+  h264NeedsKeyFrame = true;
+  const decoder = new VideoDecoder({
+    output: function(videoFrame) {
+      const infos = h264Frames.get(videoFrame.timestamp);
+      const info = infos && infos.shift();
+      if (infos && infos.length === 0) h264Frames.delete(videoFrame.timestamp);
+      if (info && h264Decoder === decoder && cfg && cfg.stream_id === streamId && ws === info.socket) {
+        ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
+        acknowledgeFrame(info.id);
+      }
+      videoFrame.close();
+    },
+    error: function(error) {
+      if (h264Decoder !== decoder) return;
+      log('H.264 decode error: ' + error.message);
+      setStatus('H.264 解码失败');
+      acknowledgeH264Frames();
+      h264Frames.clear();
+      h264NeedsKeyFrame = true;
+      h264Decoder = null;
+      try { decoder.close(); } catch (_) {}
+      if (cfg && isH264Codec()) setupH264Decoder(cfg);
+      requestKeyFrame();
+    }
+  });
+  const decoderConfig = {
+    codec: c.codec,
+    codedWidth: c.w,
+    codedHeight: c.h,
+    optimizeForLatency: true,
+    hardwareAcceleration: 'prefer-hardware'
+  };
+  if (c.annexb) decoderConfig.avc = { format: 'annexb' };
+  try {
+    decoder.configure(decoderConfig);
+  } catch (error) {
+    decoder.close();
+    setStatus('H.264 解码器初始化失败');
+    log('H.264 decoder config error: ' + error.message);
+    return false;
+  }
+  h264Decoder = decoder;
+  requestKeyFrame();
+  return true;
+}
+
 function resetFramePipeline(ackActive) {
   decodeGeneration++;
   if (ackActive && activeFrame) acknowledgeFrame(activeFrame.id);
   if (ackActive && pendingFrame) acknowledgeFrame(pendingFrame.id);
+  if (ackActive) {
+    acknowledgeH264Frames();
+  }
+  h264Frames.clear();
+  h264NeedsKeyFrame = true;
+  if (h264Decoder) {
+    h264Decoder.close();
+    h264Decoder = null;
+  }
   pendingFrame = null;
   nextFrameInfo = null;
   activeFrame = null;
@@ -121,6 +212,46 @@ function handleBinary(data) {
   if (!cfg || !info) return;
   if (info.streamId !== cfg.stream_id) {
     acknowledgeFrame(info.id);
+    return;
+  }
+  if (isH264Codec()) {
+    if (!h264Decoder) {
+      acknowledgeFrame(info.id);
+      return;
+    }
+    if (h264NeedsKeyFrame && !info.key) {
+      acknowledgeFrame(info.id);
+      requestKeyFrame();
+      return;
+    }
+    if (h264Decoder.decodeQueueSize > 2) {
+      // 丢掉一个 delta 后，后续参考帧不再可靠；直接回到下一张 IDR，保持低延迟。
+      acknowledgeFrame(info.id);
+      h264NeedsKeyFrame = true;
+      requestKeyFrame();
+      return;
+    }
+    const socket = ws;
+    const infos = h264Frames.get(info.timestamp) || [];
+    const pending = { id:info.id, socket:socket };
+    infos.push(pending);
+    h264Frames.set(info.timestamp, infos);
+    try {
+      h264Decoder.decode(new EncodedVideoChunk({
+        type: info.key ? 'key' : 'delta',
+        timestamp: info.timestamp,
+        data: data
+      }));
+      if (info.key) h264NeedsKeyFrame = false;
+    } catch (error) {
+      const pendingIndex = infos.lastIndexOf(pending);
+      if (pendingIndex >= 0) infos.splice(pendingIndex, 1);
+      if (infos.length === 0) h264Frames.delete(info.timestamp);
+      acknowledgeFrame(info.id);
+      h264NeedsKeyFrame = true;
+      requestKeyFrame();
+      log('H.264 chunk rejected: ' + error.message);
+    }
     return;
   }
   pendingFrame = { data:data, id:info.id, streamId:info.streamId };

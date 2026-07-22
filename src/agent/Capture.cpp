@@ -312,8 +312,12 @@ void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
     const double scale = std::min(1.0, std::min(
         static_cast<double>(kMaxStreamWidth) / width,
         static_cast<double>(kMaxStreamHeight) / height));
-    const int outputWidth = std::max(1, static_cast<int>(width * scale));
-    const int outputHeight = std::max(1, static_cast<int>(height * scale));
+    // NV12/H.264 需要偶数宽高。统一在采集输出处向下取偶数，JPEG 回退也使用
+    // 相同尺寸，避免浏览器在编码器切换时发生坐标和画布尺寸跳变。
+    int outputWidth = std::max(1, static_cast<int>(width * scale));
+    int outputHeight = std::max(1, static_cast<int>(height * scale));
+    if (outputWidth > 1) outputWidth &= ~1;
+    if (outputHeight > 1) outputHeight &= ~1;
 
     out.width = outputWidth;
     out.height = outputHeight;

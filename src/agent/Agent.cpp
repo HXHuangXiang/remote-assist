@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -67,6 +68,12 @@ struct CaptureLoopStats {
 
 uint64_t CounterDelta(uint64_t current, uint64_t previous) {
     return current >= previous ? current - previous : 0;
+}
+
+std::string AvcCodecString(uint32_t profile) {
+    char codec[16] = {};
+    std::snprintf(codec, sizeof(codec), "avc1.%06X", profile & 0xFFFFFF);
+    return codec;
 }
 
 }  // namespace
@@ -284,6 +291,7 @@ void Agent::CaptureLoop() {
             if (captureDesktop.CheckRebind()) {
                 capture_.ResetForDesktop();
                 firstFrame_ = true;
+                streamKeyFrameRequired_ = true;
                 lastFrameSent_ = {};
             }
         }
@@ -294,6 +302,8 @@ void Agent::CaptureLoop() {
             if (!firstFrame_) {
                 firstFrame_ = true;
             }
+            // 编码器仍会保留上一控制端的参考帧；新控制端绝不能从 delta 帧接续。
+            streamKeyFrameRequired_ = true;
             lastFrameSent_ = {};
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
@@ -301,6 +311,7 @@ void Agent::CaptureLoop() {
 
         if (frameResetRequested_.exchange(false)) {
             firstFrame_ = true;
+            streamKeyFrameRequired_ = true;
             lastFrameSent_ = {};
         }
 
@@ -335,10 +346,12 @@ void Agent::CaptureLoop() {
         }
         metrics.capturedFrames++;
 
+        const bool needsFreshFrame = firstFrame_;
         const uint64_t frameFingerprint = FrameFingerprint(frame.data);
         const bool refreshDue = lastFrameSent_.time_since_epoch().count() == 0 ||
             t0 - lastFrameSent_ >= std::chrono::seconds(1);
-        if (!firstFrame_ && frameFingerprint == previousFrameFingerprint_ && !refreshDue) {
+        if (!firstFrame_ && !streamKeyFrameRequired_ &&
+            frameFingerprint == previousFrameFingerprint_ && !refreshDue) {
             metrics.fingerprintSkipped++;
             std::this_thread::sleep_for(std::chrono::milliseconds(targetMs));
             continue;
@@ -359,6 +372,9 @@ void Agent::CaptureLoop() {
                 continue;
             }
             encoderReady_ = true;
+            streamH264_.store(encoder_->IsH264());
+            streamH264Profile_.store(encoder_->H264CodecProfile());
+            streamKeyFrameRequired_ = encoder_->IsH264();
             // 尺寸/编码器变化后提升流版本并重新下发 cfg。浏览器异步图片解码可能
             // 在 cfg 到达后才完成，因此二进制帧会带上该版本供控制端判定。
             streamId_.fetch_add(1);
@@ -368,20 +384,52 @@ void Agent::CaptureLoop() {
         if (encoderReady_ && !frame.data.empty()) {
             std::vector<EncodedChunk> chunks;
             const auto encodeStartedAt = std::chrono::steady_clock::now();
+            const bool wasH264 = streamH264_.load();
+            if (needsFreshFrame && encoder_->IsH264()) {
+                encoder_->RequestKeyFrame();
+            }
             const bool encoded = encoder_->Encode(frame.data.data(), chunks);
             metrics.encodeAttempts++;
             metrics.encodeTimeMs += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - encodeStartedAt).count());
             if (encoded) {
+                if (wasH264 != encoder_->IsH264()) {
+                    streamH264_.store(encoder_->IsH264());
+                    streamH264Profile_.store(encoder_->H264CodecProfile());
+                    streamKeyFrameRequired_ = encoder_->IsH264();
+                    streamId_.fetch_add(1);
+                    server_.Broadcaster().BroadcastText(MakeCfgJson());
+                }
+                if (encoder_->IsH264()) {
+                    const uint32_t actualProfile = encoder_->H264CodecProfile();
+                    if (streamH264Profile_.load() != actualProfile) {
+                        streamH264Profile_.store(actualProfile);
+                        streamId_.fetch_add(1);
+                        streamKeyFrameRequired_ = true;
+                        const bool hasIdr = std::any_of(chunks.begin(), chunks.end(),
+                            [](const EncodedChunk& chunk) { return chunk.isKey; });
+                        if (!hasIdr) {
+                            encoder_->RequestKeyFrame();
+                        }
+                        server_.Broadcaster().BroadcastText(MakeCfgJson());
+                    }
+                }
                 bool sent = false;
                 for (auto& c : chunks) {
                     if (c.data.empty()) {
                         continue;
                     }
+                    if (encoder_->IsH264() && streamKeyFrameRequired_) {
+                        if (!c.isKey) {
+                            continue;
+                        }
+                        streamKeyFrameRequired_ = false;
+                    }
                     metrics.encodedFrames++;
                     metrics.encodedBytes += c.data.size();
-                    server_.Broadcaster().BroadcastBinary(std::move(c.data), streamId_.load());
+                    server_.Broadcaster().BroadcastBinary(std::move(c.data), streamId_.load(),
+                                                          c.isKey, c.timestampUs);
                     sent = true;
                 }
                 if (sent) {
@@ -405,8 +453,11 @@ void Agent::CaptureLoop() {
 std::string Agent::MakeCfgJson() const {
     nlohmann::json j;
     j["t"] = "cfg";
-    // 当前编码器固定输出 JPEG,避免跨线程读取 encoder_ 实例。
-    j["codec"] = "jpeg";
+    const bool h264 = streamH264_.load();
+    j["codec"] = h264 ? AvcCodecString(streamH264Profile_.load()) : "jpeg";
+    if (h264) {
+        j["annexb"] = true;
+    }
     j["w"] = deskWidth_.load();
     j["h"] = deskHeight_.load();
     j["fps"] = cfg_.fps;
@@ -473,6 +524,9 @@ void Agent::OnMessage(const std::string& msg) {
     } else if (t == "wheel") {
         const int delta = std::clamp(j.value("delta", 0), -1200, 1200);
         Input::SendWheel(delta);
+    } else if (t == "keyframe") {
+        // 浏览器在 WebCodecs 状态丢失后请求从独立可解码的 IDR 重新开始。
+        frameResetRequested_.store(true);
     } else if (t == "monitor") {
         const int idx = j.value("index", -1);
         capture_.SetMonitor(idx);
@@ -485,6 +539,9 @@ void Agent::OnControllerDisconnected() {
     // 该回调在接收输入的 WebSocket 工作线程中运行。若本连接曾注入过输入，
     // 线程已经绑定了对应 desktop，可直接释放远端残留的按下状态。
     Input::ReleaseAll();
+    // 即使控制端快速重连，以 CaptureLoop 未观察到“零客户端”为例，也要确保
+    // 下一帧从 IDR 开始。
+    frameResetRequested_.store(true);
 }
 
 }  // namespace remote_assist
