@@ -58,6 +58,36 @@ static std::wstring ExePath() {
     return buf;
 }
 
+// 浏览器通过 WebSocket JSON 发送 UTF-8 token；配置窗口也必须把用户输入转换为同一
+// 字节序列后才进入 PBKDF2，不能继续依赖当前系统 ACP 的 GetDlgItemTextA。
+bool ReadPasswordUtf8(HWND hwnd, std::string& password) {
+    password.clear();
+    const HWND edit = GetDlgItem(hwnd, IDC_PW_EDIT);
+    if (!edit) {
+        return false;
+    }
+    const int wideLength = GetWindowTextLengthW(edit);
+    if (wideLength <= 0) {
+        return true;
+    }
+    std::vector<wchar_t> wide(static_cast<size_t>(wideLength) + 1, L'\0');
+    const int copied = GetWindowTextW(edit, wide.data(), static_cast<int>(wide.size()));
+    if (copied != wideLength) {
+        return false;
+    }
+    const int utf8Length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                                wide.data(), copied, nullptr, 0,
+                                                nullptr, nullptr);
+    // JSON 会转义引号、反斜杠等字符；3072 字节即使全部需要双字节转义，也能安全
+    // 落在 8 KiB WebSocket 首帧上限以内。
+    if (utf8Length <= 0 || utf8Length > 3072) {
+        return false;
+    }
+    password.resize(static_cast<size_t>(utf8Length));
+    return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), copied,
+                               password.data(), utf8Length, nullptr, nullptr) == utf8Length;
+}
+
 struct ServiceResult {
     bool ok = false;
     DWORD error = ERROR_GEN_FAILURE;
@@ -472,9 +502,14 @@ bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
         return false;
     }
 
-    char password[256] = {};
-    GetDlgItemTextA(hwnd, IDC_PW_EDIT, password, sizeof(password));
-    const bool passwordChanged = password[0] != '\0';
+    std::string password;
+    if (!ReadPasswordUtf8(hwnd, password)) {
+        MessageBoxW(hwnd,
+                    L"密码必须是有效文本，且 UTF-8 编码后不能超过 3072 字节。",
+                    L"RemoteAssist", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    const bool passwordChanged = !password.empty();
     portChanged = g_cfg.port != port;
     changed = passwordChanged || portChanged;
     if (!changed) {
@@ -489,7 +524,7 @@ bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
         MessageBoxW(hwnd, L"配置保存失败，请检查 exe 目录写权限。", L"RemoteAssist", MB_OK | MB_ICONERROR);
         return false;
     }
-    SetDlgItemTextA(hwnd, IDC_PW_EDIT, "");
+    SetDlgItemTextW(hwnd, IDC_PW_EDIT, L"");
     return true;
 }
 

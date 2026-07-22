@@ -34,7 +34,23 @@ std::wstring ReadAndDeleteInitialPassword() {
                         std::istreambuf_iterator<char>());
     f.close();
     DeleteFileW(path.c_str());
-    return std::wstring(s.begin(), s.end());
+    if (s.empty()) {
+        return {};
+    }
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                           s.data(), static_cast<int>(s.size()),
+                                           nullptr, 0);
+    if (length <= 0) {
+        log::Warn("initial password hint is not valid UTF-8");
+        return {};
+    }
+    std::wstring password(static_cast<size_t>(length), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                            s.data(), static_cast<int>(s.size()), password.data(), length) != length) {
+        log::Warn("initial password hint UTF-8 conversion failed");
+        return {};
+    }
+    return password;
 }
 
 }  // namespace
