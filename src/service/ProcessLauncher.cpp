@@ -6,6 +6,7 @@
 #include <userenv.h>
 #include <wtsapi32.h>
 
+#include <array>
 #include <vector>
 
 #pragma comment(lib, "advapi32.lib")
@@ -61,6 +62,48 @@ DWORD FindActiveInteractiveSessionId() {
     }
     WTSFreeMemory(sessions);
     return fallbackSession != kInvalidSessionId ? fallbackSession : consoleSession;
+}
+
+// Agent 需要使用真实 winlogon 的 LocalSystem token 才能在锁屏 input desktop 上稳定
+// 采集和注入。仅按进程名匹配会被同会话内的同名普通进程误导，因此额外校验镜像路径
+// 与 TokenUser SID；校验失败时宁可等待下一轮服务监控，也不启动半权限 Agent。
+bool IsExpectedLocalSystemProcess(DWORD pid, const wchar_t* expectedExeName) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+        return false;
+    }
+
+    std::array<wchar_t, 32768> imagePath{};
+    DWORD imagePathLength = static_cast<DWORD>(imagePath.size());
+    bool validImage = QueryFullProcessImageNameW(process, 0, imagePath.data(), &imagePathLength) != FALSE;
+    wchar_t systemDirectory[MAX_PATH] = {};
+    if (validImage && GetSystemDirectoryW(systemDirectory, MAX_PATH) != 0) {
+        const std::wstring expectedPath = std::wstring(systemDirectory) + L"\\" + expectedExeName;
+        validImage = _wcsicmp(imagePath.data(), expectedPath.c_str()) == 0;
+    } else {
+        validImage = false;
+    }
+
+    bool validOwner = false;
+    HANDLE token = nullptr;
+    if (OpenProcessToken(process, TOKEN_QUERY, &token)) {
+        DWORD tokenUserSize = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &tokenUserSize);
+        std::vector<BYTE> tokenUserBuffer(tokenUserSize);
+        if (tokenUserSize != 0 && GetTokenInformation(token, TokenUser, tokenUserBuffer.data(),
+                                                       tokenUserSize, &tokenUserSize)) {
+            const auto* tokenUser = reinterpret_cast<const TOKEN_USER*>(tokenUserBuffer.data());
+            DWORD systemSidSize = SECURITY_MAX_SID_SIZE;
+            std::array<BYTE, SECURITY_MAX_SID_SIZE> systemSidBuffer{};
+            if (CreateWellKnownSid(WinLocalSystemSid, nullptr, systemSidBuffer.data(),
+                                   &systemSidSize)) {
+                validOwner = EqualSid(tokenUser->User.Sid, systemSidBuffer.data()) != FALSE;
+            }
+        }
+        CloseHandle(token);
+    }
+    CloseHandle(process);
+    return validImage && validOwner;
 }
 
 bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
@@ -136,6 +179,10 @@ bool LaunchAgentInConsoleSession(const std::wstring& exePath, HANDLE* processOut
     const DWORD winlogonPid = FindProcessInSession(L"winlogon.exe", sid);
     if (!winlogonPid) {
         log::Warn("winlogon.exe not found in active interactive session");
+        return false;
+    }
+    if (!IsExpectedLocalSystemProcess(winlogonPid, L"winlogon.exe")) {
+        log::Warn("winlogon.exe validation failed; skip agent launch");
         return false;
     }
     const std::wstring cmd = L"\"" + exePath + L"\" --agent --service-managed";
