@@ -2,6 +2,7 @@
 
 #include "common/Config.h"
 #include "common/Log.h"
+#include "common/Path.h"
 #include "common/RuntimeNames.h"
 
 #include <fstream>
@@ -25,7 +26,12 @@ constexpr const wchar_t* kClassName = L"RemoteAssistTrayWindow";
 
 // 读取并删除 .initial-password 文件(由 service 首次生成密码时写入)。
 std::wstring ReadAndDeleteInitialPassword() {
-    const std::wstring path = ConfigDir() + L"\\.initial-password";
+    const std::wstring configDir = ConfigDir();
+    if (configDir.empty()) {
+        log::Warn("tray cannot resolve configuration directory");
+        return {};
+    }
+    const std::wstring path = configDir + L"\\.initial-password";
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         return {};
@@ -190,12 +196,13 @@ void TrayApp::ShowMenu() {
 }
 
 void TrayApp::OpenSetupWindow() {
-    wchar_t exePath[MAX_PATH] = {};
-    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) {
+    const std::wstring exePath = ModulePath();
+    if (exePath.empty()) {
         log::Warn("tray cannot resolve executable path: " + std::to_string(GetLastError()));
         return;
     }
-    const HINSTANCE result = ShellExecuteW(hwnd_, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+    const HINSTANCE result = ShellExecuteW(hwnd_, L"open", exePath.c_str(), nullptr, nullptr,
+                                           SW_SHOWNORMAL);
     if (reinterpret_cast<INT_PTR>(result) <= 32) {
         log::Warn("tray failed to open setup window: " +
                   std::to_string(reinterpret_cast<INT_PTR>(result)));

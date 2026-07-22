@@ -1,6 +1,7 @@
 #include "common/Config.h"
 
 #include "common/Log.h"
+#include "common/Path.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -163,6 +164,9 @@ bool WriteConfigAtomically(const Config& cfg) {
     j["fps"] = cfg.fps;
 
     const std::wstring path = ConfigFilePath();
+    if (path.empty()) {
+        return false;
+    }
     const std::wstring tempPath = path + L".tmp";
     {
         std::ofstream f(tempPath, std::ios::binary | std::ios::trunc);
@@ -180,7 +184,8 @@ bool WriteConfigAtomically(const Config& cfg) {
 }
 
 std::wstring InitialPasswordHintPath() {
-    return ConfigDir() + L"\\.initial-password";
+    const std::wstring dir = ConfigDir();
+    return dir.empty() ? std::wstring() : dir + L"\\.initial-password";
 }
 
 // 首次密码提示只在当前启动链路中短暂存在。用替换写避免 TrayApp 恰好读取时看到
@@ -190,6 +195,9 @@ bool WriteInitialPasswordHint(const std::string& password) {
         return false;
     }
     const std::wstring path = InitialPasswordHintPath();
+    if (path.empty()) {
+        return false;
+    }
     const std::wstring tempPath = path + L".tmp";
     DeleteFileW(tempPath.c_str());
     {
@@ -214,6 +222,9 @@ bool WriteInitialPasswordHint(const std::string& password) {
 
 void RemoveInitialPasswordHint() {
     const std::wstring path = InitialPasswordHintPath();
+    if (path.empty()) {
+        return;
+    }
     if (!DeleteFileW(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
         log::Warn("initial password hint removal failed: " + std::to_string(GetLastError()));
     }
@@ -233,28 +244,35 @@ bool ConstantTimeEquals(const std::string& left, const std::string& right) {
 }  // namespace
 
 std::wstring ConfigDir() {
-    wchar_t buf[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring exe = buf;
-    size_t pos = exe.find_last_of(L"\\/");
-    std::wstring dir = (pos != std::wstring::npos) ? exe.substr(0, pos) : exe;
-    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring dir = ModuleDirectory();
+    if (!dir.empty()) {
+        CreateDirectoryW(dir.c_str(), nullptr);
+    }
     return dir;
 }
 
 std::wstring LogDir() {
-    std::wstring dir = ConfigDir() + L"\\logs";
+    const std::wstring configDir = ConfigDir();
+    if (configDir.empty()) {
+        return {};
+    }
+    std::wstring dir = configDir + L"\\logs";
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir;
 }
 
 std::wstring ConfigFilePath() {
-    return ConfigDir() + L"\\config.json";
+    const std::wstring dir = ConfigDir();
+    return dir.empty() ? std::wstring() : dir + L"\\config.json";
 }
 
 Config LoadOrCreateConfig() {
     Config cfg;
     const std::wstring path = ConfigFilePath();
+    if (path.empty()) {
+        log::Error("config path resolution failed");
+        return Config{};
+    }
     std::ifstream f(path, std::ios::binary);
     bool loaded = false;
     const bool configFileFound = static_cast<bool>(f);

@@ -3,6 +3,7 @@
 #include "agent/DesktopAccess.h"
 #include "agent/Input.h"
 #include "common/Log.h"
+#include "common/Path.h"
 #include "common/RuntimeNames.h"
 
 #include <nlohmann/json.hpp>
@@ -212,19 +213,18 @@ Agent::~Agent() {
 }
 
 std::string Agent::WebDirFromExe() {
-    wchar_t buf[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring exe = buf;
-    const size_t pos = exe.find_last_of(L"\\/");
-    std::wstring dir = (pos != std::wstring::npos) ? exe.substr(0, pos) : exe;
+    std::wstring dir = ModuleDirectory();
+    if (dir.empty()) {
+        return {};
+    }
     dir += L"\\web";
     if (!PathFileExistsW(dir.c_str())) {
         // 兼容早期 CMake install 目录：exe 位于 bin/，网页在 prefix/share/。
         // 当前安装布局已统一为 exe 同级 web/，此分支仅用于平滑升级旧安装。
         std::wstring alt = dir + L"\\..\\..\\share\\remote-assist\\web";
-        wchar_t full[MAX_PATH] = {};
-        if (GetFullPathNameW(alt.c_str(), MAX_PATH, full, nullptr)) {
-            if (PathFileExistsW(full)) {
+        const std::wstring full = AbsolutePath(alt);
+        if (!full.empty()) {
+            if (PathFileExistsW(full.c_str())) {
                 return WideToUtf8(full);
             }
         }

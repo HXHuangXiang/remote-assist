@@ -2,6 +2,7 @@
 
 #include "common/Config.h"
 #include "common/Log.h"
+#include "common/Path.h"
 #include "common/RuntimeNames.h"
 #include "service/ProcessLauncher.h"
 
@@ -358,9 +359,12 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
         return;
     }
 
-    wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    g_state.exePath = exePath;
+    g_state.exePath = ModulePath();
+    if (g_state.exePath.empty()) {
+        log::Error("service cannot resolve executable path: " + std::to_string(GetLastError()));
+        ReportState(SERVICE_STOPPED, ERROR_PATH_NOT_FOUND);
+        return;
+    }
 
     ReportState(SERVICE_START_PENDING, NO_ERROR, 3000);
     ServiceWorker();

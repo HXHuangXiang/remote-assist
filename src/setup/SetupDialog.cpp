@@ -1,6 +1,7 @@
 #include "setup/SetupDialog.h"
 #include "common/Config.h"
 #include "common/Log.h"
+#include "common/Path.h"
 #include "common/RuntimeNames.h"
 
 #include <netfw.h>
@@ -53,9 +54,7 @@ static HANDLE g_trayMutex = nullptr;
 static bool g_ownsTray = false;
 
 static std::wstring ExePath() {
-    wchar_t buf[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    return buf;
+    return ModulePath();
 }
 
 // 浏览器通过 WebSocket JSON 发送 UTF-8 token；配置窗口也必须把用户输入转换为同一
