@@ -391,7 +391,7 @@ bool Capture::InitDXGI() {
     return false;
 }
 
-CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs) {
+CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs, bool requireFreshFrame) {
     // 采集线程串行使用同一个 staging texture。即使调用方因编码异常遗漏释放，也不
     // 能让下一次 Map 保持旧映射；正常路径会在编码后主动调用 ReleaseFrame。
     ReleaseFrame(out);
@@ -402,16 +402,28 @@ CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs) {
     }
     const bool allMonitors = selectedMonitor == -1 && MonitorsSnapshot().size() > 1;
     if (use_gdi_ || allMonitors) {
-        return CaptureGDI(out);
+        return CaptureGDI(out, requireFreshFrame);
     }
 
     const CaptureResult result = CaptureDXGI(out, std::max<DWORD>(1, waitMs));
     if (result != CaptureResult::kFailed) {
+        // Desktop Duplication 在新订阅的静态桌面上可能只等到超时或 pointer-only
+        // 通知。控制端尚未有可绘制画面时不能一直等下一次桌面变化，使用当前 input
+        // desktop 的 GDI 快照建立一次完整基线；之后仍回到成本更低的 DXGI 路径。
+        if (requireFreshFrame &&
+            (result == CaptureResult::kNoChange || result == CaptureResult::kPointerOnly)) {
+            log::Info("capture: DXGI has no full bootstrap frame, using one-shot GDI fallback");
+            return CaptureGDI(out, true);
+        }
         return result;
     }
 
     // DXGI 访问丢失等异常会在下一帧尝试重建，不把空闲超时误当异常。
     ResetForDesktop();
+    if (requireFreshFrame) {
+        log::Info("capture: DXGI recovery needs bootstrap frame, using GDI fallback");
+        return CaptureGDI(out, true);
+    }
     return CaptureResult::kNoChange;
 }
 
@@ -501,7 +513,7 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     return CaptureResult::kFrame;
 }
 
-CaptureResult Capture::CaptureGDI(CapturedFrame& out) {
+CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
     // 虚拟屏幕尺寸(涵盖所有显示器)。
     const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -564,7 +576,7 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out) {
                                                        ox, oy, ow, oh);
     const bool refreshDue = lastGdiFullFrameAt_.time_since_epoch().count() == 0 ||
         now - lastGdiFullFrameAt_ >= std::chrono::seconds(1);
-    if (hasGdiFingerprint_ && fingerprint == gdiFingerprint_ && !refreshDue) {
+    if (!forceFrame && hasGdiFingerprint_ && fingerprint == gdiFingerprint_ && !refreshDue) {
         return CaptureResult::kNoChange;
     }
     gdiFingerprint_ = fingerprint;

@@ -68,8 +68,9 @@ public:
 
     bool Init();
     // waitMs 是 DXGI 等待桌面变化的上限；由 Agent 按实际目标帧率传入，避免
-    // 固定超时把高帧率配置限制在约 20 FPS。
-    CaptureResult CaptureFrame(CapturedFrame& out, DWORD waitMs);
+    // 固定超时把高帧率配置限制在约 20 FPS。requireFreshFrame 用于新控制端或
+    // 解码恢复：DXGI 没有桌面变更时也必须提供一张完整首帧，内部会一次性回退 GDI。
+    CaptureResult CaptureFrame(CapturedFrame& out, DWORD waitMs, bool requireFreshFrame);
     // 结束直接映射的 DXGI 帧借用。编码完成后必须调用；对普通 CPU 帧是无操作。
     void ReleaseFrame(CapturedFrame& frame);
     // 取得自上次调用后最新的指针可见性/位置变化。仅由 CaptureLoop 调用。
@@ -101,7 +102,7 @@ public:
 private:
     bool InitDXGI();
     CaptureResult CaptureDXGI(CapturedFrame& out, DWORD waitMs);
-    CaptureResult CaptureGDI(CapturedFrame& out);
+    CaptureResult CaptureGDI(CapturedFrame& out, bool forceFrame);
     void CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                            int x, int y, int width, int height,
                            CapturedFrame& out);

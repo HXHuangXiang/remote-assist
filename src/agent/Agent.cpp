@@ -737,8 +737,9 @@ void Agent::CaptureLoop() {
         // DXGI 空闲时会阻塞等待桌面变化。等待一个目标帧周期即可在静态画面
         // 下避免轮询空转，同时不会再因固定 50ms 把 30FPS 限制为约 20FPS。
         const auto captureStartedAt = std::chrono::steady_clock::now();
+        const bool requireFreshFrame = firstFrame_ || streamKeyFrameRequired_;
         const CaptureResult captureResult = capture_.CaptureFrame(
-            frame, static_cast<DWORD>(std::max(1, targetMs)));
+            frame, static_cast<DWORD>(std::max(1, targetMs)), requireFreshFrame);
         metrics.captureAttempts++;
         metrics.captureTimeMs += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(

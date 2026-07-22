@@ -11,7 +11,7 @@
 
     RemoteAssist.exe --agent   (由 winlogon token 启动,绑定当前 input desktop)
       |- DesktopAccess: 每个工作线程独立 OpenInputDesktop + SetThreadDesktop，每秒检查桌面切换
-      |- Capture: DXGI Desktop Duplication(普通桌面)/ GDI BitBlt(锁屏回退，限 15 FPS)
+      |- Capture: DXGI Desktop Duplication(普通桌面)/ GDI BitBlt(锁屏回退、静态首帧兜底，限 15 FPS)
       |- EncoderMf: Media Foundation H.264 MFT（硬件优先）编码；不可用时回退 WIC JPEG
       |- HttpWsServer: cpp-httplib 托管 web/ + /ws
       \- Input: SendInput 注入键鼠(锁屏桌面用 scancode 路径)
@@ -21,7 +21,7 @@
 
 ## 桌面跟随
 
-采集线程和输入线程各自持有当前 input desktop。每秒按桌面名检测变化，变化后重建与旧桌面相关的采集资源，覆盖 锁屏<->解锁、Winlogon<->Default 切换。MVP 不处理 UAC Secure Desktop(Winlogon 桌面已满足锁屏可见可操作)。
+采集线程和输入线程各自持有当前 input desktop。每秒按桌面名检测变化，变化后重建与旧桌面相关的采集资源，覆盖 锁屏<->解锁、Winlogon<->Default 切换。新控制端或解码恢复请求完整首帧时，若 DXGI Desktop Duplication 仅返回超时/指针更新，则会一次性通过同一 input desktop 的 GDI 获取基线画面，避免静态桌面持续黑屏；后续继续优先使用 DXGI。MVP 不处理 UAC Secure Desktop(Winlogon 桌面已满足锁屏可见可操作)。
 
 同一轮检查也会刷新显示器拓扑。热插拔、分辨率变化或被选显示器消失时，采集资源会重建；
 若原设备名仍存在则保留选择，否则回退“全部屏幕”。WebSocket 线程通过显示器快照生成 cfg，
