@@ -33,9 +33,10 @@
 允许:复制 winlogon token 启动 agent 到 Winlogon 桌面,采集与注入键鼠;LocalSystem 服务常驻,开机自启;托盘可见运行,本地用户可随时退出。
 不做:UAC Secure Desktop、Ctrl+Alt+Del 注入(需 SAS/驱动)、隐藏运行、静默持久化、规避本地用户终止;日志不写密码、屏幕内容、剪贴板。
 
-图形安装和 `tools/install.bat` 在注册 LocalSystem 服务前检查 exe、web/ 资源树及其父目录
-链的 ACL。空 DACL、重解析点、网络/可移动卷、普通用户可写 ACL 或非管理员所有者都会
-被拒绝；配置、日志和网页资源仍留在当前 exe 目录，不会被自动迁移。
+图形安装和 `tools/install.bat` 在注册 LocalSystem 服务前检查 exe、web/ 资源树、已有的
+config.json、logs/、.initial-password 及其父目录链的 ACL。空 DACL、重解析点、网络/可
+移动卷、普通用户可写 ACL 或非管理员所有者都会被拒绝；配置、日志和网页资源仍留在当前
+exe 目录，不会被自动迁移。
 
 服务创建的 Agent stop/ready 全局事件显式限制为 LocalSystem 与管理员可修改，交互式用户
 仅能读取 ready 状态；这不会改变可见托盘与正常服务停止入口，但能避免普通进程伪造就绪

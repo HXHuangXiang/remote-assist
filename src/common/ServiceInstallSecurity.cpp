@@ -291,16 +291,25 @@ bool ValidateExistingObject(const std::wstring& path, const InstallerPrincipal& 
     return ValidateDacl(path, principal, reason);
 }
 
-bool ValidateWebTree(const std::wstring& directory, const InstallerPrincipal& principal,
-                     std::wstring& reason) {
+bool IsMissingPathError(DWORD error) {
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
+bool ValidateDirectoryTree(const std::wstring& directory, const wchar_t* resourceName,
+                           const InstallerPrincipal& principal, std::wstring& reason) {
     if (!ValidateExistingObject(directory, principal, reason)) {
+        return false;
+    }
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        reason = std::wstring(resourceName) + L"不是目录：" + directory;
         return false;
     }
     WIN32_FIND_DATAW data{};
     const std::wstring pattern = JoinPath(directory, L"*");
     HANDLE find = FindFirstFileW(pattern.c_str(), &data);
     if (find == INVALID_HANDLE_VALUE) {
-        reason = L"无法枚举网页资源目录：" + directory;
+        reason = L"无法枚举" + resourceName + L"：" + directory;
         return false;
     }
     bool valid = true;
@@ -310,12 +319,12 @@ bool ValidateWebTree(const std::wstring& directory, const InstallerPrincipal& pr
         }
         const std::wstring child = JoinPath(directory, data.cFileName);
         if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-            reason = L"网页资源不能包含符号链接或其他重解析点：" + child;
+            reason = std::wstring(resourceName) + L"不能包含符号链接或其他重解析点：" + child;
             valid = false;
             break;
         }
         if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            if (!ValidateWebTree(child, principal, reason)) {
+            if (!ValidateDirectoryTree(child, resourceName, principal, reason)) {
                 valid = false;
                 break;
             }
@@ -327,10 +336,47 @@ bool ValidateWebTree(const std::wstring& directory, const InstallerPrincipal& pr
     const DWORD enumerationError = GetLastError();
     FindClose(find);
     if (valid && enumerationError != ERROR_NO_MORE_FILES) {
-        reason = L"枚举网页资源目录时发生错误：" + directory;
+        reason = L"枚举" + std::wstring(resourceName) + L"时发生错误：" + directory;
         return false;
     }
     return valid;
+}
+
+// 运行产物在首次启动前可能尚不存在；存在时必须和服务映像一样可验证，缺失时则
+// 由正常的配置/日志初始化流程创建。这样既不会阻止全新安装，也能拒绝预置的链接、
+// 目录伪装或低权限可写文件。
+bool ValidateOptionalRegularFile(const std::wstring& path, const wchar_t* resourceName,
+                                 const InstallerPrincipal& principal, std::wstring& reason) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (IsMissingPathError(GetLastError())) {
+            return true;
+        }
+        reason = L"无法读取" + std::wstring(resourceName) + L"：" + path;
+        return false;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        reason = std::wstring(resourceName) + L"不是普通文件：" + path;
+        return false;
+    }
+    return ValidateExistingObject(path, principal, reason);
+}
+
+bool ValidateOptionalDirectoryTree(const std::wstring& path, const wchar_t* resourceName,
+                                   const InstallerPrincipal& principal, std::wstring& reason) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (IsMissingPathError(GetLastError())) {
+            return true;
+        }
+        reason = L"无法读取" + std::wstring(resourceName) + L"：" + path;
+        return false;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        reason = std::wstring(resourceName) + L"不是目录：" + path;
+        return false;
+    }
+    return ValidateDirectoryTree(path, resourceName, principal, reason);
 }
 
 }  // namespace
@@ -389,7 +435,23 @@ ServiceInstallPathValidation ValidateServiceInstallPath(const std::wstring& exeP
     if (!ValidateExistingObject(exePath, principal, validation.reason)) {
         return validation;
     }
-    if (!ValidateWebTree(JoinPath(exeDirectory, L"web"), principal, validation.reason)) {
+    if (!ValidateDirectoryTree(JoinPath(exeDirectory, L"web"), L"网页资源目录",
+                               principal, validation.reason)) {
+        return validation;
+    }
+    // 配置、日志和首次密码提示都由 LocalSystem 服务从 exe 同级目录读取或写入。
+    // 新安装时这些运行产物尚不存在；若用户已运行过便携模式，则必须在注册高
+    // 权限服务前确认它们同样不是链接、目录伪装或低权限可写对象。
+    if (!ValidateOptionalRegularFile(JoinPath(exeDirectory, L"config.json"), L"配置文件",
+                                     principal, validation.reason)) {
+        return validation;
+    }
+    if (!ValidateOptionalDirectoryTree(JoinPath(exeDirectory, L"logs"), L"日志目录",
+                                       principal, validation.reason)) {
+        return validation;
+    }
+    if (!ValidateOptionalRegularFile(JoinPath(exeDirectory, L".initial-password"),
+                                     L"首次密码提示文件", principal, validation.reason)) {
         return validation;
     }
 
