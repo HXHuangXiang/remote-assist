@@ -179,6 +179,46 @@ bool WriteConfigAtomically(const Config& cfg) {
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
 }
 
+std::wstring InitialPasswordHintPath() {
+    return ConfigDir() + L"\\.initial-password";
+}
+
+// 首次密码提示只在当前启动链路中短暂存在。用替换写避免 TrayApp 恰好读取时看到
+// 半写入内容；写入失败时调用方会删除旧提示，宁可不提示也不能展示失效密码。
+bool WriteInitialPasswordHint(const std::string& password) {
+    if (password.empty()) {
+        return false;
+    }
+    const std::wstring path = InitialPasswordHintPath();
+    const std::wstring tempPath = path + L".tmp";
+    DeleteFileW(tempPath.c_str());
+    {
+        std::ofstream f(tempPath, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            return false;
+        }
+        f.write(password.data(), static_cast<std::streamsize>(password.size()));
+        f.flush();
+        if (!f) {
+            DeleteFileW(tempPath.c_str());
+            return false;
+        }
+    }
+    if (MoveFileExW(tempPath.c_str(), path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return true;
+    }
+    DeleteFileW(tempPath.c_str());
+    return false;
+}
+
+void RemoveInitialPasswordHint() {
+    const std::wstring path = InitialPasswordHintPath();
+    if (!DeleteFileW(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        log::Warn("initial password hint removal failed: " + std::to_string(GetLastError()));
+    }
+}
+
 bool ConstantTimeEquals(const std::string& left, const std::string& right) {
     if (left.size() != right.size()) {
         return false;
@@ -256,19 +296,14 @@ Config LoadOrCreateConfig() {
             return Config{};
         }
 
-        // 把明文密码写到一个 only-once 文件,供 tray 进程读取后删除;
-        // 首次生成的密码不进入 service 的命令行或长期存储。
-        {
-            std::wstring pwPath = ConfigDir() + L"\\.initial-password";
-            std::ofstream pf(pwPath, std::ios::binary | std::ios::trunc);
-            if (pf) {
-                pf.write(cfg.initialPassword.data(),
-                         static_cast<std::streamsize>(cfg.initialPassword.size()));
-            }
-        }
         if (!WriteConfigAtomically(cfg)) {
             log::Error("config write failed: " + std::to_string(GetLastError()));
             return Config{};
+        }
+        // 把明文密码写到一个 only-once 文件,供 tray 进程读取后删除；它只在
+        // config 已成功落盘后创建，避免遗留不对应任何有效配置的旧提示。
+        if (!WriteInitialPasswordHint(cfg.initialPassword)) {
+            log::Warn("initial password hint write failed");
         }
         log::Info("config generated with new password (len=" +
                   std::to_string(cfg.initialPassword.size()) + ")");
@@ -304,7 +339,24 @@ bool SetPassword(Config& cfg, const std::string& password) {
     if (!IsHex(cfg.salt, 32)) cfg.salt = GenRandomHex(16);
     cfg.passwordIterations = kPasswordIterations;
     cfg.passwordHash = Pbkdf2Sha256Hex(cfg.salt, password, cfg.passwordIterations);
-    return SaveConfig(cfg);
+    if (!SaveConfig(cfg)) {
+        return false;
+    }
+
+    // 配置窗口在首次运行时已经持有随机初始密码。若用户改为自定义密码（例如
+    // 123456）再安装服务，TrayApp 必须展示新密码而不是旧随机值。普通密码变更
+    // 则删除任何残留提示，避免服务重启后泄露/展示已经失效的旧密码。
+    const bool shouldRefreshHint = !cfg.initialPassword.empty();
+    cfg.initialPassword.clear();
+    if (shouldRefreshHint) {
+        if (!WriteInitialPasswordHint(password)) {
+            RemoveInitialPasswordHint();
+            log::Warn("initial password hint refresh failed");
+        }
+    } else {
+        RemoveInitialPasswordHint();
+    }
+    return true;
 }
 
 }  // namespace remote_assist
