@@ -126,7 +126,10 @@ public:
     void SetOnControllerDisconnected(OnControllerDisconnected cb);
     WsBroadcaster& Broadcaster() { return broadcaster_; }
 
+    // 成功返回时 httplib 已进入 accept 循环，可安全对外报告 Agent 就绪。
     bool Start(const std::string& host, int port);
+    // 监听线程异常退出时变为 false；Agent 据此退出，由服务进程按既有策略重拉。
+    bool IsRunning() const { return running_.load(); }
     void Stop();
 
 private:

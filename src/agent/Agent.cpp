@@ -302,7 +302,9 @@ int Agent::Run(bool serviceManaged) {
 
     captureThread_ = std::thread(&Agent::CaptureLoop, this);
 
-    // 主线程等待停止信号(MVP:轮询 stop_ 标志,后续可改事件)。
+    // 主线程等待停止信号，同时监控 HTTP/WS accept 循环。监听线程意外退出时不能继续
+    // 保留“Agent 已就绪”状态，否则服务和配置界面会误报控制端可连接。
+    int runResult = 0;
     while (!stop_.load()) {
         const DWORD waitResult = stopEvent_
             ? WaitForSingleObject(stopEvent_, 200)
@@ -310,13 +312,17 @@ int Agent::Run(bool serviceManaged) {
         if (waitResult == WAIT_OBJECT_0) {
             log::Info("agent stop event received");
             Stop();
+        } else if (!server_.IsRunning()) {
+            log::Error("agent: HTTP/WS listener stopped unexpectedly");
+            runResult = 1;
+            Stop();
         }
     }
 
     Stop();
     CoUninitialize();
     log::Info("agent exit");
-    return 0;
+    return runResult;
 }
 
 void Agent::Stop() {

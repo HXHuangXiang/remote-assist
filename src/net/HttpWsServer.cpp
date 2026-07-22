@@ -380,6 +380,9 @@ bool HttpWsServer::Start(const std::string& host, int port) {
     svr_.set_payload_max_length(64 * 1024);
     // 发送超时保护发送线程，避免失联浏览器长期占用 socket 写操作。
     svr_.set_write_timeout(2, 0);
+    // httplib 在真正进入 listen_internal 后才调用 start handler；用它而不是创建
+    // std::thread 后立即置位，确保 running_ 与实际 accept 循环一致。
+    svr_.set_start_handler([this] { running_ = true; });
     svr_.WebSocket("/ws", [this](const httplib::Request& req, httplib::ws::WebSocket& ws) {
         const std::string remoteAddr = req.remote_addr;
         if (broadcaster_.Count() != 0) {
@@ -479,14 +482,28 @@ bool HttpWsServer::Start(const std::string& host, int port) {
         return false;
     }
 
-    running_ = true;
+    running_ = false;
     thread_ = std::thread([this, host, port]() {
         if (!svr_.listen_after_bind()) {
             log::Error("listen failed on " + host + ":" + std::to_string(port));
-            running_ = false;
-            return;
         }
+        running_ = false;
     });
+
+    // bind 成功只说明端口已占用到本进程；listen_after_bind 的 accept 循环尚未一定
+    // 开始。等待 httplib 报告运行状态，避免 Agent 过早置 readyEvent 而控制端连接失败。
+    svr_.wait_until_ready();
+    while (!running_.load() && svr_.is_running()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!running_.load()) {
+        log::Error("http/ws server failed before entering accept loop on " + host + ":" +
+                   std::to_string(port));
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        return false;
+    }
     log::Info("http/ws server listening on " + host + ":" + std::to_string(port));
     return true;
 }
