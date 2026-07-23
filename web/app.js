@@ -6,7 +6,7 @@ let ws = null, cfg = null, authed = false;
 // 上一控制端槽位，新连接会被误判为并发控制端而拒绝。
 let reconnectAfterClose = false;
 let reconnectRetriesRemaining = 0;
-let canvas, ctx, cursorCanvas, cursorCtx, logEl, statusEl, pwEl, monSel, qualitySel;
+let canvas, ctx, logEl, statusEl, pwEl, monSel, qualitySel;
 let patchThresholdEl, patchThresholdValueEl;
 const pressedKeys = new Map();
 const pressedButtons = new Set();
@@ -28,7 +28,7 @@ const clientStats = {
   decodeMsTotal: 0, decodeMsSamples: 0,
   decodeErrors: 0, maxDecodeQueue: 0, maxWsBuffered: 0
 };
-let remoteCursor = { visible:false, x:0, y:0 };
+let remoteCursor = { visible:false, style:'default' };
 let firstFrameWarningTimer = 0, awaitingFrameSocket = null;
 let activePatch = null, nextTileInfo = null, patchDrawing = false;
 const qualityStorageKey = 'remote-assist.stream-quality';
@@ -36,9 +36,10 @@ const patchThresholdStorageKey = 'remote-assist.patch-threshold';
 // 鉴权成功只代表控制信道可用。必须等解码后的帧实际绘制到 canvas，才能确认视频
 // 通路正常；否则损坏的 H.264/JPEG 负载会把黑屏误报成“已连接”。
 let firstFramePresented = false;
-// 远端指针移动非常频繁。记录上一次实际绘制的边界，只清除箭头附近的小区域，
-// 避免每个 cursor 消息都 clearRect 整张 2K/4K 覆盖 canvas。
-let drawnCursorBounds = null;
+const cursorStyles = new Set([
+  'default', 'text', 'wait', 'crosshair', 'pointer', 'move', 'ew-resize', 'ns-resize',
+  'nwse-resize', 'nesw-resize', 'not-allowed', 'progress', 'help'
+]);
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
@@ -189,10 +190,11 @@ function openConnection() {
     pendingMove = null;
     pendingWheelDelta = 0;
     wheelRemainder = 0;
-    remoteCursor.visible = false;
-    drawRemoteCursor();
     ws = null;
-    log('disconnected'); setStatus('未连接'); authed = false;
+    authed = false;
+    remoteCursor = { visible:false, style:'default' };
+    applyRemoteCursorStyle();
+    log('disconnected'); setStatus('未连接');
     updateKeyboardFocusIndicator();
     if (shouldReconnect) {
       if (reconnectRetriesRemaining > 0) --reconnectRetriesRemaining;
@@ -305,11 +307,9 @@ function setupCfg(c) {
   if (sizeChanged) {
     canvas.width = c.w;
     canvas.height = c.h;
-    cursorCanvas.width = c.w;
-    cursorCanvas.height = c.h;
     fitCanvas();
   }
-  drawRemoteCursor();
+  applyRemoteCursorStyle();
   if (c.monitors) populateMonitors(c.monitors, c.selected_monitor);
   if (videoConfigChanged && isH264Codec()) setupH264Decoder(c);
   log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps +
@@ -319,63 +319,26 @@ function setupCfg(c) {
 function updateRemoteCursor(m) {
   const visible = m.visible === true;
   if (!visible) {
-    remoteCursor.visible = false;
-    drawRemoteCursor();
+    remoteCursor = { visible:false, style:'default' };
+    applyRemoteCursorStyle();
     return;
   }
   const x = Number(m.x), y = Number(m.y);
   if (!Number.isFinite(x) || !Number.isFinite(y)) return;
   remoteCursor = {
     visible:true,
-    x:Math.max(0, Math.min(1, x)),
-    y:Math.max(0, Math.min(1, y))
+    style:cursorStyles.has(m.style) ? m.style : 'default'
   };
-  drawRemoteCursor();
+  applyRemoteCursorStyle();
 }
 
-function drawRemoteCursor() {
-  if (!cursorCanvas || !cursorCtx) return;
-  if (drawnCursorBounds) {
-    cursorCtx.clearRect(drawnCursorBounds.x, drawnCursorBounds.y,
-      drawnCursorBounds.w, drawnCursorBounds.h);
-    drawnCursorBounds = null;
-  }
-  canvas.style.cursor = remoteCursor.visible ? 'none' : 'default';
-  if (!remoteCursor.visible || !cursorCanvas.width || !cursorCanvas.height) return;
-
-  const x = remoteCursor.x * Math.max(0, cursorCanvas.width - 1);
-  const y = remoteCursor.y * Math.max(0, cursorCanvas.height - 1);
-  const size = Math.max(14, Math.min(30,
-    Math.round(Math.min(cursorCanvas.width, cursorCanvas.height) / 36)));
-  const lineWidth = Math.max(1, size / 12);
-  // 箭头底端会到 size * 1.12，描边还会向外扩展半个 lineWidth。额外留两像素，
-  // 保证抗锯齿边缘也被擦除，且坐标裁剪由 canvas 自动完成。
-  const padding = Math.ceil(lineWidth / 2) + 2;
-  drawnCursorBounds = {
-    x:x - padding,
-    y:y - padding,
-    w:size + padding * 2,
-    h:Math.ceil(size * 1.12) + padding * 2
-  };
-  cursorCtx.save();
-  cursorCtx.translate(x, y);
-  cursorCtx.lineJoin = 'round';
-  cursorCtx.lineCap = 'round';
-  cursorCtx.beginPath();
-  cursorCtx.moveTo(0, 0);
-  cursorCtx.lineTo(0, size);
-  cursorCtx.lineTo(size * 0.28, size * 0.72);
-  cursorCtx.lineTo(size * 0.52, size * 1.12);
-  cursorCtx.lineTo(size * 0.70, size);
-  cursorCtx.lineTo(size * 0.45, size * 0.60);
-  cursorCtx.lineTo(size, size * 0.60);
-  cursorCtx.closePath();
-  cursorCtx.fillStyle = '#fff';
-  cursorCtx.strokeStyle = '#000';
-  cursorCtx.lineWidth = lineWidth;
-  cursorCtx.stroke();
-  cursorCtx.fill();
-  cursorCtx.restore();
+function applyRemoteCursorStyle() {
+  if (!canvas) return;
+  // 控制端本地指针与注入坐标一致，直接采用浏览器原生光标，不再绘制一个会先按
+  // 本地预测、再被远端坐标校正的副本，避免视觉上的二次跳动。
+  // 尚未收到远端状态、或鼠标位于当前画面外时仍保留本地默认箭头，避免控制端看似
+  // “丢失鼠标”。远端光标处于画面内时才映射为与远端状态一致的原生样式。
+  canvas.style.cursor = remoteCursor.visible ? remoteCursor.style : 'default';
 }
 
 function populateMonitors(list, selectedMonitor) {
@@ -880,11 +843,6 @@ function normalizedWheelDelta(e) {
 function queueMove(e) {
   pendingMove = normXY(e);
   lastPointer = pendingMove;
-  // GDI/锁屏路径不应为每个 mousemove 执行一次完整 BitBlt。先在控制端预测
-  // 指针位置，使操作反馈不必等待下一次视频帧；被控端随后发送的 cursor 消息
-  // 仍是权威状态，可处理边界限制、跨屏或目标程序改写指针位置的情况。
-  remoteCursor = { visible:true, x:pendingMove.x, y:pendingMove.y };
-  drawRemoteCursor();
   scheduleMoveFlush();
 }
 
@@ -937,8 +895,6 @@ window.addEventListener('DOMContentLoaded', function() {
   // desynchronized 是 Chromium 的低延迟呈现提示，可减少 VideoFrame/JPEG 绘制
   // 等待合成器的机会；不支持时浏览器会忽略选项，后备上下文保证兼容性。
   ctx = canvas.getContext('2d', { alpha:false, desynchronized:true }) || canvas.getContext('2d');
-  cursorCanvas = document.getElementById('cursor');
-  cursorCtx = cursorCanvas.getContext('2d');
   logEl = document.getElementById('log');
   statusEl = document.getElementById('status');
   pwEl = document.getElementById('pw');

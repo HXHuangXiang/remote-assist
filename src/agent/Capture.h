@@ -78,12 +78,31 @@ enum class CaptureResult {
     kFailed,
 };
 
-// 指针坐标相对于当前视频画面归一化。当前版本在浏览器端叠加低成本通用箭头，避免
-// Desktop Duplication 将指针更新误当成整帧桌面变化，后续可在此基础上补充原生形状。
+// 浏览器原生 CSS 光标的安全映射。仅传递有限的标准类型，避免把任意 Windows 资源
+// 或文件路径暴露到网页；无法识别的第三方光标统一回退为默认箭头。
+enum class PointerCursorStyle : uint8_t {
+    kDefault,
+    kText,
+    kWait,
+    kCrosshair,
+    kPointer,
+    kMove,
+    kEastWestResize,
+    kNorthSouthResize,
+    kNorthwestSoutheastResize,
+    kNortheastSouthwestResize,
+    kNotAllowed,
+    kProgress,
+    kHelp,
+};
+
+// 指针坐标相对于当前视频画面归一化。网页将当前 Windows 标准光标类型映射为本地
+// 原生 CSS 光标，不再在 Canvas 上额外绘制一个会被远端回传位置二次校正的假箭头。
 struct PointerUpdate {
     bool visible = false;
     double x = 0.0;
     double y = 0.0;
+    PointerCursorStyle style = PointerCursorStyle::kDefault;
 };
 
 // 显示器信息(矩形坐标相对于虚拟屏幕原点)。
@@ -184,7 +203,9 @@ private:
         int offsetX = 0, int offsetY = 0);
     std::vector<DirtyRegion> DiffGdiTiles(const uint8_t* pixels, int width, int height);
     void ReleaseAll();
-    void UpdatePointerFromDesktop(bool visible, int screenX, int screenY);
+    void UpdatePointerFromDesktop(bool visible, int screenX, int screenY,
+                                  PointerCursorStyle style);
+    static PointerCursorStyle CursorStyleFromHandle(HCURSOR cursor);
     void UpdatePointerFromFrame(const DXGI_OUTDUPL_FRAME_INFO& frameInfo);
     void UpdatePointerFromSystem();
     void RecordGdiCaptureFailure(DWORD error);

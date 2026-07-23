@@ -37,9 +37,9 @@ private:
     // GDI 空闲路径可低频采集；离散远端输入到达时用该事件立即唤醒采集线程，避免
     // 为省 CPU 而把鼠标点击和密码输入的视觉反馈延后一个完整空闲帧周期。
     // requestFreshFrame 只用于能造成界面变化的离散输入（键盘、按键鼠标、滚轮）。
-    // 纯鼠标移动由浏览器立即预测指针位置、采集路径按交互帧率校正。首个移动和
-    // 后续受限频率的移动可唤醒采集，但不能因每个 mousemove 打断 BitBlt 等待并
-    // 退化成浏览器刷新率的全帧复制。
+    // 纯鼠标移动由浏览器原生指针立即呈现，采集路径按交互帧率同步远端光标状态。
+    // 首个移动和后续受限频率的移动可唤醒采集，但不能因每个 mousemove 打断 BitBlt
+    // 等待并退化成浏览器刷新率的全帧复制。
     void WakeGdiCaptureLoop(bool requestFreshFrame = false);
     void WaitForGdiCaptureDelay(int delayMs) const;
     std::string MakeCfgJson() const;

@@ -164,7 +164,34 @@ bool Capture::TakePointerUpdate(PointerUpdate& out) {
     return true;
 }
 
-void Capture::UpdatePointerFromDesktop(bool visible, int screenX, int screenY) {
+PointerCursorStyle Capture::CursorStyleFromHandle(HCURSOR cursor) {
+    if (!cursor) {
+        return PointerCursorStyle::kDefault;
+    }
+    // LoadCursor 返回共享的系统资源句柄，无需释放。比较标准句柄能覆盖文本、等待、
+    // 手型和常用缩放等高频交互状态；应用自定义光标则保守显示默认箭头。
+    if (cursor == LoadCursorW(nullptr, IDC_IBEAM)) return PointerCursorStyle::kText;
+    if (cursor == LoadCursorW(nullptr, IDC_WAIT)) return PointerCursorStyle::kWait;
+    if (cursor == LoadCursorW(nullptr, IDC_CROSS)) return PointerCursorStyle::kCrosshair;
+    if (cursor == LoadCursorW(nullptr, IDC_HAND)) return PointerCursorStyle::kPointer;
+    if (cursor == LoadCursorW(nullptr, IDC_SIZEALL) ||
+        cursor == LoadCursorW(nullptr, IDC_SIZE)) return PointerCursorStyle::kMove;
+    if (cursor == LoadCursorW(nullptr, IDC_SIZEWE)) return PointerCursorStyle::kEastWestResize;
+    if (cursor == LoadCursorW(nullptr, IDC_SIZENS)) return PointerCursorStyle::kNorthSouthResize;
+    if (cursor == LoadCursorW(nullptr, IDC_SIZENWSE)) {
+        return PointerCursorStyle::kNorthwestSoutheastResize;
+    }
+    if (cursor == LoadCursorW(nullptr, IDC_SIZENESW)) {
+        return PointerCursorStyle::kNortheastSouthwestResize;
+    }
+    if (cursor == LoadCursorW(nullptr, IDC_NO)) return PointerCursorStyle::kNotAllowed;
+    if (cursor == LoadCursorW(nullptr, IDC_APPSTARTING)) return PointerCursorStyle::kProgress;
+    if (cursor == LoadCursorW(nullptr, IDC_HELP)) return PointerCursorStyle::kHelp;
+    return PointerCursorStyle::kDefault;
+}
+
+void Capture::UpdatePointerFromDesktop(bool visible, int screenX, int screenY,
+                                       PointerCursorStyle style) {
     const int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -194,6 +221,7 @@ void Capture::UpdatePointerFromDesktop(bool visible, int screenX, int screenY) {
         relativeX < offsetX + outputWidth && relativeY < offsetY + outputHeight;
     PointerUpdate next;
     next.visible = visible && insideOutput;
+    next.style = next.visible ? style : PointerCursorStyle::kDefault;
     if (next.visible) {
         next.x = std::clamp(static_cast<double>(relativeX - offsetX) /
                                 std::max(1, outputWidth - 1),
@@ -205,6 +233,7 @@ void Capture::UpdatePointerFromDesktop(bool visible, int screenX, int screenY) {
 
     constexpr double kPositionEpsilon = 0.00001;
     const bool changed = !pointerKnown_ || next.visible != pointer_.visible ||
+        (next.visible && next.style != pointer_.style) ||
         (next.visible && (std::abs(next.x - pointer_.x) > kPositionEpsilon ||
                           std::abs(next.y - pointer_.y) > kPositionEpsilon));
     if (changed) {
@@ -215,14 +244,24 @@ void Capture::UpdatePointerFromDesktop(bool visible, int screenX, int screenY) {
 }
 
 void Capture::UpdatePointerFromFrame(const DXGI_OUTDUPL_FRAME_INFO& frameInfo) {
-    // LastMouseUpdateTime 为零代表本次桌面帧没有新的鼠标状态；首次帧仍读取一次，
-    // 这样控制端刚连接时即可得到当前指针位置。
-    if (frameInfo.LastMouseUpdateTime.QuadPart == 0 && pointerKnown_) {
+    // 仅位置未变但光标切换到文本/等待态时，PointerShapeBufferSize 仍会变化。不能
+    // 只看 LastMouseUpdateTime，否则网页会一直保留旧箭头。
+    if (frameInfo.LastMouseUpdateTime.QuadPart == 0 &&
+        frameInfo.PointerShapeBufferSize == 0 && pointerKnown_) {
+        return;
+    }
+    CURSORINFO cursorInfo{};
+    cursorInfo.cbSize = sizeof(cursorInfo);
+    if (GetCursorInfo(&cursorInfo)) {
+        UpdatePointerFromDesktop((cursorInfo.flags & CURSOR_SHOWING) != 0,
+                                 cursorInfo.ptScreenPos.x, cursorInfo.ptScreenPos.y,
+                                 CursorStyleFromHandle(cursorInfo.hCursor));
         return;
     }
     UpdatePointerFromDesktop(frameInfo.PointerPosition.Visible != FALSE,
                              frameInfo.PointerPosition.Position.x,
-                             frameInfo.PointerPosition.Position.y);
+                             frameInfo.PointerPosition.Position.y,
+                             pointerKnown_ ? pointer_.style : PointerCursorStyle::kDefault);
 }
 
 void Capture::UpdatePointerFromSystem() {
@@ -232,7 +271,8 @@ void Capture::UpdatePointerFromSystem() {
         return;
     }
     UpdatePointerFromDesktop((cursorInfo.flags & CURSOR_SHOWING) != 0,
-                             cursorInfo.ptScreenPos.x, cursorInfo.ptScreenPos.y);
+                             cursorInfo.ptScreenPos.x, cursorInfo.ptScreenPos.y,
+                             CursorStyleFromHandle(cursorInfo.hCursor));
 }
 
 void Capture::RecordGdiCaptureFailure(DWORD error) {
@@ -1319,7 +1359,7 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
     }
     RecordGdiCaptureRecovery();
     // GDI 不提供 Desktop Duplication 的 pointer metadata；读取当前输入桌面的系统
-    // 指针即可保持锁屏和多屏回退路径也有相同的浏览器叠加反馈。
+    // 指针即可让锁屏和多屏回退路径也同步浏览器原生光标的可见性与样式。
     UpdatePointerFromSystem();
 
     const auto* src = static_cast<const uint8_t*>(bits_);

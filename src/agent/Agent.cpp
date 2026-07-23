@@ -236,6 +236,25 @@ bool ParseStreamQuality(const std::string& text, StreamQuality& quality) {
     return true;
 }
 
+const char* CursorStyleName(PointerCursorStyle style) {
+    switch (style) {
+    case PointerCursorStyle::kDefault: return "default";
+    case PointerCursorStyle::kText: return "text";
+    case PointerCursorStyle::kWait: return "wait";
+    case PointerCursorStyle::kCrosshair: return "crosshair";
+    case PointerCursorStyle::kPointer: return "pointer";
+    case PointerCursorStyle::kMove: return "move";
+    case PointerCursorStyle::kEastWestResize: return "ew-resize";
+    case PointerCursorStyle::kNorthSouthResize: return "ns-resize";
+    case PointerCursorStyle::kNorthwestSoutheastResize: return "nwse-resize";
+    case PointerCursorStyle::kNortheastSouthwestResize: return "nesw-resize";
+    case PointerCursorStyle::kNotAllowed: return "not-allowed";
+    case PointerCursorStyle::kProgress: return "progress";
+    case PointerCursorStyle::kHelp: return "help";
+    }
+    return "default";
+}
+
 // 将脏矩形扩展到固定网格，避免为几个像素分别创建高开销的 JPEG；网格面积才是
 // 实际传输面积，因此以它和网页阈值比较，而非理想的原始脏矩形面积。
 bool BuildJpegPatchTiles(const CapturedFrame& frame, int thresholdPercent,
@@ -1475,6 +1494,7 @@ void Agent::CaptureLoop() {
             nlohmann::json cursor = {
                 {"t", "cursor"},
                 {"visible", pointer.visible},
+                {"style", CursorStyleName(pointer.style)},
             };
             if (pointer.visible) {
                 cursor["x"] = pointer.x;
@@ -1986,8 +2006,8 @@ void Agent::OnMessage(const std::string& msg) {
             }
             const uint64_t nowTick = static_cast<uint64_t>(GetTickCount64());
             lastRemoteInputTick_.store(nowTick, std::memory_order_relaxed);
-            // 浏览器会本地预测远端指针，CaptureLoop 则按已提升的交互 FPS 采样
-            // 真实桌面状态并校正。仅以初始 GDI 交互帧率打断等待：首个移动不会
+            // 浏览器原生指针会立即跟随本地位置，CaptureLoop 则按已提升的交互 FPS
+            // 同步远端实际光标样式。仅以初始 GDI 交互帧率打断等待：首个移动不会
             // 被 2 FPS 空闲周期拖慢，持续移动也不会以 60Hz 以上完整 BitBlt。
             uint64_t previousWakeTick = lastGdiMoveWakeTick_.load(std::memory_order_relaxed);
             while (nowTick - previousWakeTick >= kGdiMoveWakeIntervalMs) {
