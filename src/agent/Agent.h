@@ -70,6 +70,9 @@ private:
     std::atomic<int> requestedStreamQuality_{0};
     std::atomic<int> requestedPatchThreshold_{50};
     std::atomic<bool> requestedPatchCapability_{false};
+    // 缺省值对应旧缓存网页：未声明局部精度时维持历史 64x64 网格。新版网页会在
+    // stream 消息中显式声明平衡(32x32)或省流(16x16)。
+    std::atomic<int> requestedPatchPrecision_{0};
     // 旧缓存页面未携带 fps/bitrate 时保持 false，继续沿用服务端自适应策略；新版
     // 页面必须成对给出两个值，固定当前控制端的帧率和码率。
     std::atomic<bool> requestedFixedStreamRates_{false};

@@ -41,6 +41,13 @@
   <label class="stream-setting" for="patch-threshold">局部更新 <output id="patch-threshold-value">50%</output>
     <input id="patch-threshold" type="range" min="10" max="90" step="5" value="50">
   </label>
+  <label class="stream-setting" for="patch-precision">局部精度
+    <select id="patch-precision">
+      <option value="low_cpu">低 CPU（64×64）</option>
+      <option value="balanced" selected>平衡（32×32）</option>
+      <option value="data_saver">省流（16×16）</option>
+    </select>
+  </label>
   <span id="status">未连接</span>
 </div>
 <div id="screen-wrap">

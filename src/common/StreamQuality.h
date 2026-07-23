@@ -32,9 +32,23 @@ enum class StreamQuality : int {
     k360p = 5,
 };
 
+// 局部刷新以 JPEG 网格表示变化区域。低 CPU 保持旧版 64x64 行为；平衡模式把
+// 最小发送区域缩到 32x32；省流模式使用 16x16，适合相距较远的细小变化。
+enum class PatchPrecision : int {
+    kLowCpu = 0,
+    kBalanced = 1,
+    kDataSaver = 2,
+};
+
 constexpr int kDefaultPatchThresholdPercent = 50;
 constexpr int kMinPatchThresholdPercent = 10;
 constexpr int kMaxPatchThresholdPercent = 90;
+constexpr PatchPrecision kDefaultPatchPrecision = PatchPrecision::kBalanced;
+// 旧缓存网页不会声明 patch_precision；保持其已有的 64x64 行为而不是隐式改变
+// 带宽、CPU 与 JPEG 图块数量。
+constexpr PatchPrecision kLegacyPatchPrecision = PatchPrecision::kLowCpu;
+constexpr int kPatchCoarseTileSize = 64;
+constexpr size_t kMaxPatchTilesPerBatch = 64;
 // 网页控制端可以在固定模式下选择的帧率与码率范围。码率统一使用 bit/s，网页负责
 // 将显示的 MB/s 转换后再传输，避免协议端出现浮点误差。
 constexpr int kMinStreamFps = 1;
@@ -50,6 +64,29 @@ constexpr bool IsStreamQualityValid(int quality) {
 constexpr bool IsPatchThresholdValid(int percent) {
     return percent >= kMinPatchThresholdPercent &&
         percent <= kMaxPatchThresholdPercent && percent % 5 == 0;
+}
+
+constexpr bool IsPatchPrecisionValid(int precision) {
+    return precision >= static_cast<int>(PatchPrecision::kLowCpu) &&
+        precision <= static_cast<int>(PatchPrecision::kDataSaver);
+}
+
+constexpr int PatchTileSize(PatchPrecision precision) {
+    switch (precision) {
+    case PatchPrecision::kLowCpu: return 64;
+    case PatchPrecision::kBalanced: return 32;
+    case PatchPrecision::kDataSaver: return 16;
+    }
+    return kPatchCoarseTileSize;
+}
+
+inline const char* PatchPrecisionName(PatchPrecision precision) {
+    switch (precision) {
+    case PatchPrecision::kLowCpu: return "low_cpu";
+    case PatchPrecision::kBalanced: return "balanced";
+    case PatchPrecision::kDataSaver: return "data_saver";
+    }
+    return "low_cpu";
 }
 
 constexpr bool IsStreamFpsValid(int fps) {

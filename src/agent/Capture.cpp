@@ -394,6 +394,19 @@ void Capture::SetPatchCaptureEnabled(bool enabled) {
     log::Info(std::string("capture patch regions ") + (enabled ? "enabled" : "disabled"));
 }
 
+void Capture::SetPatchPrecision(PatchPrecision precision) {
+    if (!IsPatchPrecisionValid(static_cast<int>(precision))) {
+        precision = kLegacyPatchPrecision;
+    }
+    if (patchPrecision_ == precision) {
+        return;
+    }
+    // 精度只影响下一帧的变化区域划分，不会改变 canvas 坐标、分辨率或已经确认
+    // 的完整基线；因此不清空 GDI 基线，也不需要重建 DXGI/H.264 资源。
+    patchPrecision_ = precision;
+    log::Info(std::string("capture patch precision=") + PatchPrecisionName(precision));
+}
+
 void Capture::SetGpuOutputEnabled(bool enabled) {
     // GPU 直通只适用于 DXGI 单输出；视频处理器可同时完成保持比例的缩放。GDI
     // 回退时 CaptureFrame 会自然改走 CPU 帧，无需由调用者额外清理 surface。
@@ -955,7 +968,8 @@ void Capture::SetOutputDirtyRegions(const std::vector<DirtyRegion>& sourceRegion
     }
 }
 
-std::vector<DirtyRegion> Capture::DiffGdiTiles(const uint8_t* pixels, int width, int height) {
+std::vector<DirtyRegion> Capture::DiffGdiTiles(const uint8_t* pixels, int width, int height,
+                                                int leafTileSize) {
     std::vector<DirtyRegion> regions;
     if (!pixels || width <= 0 || height <= 0) {
         return regions;
@@ -967,23 +981,44 @@ std::vector<DirtyRegion> Capture::DiffGdiTiles(const uint8_t* pixels, int width,
         regions.push_back({0, 0, width, height});
         return regions;
     }
-    constexpr int kTileSize = 64;
-    for (int y = 0; y < height; y += kTileSize) {
-        const int tileHeight = std::min(kTileSize, height - y);
-        for (int x = 0; x < width; x += kTileSize) {
-            const int tileWidth = std::min(kTileSize, width - x);
-            bool changed = false;
-            for (int row = 0; row < tileHeight; ++row) {
-                const size_t offset = static_cast<size_t>(y + row) * stride +
-                    static_cast<size_t>(x) * 4;
-                if (std::memcmp(pixels + offset, gdiPreviousFrame_.data() + offset,
-                                static_cast<size_t>(tileWidth) * 4) != 0) {
-                    changed = true;
-                    break;
-                }
+    if (leafTileSize <= 0 || leafTileSize > kPatchCoarseTileSize ||
+        kPatchCoarseTileSize % leafTileSize != 0) {
+        leafTileSize = kPatchCoarseTileSize;
+    }
+    const auto regionChanged = [&](int x, int y, int regionWidth, int regionHeight) {
+        for (int row = 0; row < regionHeight; ++row) {
+            const size_t offset = static_cast<size_t>(y + row) * stride +
+                static_cast<size_t>(x) * 4;
+            if (std::memcmp(pixels + offset, gdiPreviousFrame_.data() + offset,
+                            static_cast<size_t>(regionWidth) * 4) != 0) {
+                return true;
             }
-            if (changed) {
-                regions.push_back({x, y, tileWidth, tileHeight});
+        }
+        return false;
+    };
+
+    // GDI 没有脏矩形元数据。先保留旧版 64x64 的粗筛成本；只有粗块发生变化时，
+    // 才进一步检查 32x32 或 16x16 子块。静止桌面不会增加比较次数，两处相距较远
+    // 的细小变化也不会因同属不同粗块被扩展成中间的大区域。
+    for (int coarseY = 0; coarseY < height; coarseY += kPatchCoarseTileSize) {
+        const int coarseHeight = std::min(kPatchCoarseTileSize, height - coarseY);
+        for (int coarseX = 0; coarseX < width; coarseX += kPatchCoarseTileSize) {
+            const int coarseWidth = std::min(kPatchCoarseTileSize, width - coarseX);
+            if (!regionChanged(coarseX, coarseY, coarseWidth, coarseHeight)) {
+                continue;
+            }
+            if (leafTileSize == kPatchCoarseTileSize) {
+                regions.push_back({coarseX, coarseY, coarseWidth, coarseHeight});
+                continue;
+            }
+            for (int y = coarseY; y < coarseY + coarseHeight; y += leafTileSize) {
+                const int tileHeight = std::min(leafTileSize, coarseY + coarseHeight - y);
+                for (int x = coarseX; x < coarseX + coarseWidth; x += leafTileSize) {
+                    const int tileWidth = std::min(leafTileSize, coarseX + coarseWidth - x);
+                    if (regionChanged(x, y, tileWidth, tileHeight)) {
+                        regions.push_back({x, y, tileWidth, tileHeight});
+                    }
+                }
             }
         }
     }
@@ -1366,7 +1401,8 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
     const auto now = std::chrono::steady_clock::now();
     if (patchCaptureEnabled_) {
         out.hasDirtyRegions = true;
-        out.dirtyRegions = DiffGdiTiles(src, outputWidth, outputHeight);
+        out.dirtyRegions = DiffGdiTiles(src, outputWidth, outputHeight,
+                                        PatchTileSize(patchPrecision_));
         if (!forceFrame && out.dirtyRegions.empty()) {
             return CaptureResult::kNoChange;
         }

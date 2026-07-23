@@ -7,7 +7,7 @@ let ws = null, cfg = null, authed = false;
 let reconnectAfterClose = false;
 let reconnectRetriesRemaining = 0;
 let canvas, ctx, logEl, statusEl, pwEl, monSel, qualitySel, streamFpsEl, streamBitrateEl;
-let patchThresholdEl, patchThresholdValueEl;
+let patchThresholdEl, patchThresholdValueEl, patchPrecisionEl;
 const pressedKeys = new Map();
 const pressedButtons = new Set();
 let lastPointer = { x: 0.5, y: 0.5 };
@@ -33,8 +33,11 @@ let firstFrameWarningTimer = 0, awaitingFrameSocket = null;
 let activePatch = null, nextTileInfo = null, patchDrawing = false;
 const qualityStorageKey = 'remote-assist.stream-quality';
 const patchThresholdStorageKey = 'remote-assist.patch-threshold';
+const patchPrecisionStorageKey = 'remote-assist.patch-precision';
 const streamFpsStorageKey = 'remote-assist.stream-fps';
 const streamBitrateStorageKey = 'remote-assist.stream-bitrate-mbs';
+const defaultPatchPrecision = 'balanced';
+const patchPrecisions = new Set(['low_cpu', 'balanced', 'data_saver']);
 const defaultStreamFps = 30;
 const defaultStreamBitrateMbs = 0.5;
 const minStreamFps = 1;
@@ -65,6 +68,10 @@ function updatePatchThresholdLabel() {
   }
 }
 
+function normalizePatchPrecision(value) {
+  return patchPrecisions.has(value) ? value : defaultPatchPrecision;
+}
+
 function normalizeStreamFps(value) {
   if (value === null || value === '') return defaultStreamFps;
   const number = Number(value);
@@ -92,18 +99,20 @@ function streamBitrateBps(value) {
 }
 
 function loadStreamPreferences() {
-  if (!qualitySel || !patchThresholdEl || !streamFpsEl || !streamBitrateEl) return;
+  if (!qualitySel || !patchThresholdEl || !patchPrecisionEl || !streamFpsEl || !streamBitrateEl) return;
   try {
     const quality = localStorage.getItem(qualityStorageKey);
     if (quality && Array.prototype.some.call(qualitySel.options, function(option) {
       return option.value === quality;
     })) qualitySel.value = quality;
     patchThresholdEl.value = String(normalizePatchThreshold(localStorage.getItem(patchThresholdStorageKey)));
+    patchPrecisionEl.value = normalizePatchPrecision(localStorage.getItem(patchPrecisionStorageKey));
     streamFpsEl.value = String(normalizeStreamFps(localStorage.getItem(streamFpsStorageKey)));
     streamBitrateEl.value = formatStreamBitrateMbs(
       localStorage.getItem(streamBitrateStorageKey));
   } catch (_) {
     patchThresholdEl.value = '50';
+    patchPrecisionEl.value = defaultPatchPrecision;
     streamFpsEl.value = String(defaultStreamFps);
     streamBitrateEl.value = formatStreamBitrateMbs(defaultStreamBitrateMbs);
   }
@@ -111,29 +120,34 @@ function loadStreamPreferences() {
 }
 
 function sendStreamPreferences() {
-  if (!qualitySel || !patchThresholdEl || !streamFpsEl || !streamBitrateEl) return;
+  if (!qualitySel || !patchThresholdEl || !patchPrecisionEl || !streamFpsEl || !streamBitrateEl) return;
   const threshold = normalizePatchThreshold(patchThresholdEl.value);
+  const patchPrecision = normalizePatchPrecision(patchPrecisionEl.value);
   const fps = normalizeStreamFps(streamFpsEl.value);
   const bitrateMbs = normalizeStreamBitrateMbs(streamBitrateEl.value);
   patchThresholdEl.value = String(threshold);
+  patchPrecisionEl.value = patchPrecision;
   streamFpsEl.value = String(fps);
   streamBitrateEl.value = formatStreamBitrateMbs(bitrateMbs);
   updatePatchThresholdLabel();
   send({t:'stream', quality:qualitySel.value || 'auto', patch_threshold:threshold, patches:true,
-    fps:fps, bitrate:streamBitrateBps(bitrateMbs)});
+    patch_precision:patchPrecision, fps:fps, bitrate:streamBitrateBps(bitrateMbs)});
 }
 
 function saveAndSendStreamPreferences() {
-  if (!qualitySel || !patchThresholdEl || !streamFpsEl || !streamBitrateEl) return;
+  if (!qualitySel || !patchThresholdEl || !patchPrecisionEl || !streamFpsEl || !streamBitrateEl) return;
   const threshold = normalizePatchThreshold(patchThresholdEl.value);
+  const patchPrecision = normalizePatchPrecision(patchPrecisionEl.value);
   const fps = normalizeStreamFps(streamFpsEl.value);
   const bitrateMbs = normalizeStreamBitrateMbs(streamBitrateEl.value);
   patchThresholdEl.value = String(threshold);
+  patchPrecisionEl.value = patchPrecision;
   streamFpsEl.value = String(fps);
   streamBitrateEl.value = formatStreamBitrateMbs(bitrateMbs);
   try {
     localStorage.setItem(qualityStorageKey, qualitySel.value || 'auto');
     localStorage.setItem(patchThresholdStorageKey, String(threshold));
+    localStorage.setItem(patchPrecisionStorageKey, patchPrecision);
     localStorage.setItem(streamFpsStorageKey, String(fps));
     localStorage.setItem(streamBitrateStorageKey, formatStreamBitrateMbs(bitrateMbs));
   } catch (_) {}
@@ -367,8 +381,10 @@ function setupCfg(c) {
   const bitrateText = Number.isSafeInteger(bitrate) && bitrate > 0
     ? ' ' + String(Number((bitrate / (8 * 1000 * 1000)).toFixed(2))) + ' MB/s'
     : '';
+  const patchPrecision = patchPrecisions.has(c.patch_precision) ? c.patch_precision : '';
   log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps +
-    ' FPS' + bitrateText + (videoConfigChanged ? ' video-reset' : ' topology-only'));
+    ' FPS' + bitrateText + (patchPrecision ? ' patch=' + patchPrecision : '') +
+    (videoConfigChanged ? ' video-reset' : ' topology-only'));
 }
 
 function updateRemoteCursor(m) {
@@ -959,6 +975,7 @@ window.addEventListener('DOMContentLoaded', function() {
   streamBitrateEl = document.getElementById('stream-bitrate');
   patchThresholdEl = document.getElementById('patch-threshold');
   patchThresholdValueEl = document.getElementById('patch-threshold-value');
+  patchPrecisionEl = document.getElementById('patch-precision');
   loadStreamPreferences();
   document.getElementById('connect').addEventListener('click', connect);
   pwEl.addEventListener('keydown', function(e) { if (e.key === 'Enter') connect(); });
@@ -968,6 +985,7 @@ window.addEventListener('DOMContentLoaded', function() {
   streamBitrateEl.addEventListener('change', saveAndSendStreamPreferences);
   patchThresholdEl.addEventListener('input', updatePatchThresholdLabel);
   patchThresholdEl.addEventListener('change', saveAndSendStreamPreferences);
+  patchPrecisionEl.addEventListener('change', saveAndSendStreamPreferences);
   window.addEventListener('resize', fitCanvas);
   window.addEventListener('keydown', function(e) {
     if (!canSendKeyboardInput()) return;

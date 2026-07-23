@@ -6,6 +6,8 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include "common/StreamQuality.h"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -148,6 +150,9 @@ public:
     // 局部图块模式需要可访问的 BGRA 像素和变化区域。开启后 DXGI 会暂不走直接
     // NV12 surface 输出；完整帧仍由 H.264 MFT 编码，只是输入来自 CPU 映射。
     void SetPatchCaptureEnabled(bool enabled);
+    // 仅由采集线程调用。GDI 会以 64x64 为粗筛，再按该精度比较发生变化的子块；
+    // DXGI 继续直接使用系统脏矩形，最终统一由 Agent 按该网格编码 JPEG 图块。
+    void SetPatchPrecision(PatchPrecision precision);
     // H.264 MFT 确认支持同一 D3D11 设备后启用。GDI、缩放和能力不完整的机器
     // 会继续走现有 CPU 帧路径。当前 D3D11 设备已确认失败时，此调用不会再次
     // 打开 GPU 输出，直到 Desktop Duplication 重建出新的 device generation。
@@ -201,7 +206,8 @@ private:
     static std::vector<DirtyRegion> ReadDxgiDirtyRegions(
         IDXGIOutputDuplication* duplication, const DXGI_OUTDUPL_FRAME_INFO& frameInfo,
         int offsetX = 0, int offsetY = 0);
-    std::vector<DirtyRegion> DiffGdiTiles(const uint8_t* pixels, int width, int height);
+    std::vector<DirtyRegion> DiffGdiTiles(const uint8_t* pixels, int width, int height,
+                                          int leafTileSize);
     void ReleaseAll();
     void UpdatePointerFromDesktop(bool visible, int screenX, int screenY,
                                   PointerCursorStyle style);
@@ -233,6 +239,7 @@ private:
     std::vector<DxgiOutputCapture> dxgiOutputs_;
     bool gpuOutputEnabled_ = false;
     bool patchCaptureEnabled_ = false;
+    PatchPrecision patchPrecision_ = kLegacyPatchPrecision;
     // 记录当前设备是否已发生过 GPU 路径故障。0 表示尚未初始化 DXGI device；
     // InitDXGI 成功时 generation 单调递增，因此旧设备的失败不会阻断新设备重试。
     uint64_t gpuOutputDisabledGeneration_ = 0;

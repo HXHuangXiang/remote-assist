@@ -236,6 +236,14 @@ bool ParseStreamQuality(const std::string& text, StreamQuality& quality) {
     return true;
 }
 
+bool ParsePatchPrecision(const std::string& text, PatchPrecision& precision) {
+    if (text == "low_cpu") precision = PatchPrecision::kLowCpu;
+    else if (text == "balanced") precision = PatchPrecision::kBalanced;
+    else if (text == "data_saver") precision = PatchPrecision::kDataSaver;
+    else return false;
+    return true;
+}
+
 const char* CursorStyleName(PointerCursorStyle style) {
     switch (style) {
     case PointerCursorStyle::kDefault: return "default";
@@ -255,17 +263,19 @@ const char* CursorStyleName(PointerCursorStyle style) {
     return "default";
 }
 
-// 将脏矩形扩展到固定网格，避免为几个像素分别创建高开销的 JPEG；网格面积才是
-// 实际传输面积，因此以它和网页阈值比较，而非理想的原始脏矩形面积。
+// 将脏矩形扩展到当前网页选择的网格。网格面积才是实际 JPEG 传输面积，因此以
+// 它和网页阈值比较，而非理想的原始脏矩形面积；远距离区域始终保留为独立图块。
 bool BuildJpegPatchTiles(const CapturedFrame& frame, int thresholdPercent,
-                         EncoderMf& encoder, std::vector<JpegTile>& tiles) {
+                         PatchPrecision precision, EncoderMf& encoder,
+                         std::vector<JpegTile>& tiles) {
     tiles.clear();
     if (!frame.hasDirtyRegions || frame.dirtyRegions.empty() || frame.IsGpuNv12() ||
         !frame.Pixels() || frame.width <= 0 || frame.height <= 0 ||
-        !IsPatchThresholdValid(thresholdPercent)) {
+        !IsPatchThresholdValid(thresholdPercent) ||
+        !IsPatchPrecisionValid(static_cast<int>(precision))) {
         return false;
     }
-    constexpr int kTileSize = 64;
+    const int kTileSize = PatchTileSize(precision);
     const int columns = (frame.width + kTileSize - 1) / kTileSize;
     const int rows = (frame.height + kTileSize - 1) / kTileSize;
     std::vector<uint8_t> changed(static_cast<size_t>(columns) * rows, 0);
@@ -299,8 +309,8 @@ bool BuildJpegPatchTiles(const CapturedFrame& frame, int thresholdPercent,
         return false;
     }
     // 同一行连续网格合成一个跨度；再将相邻行中跨度相同的区域纵向延伸。这样
-    // 滚动、窗口拖动等连续变化不会生成数百个 64x64 JPEG，但所有边界仍对齐到
-    // 固定网格，覆盖面积也仍是上面用于阈值比较的精确网格并集。
+    // 滚动、窗口拖动等连续变化不会生成数百个 JPEG，但不连续的变化绝不会跨过
+    // 未变化网格合并，覆盖面积也仍是上面用于阈值比较的精确网格并集。
     struct TileBounds {
         int firstColumn = 0;
         int lastColumn = 0;
@@ -340,6 +350,11 @@ bool BuildJpegPatchTiles(const CapturedFrame& frame, int thresholdPercent,
         active = std::move(current);
     }
     rectangles.insert(rectangles.end(), active.begin(), active.end());
+    // 网页按顺序解码一个批次中的 JPEG；过多碎片会让 JPEG 头、WebSocket 消息与
+    // 顺序 decode 的总成本超过完整视频帧。此时返回 false，让调用方走完整帧路径。
+    if (rectangles.empty() || rectangles.size() > kMaxPatchTilesPerBatch) {
+        return false;
+    }
 
     tiles.reserve(rectangles.size());
     for (const TileBounds& bounds : rectangles) {
@@ -660,6 +675,8 @@ void Agent::CaptureLoop() {
     bool resolutionLocked = false;
     bool patchCapability = false;
     int patchThreshold = kDefaultPatchThresholdPercent;
+    // 新版网页明确选择局部精度；无字段的旧缓存网页维持历史 64x64 网格。
+    PatchPrecision patchPrecision = kLegacyPatchPrecision;
     uint64_t appliedPreferenceGeneration = 0;
     capture_.SetMaxOutputSize(kStreamResolutionCaps[adaptiveResolutionTier].width,
                               kStreamResolutionCaps[adaptiveResolutionTier].height);
@@ -786,6 +803,12 @@ void Agent::CaptureLoop() {
         }
         const bool nextPatchCapability =
             requestedPatchCapability_.load(std::memory_order_relaxed);
+        int precisionValue = requestedPatchPrecision_.load(std::memory_order_relaxed);
+        if (!IsPatchPrecisionValid(precisionValue)) {
+            precisionValue = static_cast<int>(kLegacyPatchPrecision);
+        }
+        const PatchPrecision nextPatchPrecision =
+            static_cast<PatchPrecision>(precisionValue);
         bool nextFixedStreamRates =
             requestedFixedStreamRates_.load(std::memory_order_relaxed);
         int nextStreamFps = cfg_.fps;
@@ -804,6 +827,7 @@ void Agent::CaptureLoop() {
         }
         const bool qualityChanged = nextQuality != activeQuality;
         const bool patchCapabilityChanged = nextPatchCapability != patchCapability;
+        const bool patchPrecisionChanged = nextPatchPrecision != patchPrecision;
         const bool rateModeChanged = nextFixedStreamRates != fixedStreamRates;
         const bool rateChanged = rateModeChanged ||
             (nextFixedStreamRates &&
@@ -811,7 +835,9 @@ void Agent::CaptureLoop() {
         activeQuality = nextQuality;
         patchThreshold = nextThreshold;
         patchCapability = nextPatchCapability;
+        patchPrecision = nextPatchPrecision;
         capture_.SetPatchCaptureEnabled(patchCapability);
+        capture_.SetPatchPrecision(patchPrecision);
 
         bool rateChangeNeedsEncoderRebuild = false;
         bool broadcastRateCfg = false;
@@ -856,7 +882,11 @@ void Agent::CaptureLoop() {
         }
 
         if (!qualityChanged && !patchCapabilityChanged) {
-            if (broadcastRateCfg) {
+            if (patchPrecisionChanged) {
+                log::Info(std::string("web patch precision=") +
+                          PatchPrecisionName(patchPrecision));
+            }
+            if (broadcastRateCfg || patchPrecisionChanged) {
                 server_.Broadcaster().BroadcastText(MakeCfgJson());
             }
             return;
@@ -884,7 +914,8 @@ void Agent::CaptureLoop() {
         log::Info(std::string("web stream preference quality=") +
                   StreamQualityName(activeQuality) + " patch=" +
                   (patchCapability ? "true" : "false") + " threshold=" +
-                  std::to_string(patchThreshold));
+                  std::to_string(patchThreshold) + " precision=" +
+                  PatchPrecisionName(patchPrecision));
     };
 
     // 自适应码率是按“当前控制端”的链路质量得出的。控制端断开后若直接保留低码率，
@@ -1716,7 +1747,7 @@ void Agent::CaptureLoop() {
         bool patchQueued = false;
         if (patchCapability && !needsFreshFrame && encoderReady_ && !frame.Empty()) {
             std::vector<JpegTile> tiles;
-            if (BuildJpegPatchTiles(frame, patchThreshold, *encoder_, tiles)) {
+            if (BuildJpegPatchTiles(frame, patchThreshold, patchPrecision, *encoder_, tiles)) {
                 uint64_t patchBytes = 0;
                 for (const auto& tile : tiles) {
                     patchBytes += tile.data.size();
@@ -1916,6 +1947,11 @@ std::string Agent::MakeCfgJson() const {
     j["quality"] = StreamQualityName(static_cast<StreamQuality>(qualityValue));
     j["patch_threshold"] = requestedPatchThreshold_.load(std::memory_order_relaxed);
     j["patches"] = requestedPatchCapability_.load(std::memory_order_relaxed);
+    int precisionValue = requestedPatchPrecision_.load(std::memory_order_relaxed);
+    if (!IsPatchPrecisionValid(precisionValue)) {
+        precisionValue = static_cast<int>(kLegacyPatchPrecision);
+    }
+    j["patch_precision"] = PatchPrecisionName(static_cast<PatchPrecision>(precisionValue));
     auto mons = nlohmann::json::array();
     for (const auto& m : capture_.MonitorsSnapshot()) {
         mons.push_back({{"index", m.index}, {"name", m.name}, {"w", m.w}, {"h", m.h}});
@@ -1990,11 +2026,13 @@ void Agent::OnMessage(const std::string& msg) {
     }
     if (t == "stream") {
         std::string qualityText;
+        std::string precisionText;
         int threshold = 0;
         bool patches = false;
         int fps = 0;
         int bitrate = 0;
         StreamQuality quality = StreamQuality::kAutomatic;
+        PatchPrecision precision = kLegacyPatchPrecision;
         if (!ReadJsonString(j, "quality", qualityText) ||
             !ParseStreamQuality(qualityText, quality) ||
             !ReadJsonIntInRange(j, "patch_threshold", kMinPatchThresholdPercent,
@@ -2004,17 +2042,22 @@ void Agent::OnMessage(const std::string& msg) {
         }
         const bool hasFps = j.contains("fps");
         const bool hasBitrate = j.contains("bitrate");
+        const bool hasPatchPrecision = j.contains("patch_precision");
         // 两个字段必须成对提供。旧缓存网页不会携带它们，继续使用原有的自适应
         // 逻辑；半个固定设置可能让编码器只更新一个维度，直接拒绝。
         if (hasFps != hasBitrate ||
             (hasFps && (!ReadJsonIntInRange(j, "fps", kMinStreamFps, kMaxStreamFps, fps) ||
                         !ReadJsonIntInRange(j, "bitrate", kMinStreamBitrate,
-                                            kMaxStreamBitrate, bitrate)))) {
+                                            kMaxStreamBitrate, bitrate))) ||
+            (hasPatchPrecision &&
+             (!ReadJsonString(j, "patch_precision", precisionText) ||
+              !ParsePatchPrecision(precisionText, precision)))) {
             return;
         }
         requestedStreamQuality_.store(static_cast<int>(quality), std::memory_order_relaxed);
         requestedPatchThreshold_.store(threshold, std::memory_order_relaxed);
         requestedPatchCapability_.store(patches, std::memory_order_relaxed);
+        requestedPatchPrecision_.store(static_cast<int>(precision), std::memory_order_relaxed);
         requestedFixedStreamRates_.store(hasFps, std::memory_order_relaxed);
         requestedStreamFps_.store(hasFps ? fps : 0, std::memory_order_relaxed);
         requestedStreamBitrate_.store(hasFps ? bitrate : 0, std::memory_order_relaxed);
@@ -2181,6 +2224,8 @@ void Agent::OnControllerDisconnected() {
                                   std::memory_order_relaxed);
     requestedPatchThreshold_.store(kDefaultPatchThresholdPercent, std::memory_order_relaxed);
     requestedPatchCapability_.store(false, std::memory_order_relaxed);
+    requestedPatchPrecision_.store(static_cast<int>(kLegacyPatchPrecision),
+                                   std::memory_order_relaxed);
     requestedFixedStreamRates_.store(false, std::memory_order_relaxed);
     requestedStreamFps_.store(0, std::memory_order_relaxed);
     requestedStreamBitrate_.store(0, std::memory_order_relaxed);
