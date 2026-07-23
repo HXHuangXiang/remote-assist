@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -73,3 +74,25 @@ jobs:
         with:
           name: RemoteAssist-windows
           path: RemoteAssist.zip
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: RemoteAssist-windows
+          path: release
+      - name: Name release asset
+        shell: bash
+        run: mv release/RemoteAssist.zip "release/RemoteAssist-${{ github.ref_name }}-windows-x64.zip"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/RemoteAssist-${{ github.ref_name }}-windows-x64.zip

@@ -1,15 +1,23 @@
 * { box-sizing: border-box; }
+html { font-size: clamp(16px, 1.1vw, 20px); }
 html, body { margin: 0; height: 100%; background: #111; color: #ddd; font-family: system-ui, sans-serif; overflow: hidden; }
 body { display: flex; flex-direction: column; }
-#bar { display: flex; gap: 8px; align-items: center; padding: 8px; background: #1a1a1a; flex-shrink: 0; }
-#pw { width: 140px; padding: 4px 6px; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; }
-#connect { padding: 4px 14px; cursor: pointer; border: 1px solid #444; background: #2a5a2a; color: #eee; border-radius: 3px; }
+#bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 12px 16px; background: #1a1a1a; flex-shrink: 0; }
+#pw, #connect, #monitor { font: inherit; min-height: 42px; }
+#pw { width: clamp(210px, 18vw, 340px); padding: 8px 12px; background: #222; color: #eee; border: 1px solid #444; border-radius: 5px; }
+#connect { padding: 8px 22px; cursor: pointer; border: 1px solid #444; background: #2a5a2a; color: #eee; border-radius: 5px; }
 #connect:hover { background: #3a6a3a; }
-#monitor { padding: 4px 6px; background: #222; color: #eee; border: 1px solid #444; border-radius: 3px; max-width: 200px; }
-#status { font-size: 13px; color: #888; }
+#monitor { padding: 8px 12px; background: #222; color: #eee; border: 1px solid #444; border-radius: 5px; max-width: 320px; }
+#status { font-size: 0.9rem; color: #aaa; }
 #screen-wrap { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #000; position: relative; }
 #screen-stack { position: relative; line-height: 0; }
 #screen { background: #000; display: block; outline: none; image-rendering: auto; }
 #screen.remote-keyboard-active { box-shadow: 0 0 0 2px #4b9e4b; }
 #cursor { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-#log { position: fixed; bottom: 0; right: 0; max-height: 40px; overflow: hidden; font-size: 12px; padding: 4px 8px; opacity: 0.5; pointer-events: none; }
+#log { position: fixed; bottom: 0; right: 0; max-height: 48px; overflow: hidden; font-size: 0.8rem; padding: 6px 10px; opacity: 0.6; pointer-events: none; }
+
+@media (max-width: 720px) {
+  #bar { gap: 8px; padding: 10px; }
+  #pw { flex: 1 1 190px; }
+  #monitor { flex: 1 1 210px; max-width: none; }
+}

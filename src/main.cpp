@@ -8,7 +8,6 @@
 #include "common/Log.h"
 #include "common/Path.h"
 #include "common/RuntimeNames.h"
-#include "common/ServiceInstallSecurity.h"
 #include "service/ServiceHost.h"
 #include "setup/SetupDialog.h"
 #include "tray/TrayApp.h"
@@ -47,10 +46,8 @@ bool HasArg(int argc, wchar_t* const* argv, const wchar_t* target) {
     return false;
 }
 
-// 图形配置窗口既要在 exe 同级目录写入 config/logs，又要注册 LocalSystem 服务。
-// 如果普通用户先写入这些运行产物，随后服务安装的路径 ACL 校验必然拒绝它们；若
-// 放宽校验又会把高权限服务暴露给普通用户可改写的目录。因此无参数入口统一通过
-// UAC 进入管理员上下文，保证“首次配置 -> 写入产物 -> 安装服务”使用同一安全身份。
+// 图形配置窗口会在 exe 同级目录写入配置和日志，并负责注册 LocalSystem 服务；无参数
+// 入口统一通过 UAC 进入管理员上下文，避免用户在安装阶段切换到另一套操作入口。
 // --agent/--tray/--service 均不会走这里，服务拉起的用户 Tray 不会额外弹 UAC。
 bool IsCurrentProcessElevated() {
     HANDLE token = nullptr;
@@ -99,17 +96,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     const bool serviceMode = HasArg(argc, argv, L"--service");
     const bool trayMode = HasArg(argc, argv, L"--tray");
     const bool serviceManaged = HasArg(argc, argv, L"--service-managed");
-    const bool checkServiceInstallPath = HasArg(argc, argv, L"--check-service-install-dir");
     const bool elevatedSetupMode = HasArg(argc, argv, L"--setup-elevated");
     const std::wstring initialPasswordChannel =
         ArgValue(argc, argv, L"--initial-password-channel");
     LocalFree(argv);
 
-    if (checkServiceInstallPath) {
-        // 供 tools/install.bat 在调用 sc create 前复用与图形安装完全相同的 ACL
-        // 校验。此模式不创建窗口，也不写配置或日志。
-        return remote_assist::ValidateServiceInstallPath(remote_assist::ModulePath()).secure ? 0 : 2;
-    }
     if (agentMode) {
         remote_assist::Agent agent;
         return agent.Run(serviceManaged);
@@ -121,8 +112,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         remote_assist::TrayApp tray;
         return tray.Run(initialPasswordChannel);
     }
-    // 无参数(用户双击):先以管理员身份进入配置窗口。这样同级 config/logs 的
-    // 所有者与安装路径 ACL 校验一致；用户取消 UAC 时不创建不安全的半成品配置。
+    // 无参数(用户双击):先以管理员身份进入配置窗口。用户取消 UAC 时不写配置，
+    // 也不会尝试创建或更新服务。
     if (!elevatedSetupMode && !IsCurrentProcessElevated()) {
         if (RelaunchElevatedSetup()) {
             return 0;

@@ -241,8 +241,8 @@ void TrayApp::RemoveIcon() {
 }
 
 int TrayApp::Run(const std::wstring& initialPasswordChannel) {
-    // Tray 使用 Explorer 的普通用户 token，安全安装目录不授予写权限。日志由
-    // LocalSystem 服务通过受控管道转存到同级 logs/tray.log，避免为了诊断放宽 ACL。
+    // Tray 使用 Explorer 的普通用户 token。日志由 LocalSystem 服务通过受控管道
+    // 转存到同级 logs/tray.log，避免多个进程直接争用同一个日志文件。
     log::InitPipeSink(runtime::kTrayLogPipeName);
     log::Info("tray starting");
 

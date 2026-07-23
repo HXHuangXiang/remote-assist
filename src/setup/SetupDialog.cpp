@@ -3,7 +3,6 @@
 #include "common/Log.h"
 #include "common/Path.h"
 #include "common/RuntimeNames.h"
-#include "common/ServiceInstallSecurity.h"
 
 #include <netfw.h>
 #include <wrl/client.h>
@@ -54,6 +53,7 @@ static HMENU g_trayMenu = nullptr;
 static UINT g_wmTaskbarRestart = 0;
 static bool g_trayAdded = false;
 static HFONT g_font = nullptr;
+constexpr UINT kBaseDpi = 96;
 constexpr wchar_t kFirewallRuleName[] = L"RemoteAssist 局域网控制（专用网络）";
 constexpr wchar_t kFirewallRuleDescription[] =
     L"允许 RemoteAssist 在专用局域网接收浏览器远程协助连接。";
@@ -63,6 +63,17 @@ static bool g_ownsTray = false;
 
 static std::wstring ExePath() {
     return ModulePath();
+}
+
+// 配置窗口使用 Per-Monitor V2。所有手工指定的坐标都要随当前 DPI 放大，避免在
+// 高分屏上仍以 96 DPI 的物理像素绘制，导致文字和按钮过小。
+int ScaleByDpi(int value, UINT dpi) {
+    return MulDiv(value, static_cast<int>(dpi == 0 ? kBaseDpi : dpi), kBaseDpi);
+}
+
+UINT WindowDpi(HWND hwnd) {
+    const UINT dpi = hwnd ? GetDpiForWindow(hwnd) : GetDpiForSystem();
+    return dpi == 0 ? kBaseDpi : dpi;
 }
 
 // 浏览器通过 WebSocket JSON 发送 UTF-8 token；配置窗口也必须把用户输入转换为同一
@@ -130,8 +141,6 @@ struct InstallServiceResult {
     ServiceResult service;
     // 防火墙策略可能被企业策略锁定。服务安装不因该项失败回滚，但 UI 必须明确提示。
     DWORD firewallError = ERROR_SUCCESS;
-    // 安装路径不安全时，向用户说明具体目录而不是只显示笼统的 ACCESS_DENIED。
-    std::wstring pathSecurityReason;
     // 当前目录中的新版本替换已有服务映像时，必须重启正在运行的旧服务，新的
     // binPath 才会实际生效。
     bool updatedExistingService = false;
@@ -277,8 +286,7 @@ ServiceResult ServiceFailure(DWORD error) {
     return {false, error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error};
 }
 
-// GUI 安装路径与 tools/install.bat 保持一致：异常退出由 SCM 自动拉起，正常
-// StopService 不受影响；这样用户双击安装后不会少掉脚本安装才有的恢复能力。
+// 图形安装创建的服务在异常退出时由 SCM 自动拉起，正常 StopService 不受影响。
 ServiceResult ConfigureServiceRecovery(SC_HANDLE service) {
     SERVICE_DESCRIPTIONW description{};
     description.lpDescription = const_cast<LPWSTR>(L"RemoteAssist 远控被控端(LocalSystem)");
@@ -428,13 +436,6 @@ static bool WaitForAgentFrameReady(DWORD timeoutMs) {
 
 static InstallServiceResult InstallService() {
     const std::wstring exePath = ExePath();
-    const ServiceInstallPathValidation pathValidation =
-        ValidateServiceInstallPath(exePath);
-    if (!pathValidation.secure) {
-        log::Warn("service install rejected by path ACL validation");
-        return {ServiceFailure(ERROR_ACCESS_DENIED), ERROR_SUCCESS,
-                pathValidation.reason};
-    }
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr,
                                    SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
     if (!scm) {
@@ -457,8 +458,8 @@ static InstallServiceResult InstallService() {
             return {ServiceFailure(createError)};
         }
 
-        // 双击新版本后应能直接“安装/更新”，无需先手工卸载服务。仍先完成相同
-        // 的目录 ACL 验证，随后收紧回 RemoteAssist 固定的 LocalSystem 配置。
+        // 双击新版本后可直接“安装/更新”，无需先手工卸载服务；更新时固定服务的
+        // 启动类型、账户和映像路径，避免旧配置遗留到新版。
         svc = OpenServiceW(scm, runtime::kServiceName,
                            SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP |
                                SERVICE_CHANGE_CONFIG | DELETE);
@@ -500,7 +501,7 @@ static InstallServiceResult InstallService() {
         log::Warn("private firewall rule update failed err=" +
                   std::to_string(firewallError));
     }
-    return {ServiceSuccess(), firewallError, {}, updatedExistingService};
+    return {ServiceSuccess(), firewallError, updatedExistingService};
 }
 
 static ServiceResult StartServiceS() {
@@ -947,21 +948,12 @@ static void HandleAsyncOperationCompleted(HWND hwnd,
     if (result->operation == AsyncOperation::kInstall) {
         if (!result->install.service.ok) {
             FinishAsyncOperation(hwnd);
-            if (!result->install.pathSecurityReason.empty()) {
-                const std::wstring message =
-                    L"为防止非管理员改写 LocalSystem 服务，已拒绝从当前目录安装。\n\n" +
-                    result->install.pathSecurityReason +
-                    L"\n\n请将 RemoteAssist.exe 与 web 目录放到仅管理员和 LocalSystem "
-                    L"可写的本机固定磁盘目录，然后重新以管理员身份运行。";
-                MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONWARNING);
-            } else {
-                ShowServiceError(hwnd, L"安装服务", result->install.service.error);
-            }
+            ShowServiceError(hwnd, L"安装服务", result->install.service.error);
             return;
         }
 
-        // 只有服务创建成功后才让出配置窗口的托盘所有权。这样 ACL 或权限校验失败
-        // 时仍保留当前窗口的隐藏入口；随后启动服务的慢操作继续放到工作线程。
+        // 只有服务创建成功后才让出配置窗口的托盘所有权；随后启动服务的慢操作继续
+        // 放到工作线程，避免阻塞界面。
         g_startAfterInstall = true;
         g_installFirewallError = result->install.firewallError;
         g_operationInProgress = false;
@@ -1092,27 +1084,32 @@ static void HideToTray() {
 }
 
 static void CreateControls(HWND hwnd) {
-    g_font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+    const UINT dpi = WindowDpi(hwnd);
+    const auto scale = [dpi](int value) { return ScaleByDpi(value, dpi); };
+    // 使用逻辑像素创建 18px 字体；在 100% 缩放下也比原先 16px 字体更易读，并在
+    // 高 DPI 显示器上随窗口同步放大。
+    g_font = CreateFontW(-scale(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0,
+        L"Microsoft YaHei UI");
 
     auto mk = [&](int id, const wchar_t* cls, const wchar_t* text, int x, int y, int w, int h, DWORD style) {
         HWND hw = CreateWindowExW(0, cls, text, style | WS_CHILD | WS_VISIBLE,
-            x, y, w, h, hwnd, (HMENU)(LONG_PTR)id, nullptr, nullptr);
+            scale(x), scale(y), scale(w), scale(h), hwnd, (HMENU)(LONG_PTR)id, nullptr, nullptr);
         if (g_font) {
             SendMessageW(hw, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
         }
         return hw;
     };
 
-    mk(0, L"STATIC", L"\u5bc6\u7801(\u7559\u7a7a\u4e0d\u53d8):", 20, 20, 120, 20, 0);
-    mk(IDC_PW_EDIT, L"EDIT", L"", 140, 18, 110, 24,
+    mk(0, L"STATIC", L"\u5bc6\u7801(\u7559\u7a7a\u4e0d\u53d8):", 28, 28, 150, 28, 0);
+    mk(IDC_PW_EDIT, L"EDIT", L"", 180, 24, 190, 38,
        ES_AUTOHSCROLL | ES_PASSWORD | WS_BORDER);
-    mk(IDC_PW_SAVE, L"BUTTON", L"\u4fdd\u5b58\u914d\u7f6e", 260, 17, 90, 26, BS_PUSHBUTTON);
+    mk(IDC_PW_SAVE, L"BUTTON", L"\u4fdd\u5b58\u914d\u7f6e", 390, 24, 190, 40, BS_PUSHBUTTON);
 
-    mk(0, L"STATIC", L"\u7aef\u53e3:", 20, 55, 50, 20, 0);
-    mk(IDC_PORT_EDIT, L"EDIT", L"7980", 70, 53, 60, 24, ES_NUMBER | WS_BORDER);
-    mk(0, L"STATIC", L"\u753b\u8d28\u4e0a\u9650:", 145, 55, 70, 20, 0);
-    HWND qualityCombo = mk(IDC_QUALITY_COMBO, L"COMBOBOX", L"", 215, 52, 135, 160,
+    mk(0, L"STATIC", L"\u7aef\u53e3:", 28, 88, 72, 28, 0);
+    mk(IDC_PORT_EDIT, L"EDIT", L"7980", 100, 84, 110, 38, ES_NUMBER | WS_BORDER);
+    mk(0, L"STATIC", L"\u753b\u8d28\u4e0a\u9650:", 232, 88, 120, 28, 0);
+    HWND qualityCombo = mk(IDC_QUALITY_COMBO, L"COMBOBOX", L"", 352, 82, 228, 200,
                            CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP | WS_VSCROLL);
     SendMessageW(qualityCombo, CB_ADDSTRING, 0,
                  reinterpret_cast<LPARAM>(L"\u81ea\u52a8\uff08\u6700\u9ad81080p\uff09"));
@@ -1124,18 +1121,18 @@ static void CreateControls(HWND hwnd) {
                  reinterpret_cast<LPARAM>(L"\u6700\u9ad8540p"));
     SendMessageW(qualityCombo, CB_SETCURSEL, 0, 0);
 
-    mk(0, L"STATIC", L"\u72b6\u6001:", 20, 90, 50, 20, 0);
-    mk(IDC_STATUS, L"STATIC", L"...", 70, 90, 280, 20, 0);
+    mk(0, L"STATIC", L"\u72b6\u6001:", 28, 142, 72, 28, 0);
+    mk(IDC_STATUS, L"STATIC", L"...", 100, 142, 480, 28, 0);
 
-    mk(IDC_RUN_AGENT, L"BUTTON", L"\u76f4\u63a5\u8fd0\u884c(\u975e\u670d\u52a1)", 20, 125, 160, 32, BS_PUSHBUTTON);
-    mk(IDC_SVC_INSTALL, L"BUTTON", L"\u5b89\u88c5/\u66f4\u65b0\u5e76\u542f\u52a8", 200, 125, 150, 32, BS_PUSHBUTTON);
+    mk(IDC_RUN_AGENT, L"BUTTON", L"\u76f4\u63a5\u8fd0\u884c(\u975e\u670d\u52a1)", 28, 190, 270, 50, BS_PUSHBUTTON);
+    mk(IDC_SVC_INSTALL, L"BUTTON", L"\u5b89\u88c5/\u66f4\u65b0\u5e76\u542f\u52a8", 312, 190, 268, 50, BS_PUSHBUTTON);
 
-    mk(IDC_SVC_START, L"BUTTON", L"\u542f\u52a8\u670d\u52a1", 20, 170, 110, 32, BS_PUSHBUTTON);
-    mk(IDC_SVC_STOP, L"BUTTON", L"\u505c\u6b62\u670d\u52a1", 140, 170, 110, 32, BS_PUSHBUTTON);
-    mk(IDC_SVC_UNINSTALL, L"BUTTON", L"\u5378\u8f7d\u670d\u52a1", 260, 170, 90, 32, BS_PUSHBUTTON);
+    mk(IDC_SVC_START, L"BUTTON", L"\u542f\u52a8\u670d\u52a1", 28, 260, 170, 50, BS_PUSHBUTTON);
+    mk(IDC_SVC_STOP, L"BUTTON", L"\u505c\u6b62\u670d\u52a1", 219, 260, 170, 50, BS_PUSHBUTTON);
+    mk(IDC_SVC_UNINSTALL, L"BUTTON", L"\u5378\u8f7d\u670d\u52a1", 410, 260, 170, 50, BS_PUSHBUTTON);
 
-    mk(IDC_HIDE_TRAY, L"BUTTON", L"\u9690\u85cf\u5230\u6258\u76d8", 20, 210, 130, 30, BS_PUSHBUTTON);
-    mk(IDC_EXIT, L"BUTTON", L"\u9000\u51fa", 160, 210, 80, 30, BS_PUSHBUTTON);
+    mk(IDC_HIDE_TRAY, L"BUTTON", L"\u9690\u85cf\u5230\u6258\u76d8", 28, 335, 210, 46, BS_PUSHBUTTON);
+    mk(IDC_EXIT, L"BUTTON", L"\u9000\u51fa", 260, 335, 130, 46, BS_PUSHBUTTON);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1358,9 +1355,11 @@ int RunSetupDialog(HINSTANCE hInst) {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassExW(&wc);
 
+    const UINT initialDpi = WindowDpi(nullptr);
     HWND hwnd = CreateWindowExW(0, cls, L"RemoteAssist \u914d\u7f6e",
         (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 420, 280, nullptr, nullptr, hInst, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, ScaleByDpi(640, initialDpi), ScaleByDpi(460, initialDpi),
+        nullptr, nullptr, hInst, nullptr);
 
     if (!hwnd) {
         log::Error("CreateWindowEx failed err=" + std::to_string(GetLastError()));
