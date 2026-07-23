@@ -207,7 +207,11 @@ std::string Pbkdf2Sha256Hex(const std::string& saltHex, const std::string& token
     }
 
     BCRYPT_ALG_HANDLE hAlg = nullptr;
-    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+    // PBKDF2 的 PRF 是 HMAC-SHA256，而不是裸 SHA-256。未指定 HMAC 标志时，
+    // BCryptDeriveKeyPBKDF2 会在部分 Windows CNG 实现上返回无效句柄，导致首次
+    // 配置和改密无法生成哈希。
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0) {
         return {};
     }
     uint8_t hash[32] = {};

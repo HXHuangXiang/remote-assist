@@ -96,7 +96,8 @@ std::string Pbkdf2Sha256(const std::string& saltHex, const std::string& password
     }
 
     BCRYPT_ALG_HANDLE algorithm = nullptr;
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0) {
         return {};
     }
     uint8_t digest[32]{};
