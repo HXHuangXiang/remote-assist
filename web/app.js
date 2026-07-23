@@ -20,18 +20,50 @@ let wheelRemainder = 0;
 // 键盘和鼠标按键绝不能因网络背压被丢弃；高频 move/wheel 则只保留最新状态，
 // 避免浏览器的 WebSocket 发送缓冲区堆满后，用户已经停手但远端鼠标仍持续移动。
 const inputBufferHighWaterMark = 16 * 1024;
+const controllerCleanupReconnectAttempts = 20;
 let pendingWheelDelta = 0, wheelQueued = false;
 const clientStats = {
   drawn: 0, dropped: 0, drawMsTotal: 0, drawMsSamples: 0,
+  decodeMsTotal: 0, decodeMsSamples: 0,
   decodeErrors: 0, maxDecodeQueue: 0, maxWsBuffered: 0
 };
 let remoteCursor = { visible:false, x:0, y:0 };
+let firstFrameWarningTimer = 0, awaitingFrameSocket = null;
+// 鉴权成功只代表控制信道可用。必须等解码后的帧实际绘制到 canvas，才能确认视频
+// 通路正常；否则损坏的 H.264/JPEG 负载会把黑屏误报成“已连接”。
+let firstFramePresented = false;
 // 远端指针移动非常频繁。记录上一次实际绘制的边界，只清除箭头附近的小区域，
 // 避免每个 cursor 消息都 clearRect 整张 2K/4K 覆盖 canvas。
 let drawnCursorBounds = null;
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
+
+function clearFirstFrameWarning() {
+  if (firstFrameWarningTimer) window.clearTimeout(firstFrameWarningTimer);
+  firstFrameWarningTimer = 0;
+  awaitingFrameSocket = null;
+}
+
+function scheduleFirstFrameWarning(socket) {
+  clearFirstFrameWarning();
+  firstFramePresented = false;
+  awaitingFrameSocket = socket;
+  firstFrameWarningTimer = window.setTimeout(function() {
+    if (ws === socket && authed && awaitingFrameSocket === socket) {
+      setStatus('未收到首帧，请查看被控机 logs/agent.log');
+      log('first video frame timeout');
+    }
+  }, 6000);
+}
+
+function markFirstFramePresented(socket) {
+  if (firstFramePresented || ws !== socket || !authed) return;
+  firstFramePresented = true;
+  clearFirstFrameWarning();
+  setStatus('已连接');
+  log('first video frame presented');
+}
 
 function fitCanvas() {
   if (!canvas.width || !canvas.height) return;
@@ -66,11 +98,15 @@ function openConnection() {
   const url = endpoint.href;
   log('connecting ' + url);
   releasePressedInputs();
+  clearFirstFrameWarning();
+  firstFramePresented = false;
+  cfg = null;
   resetFramePipeline(false);
   pendingMove = null;
   pendingWheelDelta = 0;
   wheelRemainder = 0;
   authed = false;
+  updateKeyboardFocusIndicator();
   setStatus('连接中');
   const socket = new WebSocket(url);
   ws = socket;
@@ -96,6 +132,9 @@ function openConnection() {
     const shouldReconnect = reconnectAfterClose || reconnectRetriesRemaining > 0;
     reconnectAfterClose = false;
     resetFramePipeline(false);
+    clearFirstFrameWarning();
+    firstFramePresented = false;
+    cfg = null;
     pressedKeys.clear();
     pressedButtons.clear();
     pendingMove = null;
@@ -105,6 +144,7 @@ function openConnection() {
     drawRemoteCursor();
     ws = null;
     log('disconnected'); setStatus('未连接'); authed = false;
+    updateKeyboardFocusIndicator();
     if (shouldReconnect) {
       if (reconnectRetriesRemaining > 0) --reconnectRetriesRemaining;
       // 服务端会先释放遗留按键再让出唯一 controller 槽位；给这段收尾留出一个
@@ -119,9 +159,18 @@ function handleText(m) {
   if (m.t === 'auth') {
     authed = m.ok;
     if (m.ok) reconnectRetriesRemaining = 0;
-    setStatus(m.ok ? '已连接' : '鉴权失败');
+    if (m.ok) {
+      setStatus('已连接，等待远端首帧');
+      scheduleFirstFrameWarning(ws);
+    } else {
+      clearFirstFrameWarning();
+      setStatus('鉴权失败');
+    }
     log(m.ok ? 'auth ok' : ('auth fail: ' + (m.reason || '')));
-    if (m.ok && canvas) canvas.focus();
+    if (m.ok && canvas) {
+      canvas.focus();
+      updateKeyboardFocusIndicator();
+    }
     return;
   }
   if (m.t === 'cfg') { setupCfg(m); return; }
@@ -137,12 +186,34 @@ function handleText(m) {
     return;
   }
   if (m.t === 'monitors') { populateMonitors(m.list); return; }
-  if (m.t === 'error') { log('error: ' + (m.msg || '')); return; }
+  if (m.t === 'error') {
+    log('error: ' + (m.msg || ''));
+    // 旧控制端断连时服务端会先在当前桌面释放 keyup/mouseup。这个短窗口不能让
+    // 新控制端抢入，否则会误抬起新会话按下的键；浏览器识别专用错误后自动重试。
+    if (m.code === 'controller_cleanup' && ws) {
+      reconnectAfterClose = true;
+      reconnectRetriesRemaining = Math.max(reconnectRetriesRemaining,
+                                           controllerCleanupReconnectAttempts);
+      setStatus('正在等待上一控制端释放输入');
+    }
+    return;
+  }
 }
 
 function setupCfg(c) {
   const streamId = Number(c.stream_id);
   c.stream_id = Number.isSafeInteger(streamId) && streamId >= 0 ? streamId : 0;
+  const width = Number(c.w), height = Number(c.h);
+  const hasVideoSize = Number.isSafeInteger(width) && Number.isSafeInteger(height) &&
+    width >= 2 && height >= 2;
+  c.w = hasVideoSize ? width : 0;
+  c.h = hasVideoSize ? height : 0;
+  if (!hasVideoSize) {
+    cfg = c;
+    if (c.monitors) populateMonitors(c.monitors, c.selected_monitor);
+    log('cfg awaiting first frame');
+    return;
+  }
   // 显示器列表和选中项也会下发 cfg，但它们不会改变已在解码的 H.264 码流。
   // 仅当真正的视频协商参数变化时才销毁解码器；否则热插拔/布局刷新会无谓地
   // 清空参考帧、请求 IDR，并让控制端出现一次短暂黑屏。
@@ -152,6 +223,7 @@ function setupCfg(c) {
   const sizeChanged = !cfg || cfg.w !== c.w || cfg.h !== c.h;
   if (videoConfigChanged) resetFramePipeline(true);
   cfg = c;
+  setStatus('已连接，等待远端首帧');
   if (sizeChanged) {
     canvas.width = c.w;
     canvas.height = c.h;
@@ -286,6 +358,7 @@ function queueH264Presentation(videoFrame, info, streamId, decoder) {
       try {
         ctx.drawImage(presentation.videoFrame, 0, 0, canvas.width, canvas.height);
         recordPresentedFrame(presentation.info);
+        markFirstFramePresented(presentation.info.socket);
       } catch (error) {
         log('H.264 draw error: ' + error.message);
       }
@@ -320,6 +393,22 @@ function isH264Codec() {
   return cfg && typeof cfg.codec === 'string' && cfg.codec.toLowerCase().indexOf('avc1.') === 0;
 }
 
+// 丢掉任意 H.264 delta 后，旧 decoder 内仍可能排队着依赖该 delta 的访问单元。
+// 仅设置 h264NeedsKeyFrame 不足以隔离这些旧参考帧：关闭并重建 decoder，同时确认
+// 已登记但不会再展示的服务端帧，下一张 IDR 才会成为新的独立解码起点。
+function resetH264DecoderForKeyFrame(reason) {
+  discardPendingH264Presentation(true);
+  acknowledgeH264Frames();
+  h264Frames.clear();
+  h264NeedsKeyFrame = true;
+  if (cfg && isH264Codec()) {
+    setupH264Decoder(cfg);
+  } else {
+    requestKeyFrame();
+  }
+  if (reason) log(reason);
+}
+
 function setupH264Decoder(c) {
   if (!window.VideoDecoder || !window.EncodedVideoChunk) {
     setStatus('浏览器不支持 H.264 WebCodecs');
@@ -338,6 +427,10 @@ function setupH264Decoder(c) {
       const info = infos && infos.shift();
       if (infos && infos.length === 0) h264Frames.delete(videoFrame.timestamp);
       if (info && h264Decoder === decoder && cfg && cfg.stream_id === streamId && ws === info.socket) {
+        if (Number.isFinite(info.receivedAt)) {
+          clientStats.decodeMsTotal += Math.max(0, performance.now() - info.receivedAt);
+          clientStats.decodeMsSamples++;
+        }
         queueH264Presentation(videoFrame, info, streamId, decoder);
         return;
       }
@@ -407,6 +500,9 @@ function handleBinary(data) {
     acknowledgeFrame(info.id);
     return;
   }
+  // 收到二进制负载并不代表浏览器能成功解码或绘制。首帧诊断会持续到实际
+  // drawImage 成功，便于区分“Agent 没有输出视频”和“浏览器无法呈现视频”。
+  if (!firstFramePresented) setStatus('已连接，正在解码远端首帧');
   if (isH264Codec()) {
     if (!h264Decoder) {
       acknowledgeFrame(info.id);
@@ -421,8 +517,7 @@ function handleBinary(data) {
       // 丢掉一个 delta 后，后续参考帧不再可靠；直接回到下一张 IDR，保持低延迟。
       acknowledgeFrame(info.id);
       clientStats.dropped++;
-      h264NeedsKeyFrame = true;
-      requestKeyFrame();
+      resetH264DecoderForKeyFrame('H.264 decode queue backpressure; waiting for IDR');
       return;
     }
     const socket = ws;
@@ -444,8 +539,7 @@ function handleBinary(data) {
       if (infos.length === 0) h264Frames.delete(info.timestamp);
       acknowledgeFrame(info.id);
       clientStats.dropped++;
-      h264NeedsKeyFrame = true;
-      requestKeyFrame();
+      resetH264DecoderForKeyFrame('H.264 chunk rejected; waiting for IDR');
       log('H.264 chunk rejected: ' + error.message);
     }
     return;
@@ -478,8 +572,14 @@ function drawNext() {
     URL.revokeObjectURL(url);
     if (generation !== decodeGeneration || ws !== socket) return;
     if (cfg && frame.streamId === cfg.stream_id) {
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      recordPresentedFrame(frame);
+      try {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        recordPresentedFrame(frame);
+        markFirstFramePresented(socket);
+      } catch (error) {
+        clientStats.dropped++;
+        log('JPEG draw error: ' + error.message);
+      }
       // 图片已绘制到 canvas，释放服务端的唯一在途帧配额。
       acknowledgeFrame(frame.id);
     }
@@ -500,6 +600,19 @@ function drawNext() {
 
 function canSendInput() {
   return ws && ws.readyState === WebSocket.OPEN && authed;
+}
+
+// 仅 canvas 获得焦点时才把新的按键下发到远端。此前 window 级 keydown 会把用户
+// 在密码框、显示器下拉框甚至浏览器页面内输入的字符一并注入，既容易误操作也会
+// 让本地控件难以使用。已按下的按键仍必须允许 keyup 收尾，避免焦点切换时卡键。
+function canSendKeyboardInput() {
+  return canSendInput() && document.hasFocus() && document.activeElement === canvas;
+}
+
+function updateKeyboardFocusIndicator() {
+  if (!canvas) return;
+  canvas.classList.toggle('remote-keyboard-active',
+    canSendInput() && document.hasFocus() && document.activeElement === canvas);
 }
 
 function send(obj) {
@@ -576,15 +689,20 @@ function flushClientStats() {
     t:'client_stats', drawn:clientStats.drawn, dropped:clientStats.dropped,
     draw_ms_total:Math.round(clientStats.drawMsTotal),
     draw_ms_samples:clientStats.drawMsSamples, decode_errors:clientStats.decodeErrors,
+    decode_ms_total:Math.round(clientStats.decodeMsTotal),
+    decode_ms_samples:clientStats.decodeMsSamples,
     max_decode_queue:clientStats.maxDecodeQueue,
     max_ws_buffered:Math.round(clientStats.maxWsBuffered)
   };
   clientStats.drawn = 0; clientStats.dropped = 0;
   clientStats.drawMsTotal = 0; clientStats.drawMsSamples = 0;
+  clientStats.decodeMsTotal = 0; clientStats.decodeMsSamples = 0;
   clientStats.decodeErrors = 0; clientStats.maxDecodeQueue = 0; clientStats.maxWsBuffered = 0;
   send(payload);
 }
-function btnName(b) { return b === 1 ? 'middle' : b === 2 ? 'right' : 'left'; }
+function btnName(b) {
+  return b === 0 ? 'left' : b === 1 ? 'middle' : b === 2 ? 'right' : '';
+}
 
 function normalizedWheelDelta(e) {
   // 浏览器的 deltaY 可能是像素、行或页，Windows SendInput 则使用 WHEEL_DELTA
@@ -603,6 +721,11 @@ function normalizedWheelDelta(e) {
 function queueMove(e) {
   pendingMove = normXY(e);
   lastPointer = pendingMove;
+  // GDI/锁屏路径不应为每个 mousemove 执行一次完整 BitBlt。先在控制端预测
+  // 指针位置，使操作反馈不必等待下一次视频帧；被控端随后发送的 cursor 消息
+  // 仍是权威状态，可处理边界限制、跨屏或目标程序改写指针位置的情况。
+  remoteCursor = { visible:true, x:pendingMove.x, y:pendingMove.y };
+  drawRemoteCursor();
   scheduleMoveFlush();
 }
 
@@ -666,7 +789,7 @@ window.addEventListener('DOMContentLoaded', function() {
   monSel.addEventListener('change', function() { send({t:'monitor', index: parseInt(monSel.value, 10)}); });
   window.addEventListener('resize', fitCanvas);
   window.addEventListener('keydown', function(e) {
-    if (!authed) return;
+    if (!canSendKeyboardInput()) return;
     const sc = codeToSc[e.code];
     if (sc !== undefined) {
       e.preventDefault();
@@ -681,9 +804,9 @@ window.addEventListener('DOMContentLoaded', function() {
     if (!authed) return;
     const sc = codeToSc[e.code];
     if (sc !== undefined) {
-      e.preventDefault();
       const key = pressedKeys.get(e.code);
       if (key) {
+        e.preventDefault();
         pressedKeys.delete(e.code);
         send({t:'key', sc:key.sc, ext:key.ext, down:false});
       }
@@ -694,15 +817,24 @@ window.addEventListener('DOMContentLoaded', function() {
     if (!authed) return;
     const p = normXY(e);
     const button = btnName(e.button);
+    if (!button) return;
     lastPointer = p;
     pressedButtons.add(button);
     canvas.focus();
     send({t:'mouse', x:p.x, y:p.y, btn:button, down:true});
     e.preventDefault();
   });
+  canvas.addEventListener('focus', updateKeyboardFocusIndicator);
+  canvas.addEventListener('blur', function() {
+    // 点击密码框、显示器选择框等本地控件时立即释放远端已有按键；否则按住 Ctrl
+    // 后再点击 UI，远端会一直认为 Ctrl 处于按下状态。
+    releasePressedInputs();
+    updateKeyboardFocusIndicator();
+  });
   window.addEventListener('mouseup', function(e) {
     if (!authed) return;
     const button = btnName(e.button);
+    if (!button) return;
     if (pressedButtons.delete(button)) {
       send({t:'mouse', x:lastPointer.x, y:lastPointer.y, btn:button, down:false});
     }
@@ -717,7 +849,11 @@ window.addEventListener('DOMContentLoaded', function() {
     }
     e.preventDefault();
   }, { passive:false });
-  window.addEventListener('blur', releasePressedInputs);
+  window.addEventListener('blur', function() {
+    releasePressedInputs();
+    updateKeyboardFocusIndicator();
+  });
+  window.addEventListener('focus', updateKeyboardFocusIndicator);
   document.addEventListener('visibilitychange', function() {
     if (document.hidden) releasePressedInputs();
   });

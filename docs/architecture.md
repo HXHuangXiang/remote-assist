@@ -12,7 +12,7 @@
     RemoteAssist.exe --agent   (由 winlogon token 启动,绑定当前 input desktop)
       |- DesktopAccess: 每个工作线程独立 OpenInputDesktop + SetThreadDesktop，每秒检查桌面切换
       |- Capture: DXGI Desktop Duplication（单屏；同 adapter 多屏 GPU 合成）/
-      |           GDI BitBlt（锁屏、跨 adapter/旋转多屏回退、静态首帧兜底；交互 15 FPS、静止 5 FPS）
+      |           GDI BitBlt（锁屏、跨 adapter/旋转多屏回退、静态首帧兜底；交互 5~30 FPS 自适应、静止 2 FPS）
       |- EncoderMf: Media Foundation H.264 MFT（硬件优先）编码；不可用时回退 WIC JPEG
       |- HttpWsServer: cpp-httplib 托管 web/ + /ws
       \- Input: SendInput 注入键鼠(锁屏桌面用 scancode 路径)
@@ -34,17 +34,32 @@
 不做:UAC Secure Desktop、Ctrl+Alt+Del 注入(需 SAS/驱动)、隐藏运行、静默持久化、规避本地用户终止;日志不写密码、屏幕内容、剪贴板。
 
 图形安装和 `tools/install.bat` 在注册 LocalSystem 服务前检查 exe、web/ 资源树、已有的
-config.json、logs/、.initial-password 及其父目录链的 ACL。空 DACL、重解析点、网络/可
-移动卷、普通用户可写 ACL 或非管理员所有者都会被拒绝；配置、日志和网页资源仍留在当前
-exe 目录，不会被自动迁移。
+config.json、.config.lock、logs/ 与遗留 .initial-password 及其父目录链的 ACL。空 DACL、重解析点、网络/可
+移动卷、普通用户可写 ACL、非管理员所有者，或 LocalSystem 对映像、网页、配置锁和日志缺少运行权限都会被拒绝；配置、日志和网页资源仍留在当前
+exe 目录，不会被自动迁移。无参数双击 exe 时会先经 UAC 进入管理员配置窗口，再创建
+config/logs 或安装服务；这使首次写入运行产物的所有者与服务路径校验一致，避免出现
+“普通用户先写配置，随后 LocalSystem 服务因 ACL 拒绝安装”的矛盾。--service、--agent
+和由服务拉起的 --tray 不会触发该 UAC 路径。
 
-服务创建的 Agent stop/ready 全局事件显式限制为 LocalSystem 与管理员可修改，交互式用户
-仅能读取 ready 状态；这不会改变可见托盘与正常服务停止入口，但能避免普通进程伪造就绪
-或直接干扰 Agent 生命周期。
+服务创建的 Agent stop/listener-ready/frame-ready 全局事件显式限制为 LocalSystem 与管理员
+可修改，交互式用户仅能读取状态。listener-ready 仅表示 HTTP/WebSocket 已监听；frame-ready
+必须在当前视频流实际采集、编码并入队首帧后才置位；桌面、显示器、输出分辨率、编码器参数
+或浏览器请求恢复发生变化时会先复位，避免黑屏时误报上一轮画面可用。这不会改变可见托盘与
+正常服务停止入口，但能避免普通进程伪造就绪或直接干扰 Agent 生命周期。
 
 ## 配置文件
 
-exe 同目录的 config.json:port、password_hash、salt、password_iterations、bitrate、fps；日志位于 exe 同目录 logs/，按 service.log、agent.log、tray.log、setup.log 分开写入，避免多进程抢写同一日志。agent 在有控制端时每 10 秒记录捕获、编码、发送和帧确认统计，用于定位卡顿；fps 与 bitrate 是配置上限，Agent 会根据浏览器 ACK 端到端延迟、发送失败、H.264 发送信用等待、重同步和真实编码时间预算，在 5 FPS 到该上限间自适应降低帧率，并在 MFT 支持时同步下调码率；GDI BitBlt 回退路径会在远端键鼠操作后的 1.2 秒内保持最高 15 FPS，静止时降至 5 FPS，避免锁屏或跨显卡多屏持续复制整张虚拟桌面。H.264 在编码前确认待发送槽位可用，槽位满时跳过采集输入而不生成会丢失参考关系的 delta 帧。若拥塞或编码压力持续，则按 1080p、900p、720p、540p、360p 的输出上限逐级缩小画面，网络/CPU 恢复后再保守提升，避免慢网络或慢编码不断堆积增量帧。H.264/JPEG 的帧时间戳使用单调时钟，关键帧按真实经过时间而非初始化 FPS 的帧计数触发，因此降帧后浏览器时间基与关键帧周期仍然正确。新配置使用 PBKDF2-SHA256(210000 次)保存密码哈希；缺少 password_iterations 的历史配置继续按 SHA-256(salt + token) 校验，避免升级后密码失效。
-首次启动生成随机密码与 salt,计算哈希并写回;同时把明文密码写入 .initial-password,供 tray 进程读取展示后删除。首次配置窗口若把随机密码改为自定义密码，会原子更新该一次性提示；后续常规改密会删除残留提示，避免托盘展示旧密码。已存在的 config.json 若校验失败，程序不会静默覆盖或随机重置密码；Agent 会等待配置窗口设置新密码并显式保存完成修复，原文件保留以便排查。
+H.264 的端到端视频窗口以“已发送未确认 + 待发送”合计计算，最多两帧；窗口满时
+跳过本轮采集输入而不生成会丢失参考关系的 delta，避免额外积压一帧陈旧画面。
+
+GDI 路径中，键盘、按键鼠标和滚轮会立即唤醒采集；连续鼠标移动则由浏览器本地
+预测指针，并在后续 `cursor` 消息中以实际桌面位置校正。首个移动和后续受限频率的
+移动可唤醒采集，避免每个 mousemove 都触发一次完整 BitBlt。
+
+exe 同目录的 config.json:port、password_hash、salt、password_iterations、bitrate、fps、quality_cap；日志位于 exe 同目录 logs/，按 service.log、agent.log、tray.log、setup.log 分开写入，避免多进程抢写同一日志。Tray 由普通用户令牌运行时，日志通过仅授权当前活动用户写入的本地命名管道转交 LocalSystem 服务落盘，不放宽安装目录 ACL。agent 在有控制端时每 10 秒记录捕获、编码、发送和帧确认统计，用于定位卡顿；`diagnosis` 会明确输出 capture_gdi/capture_dxgi、encode、browser、network 或 normal，可直接判断下一步应优化的流水线阶段。CPU 回退时同一条指标还会给出 `capture_cpu_copy_scale_avg_us`、`gdi_blt_avg_us`、`bgra_nv12_avg_us` 和 `mf_input_prepare_avg_us`，分别定位缩放、锁屏 BitBlt、颜色转换与 Media Foundation 输入对象创建。GDI 直接借用最终 DIB 到本轮同步编码结束，不再额外复制整张 BGRA 帧。日志中的 `h264_ack_window_ms` 表示按浏览器实际绘制确认动态收敛的 350~1000ms H.264 确认窗口，避免偶发浏览器抖动反复触发 IDR。fps 与 bitrate 是配置上限，Agent 会根据浏览器 ACK 端到端延迟、发送失败、H.264 发送信用等待、重同步和真实编码时间预算，在 5 FPS 到该上限间自适应降低帧率，并在 MFT 支持时同步下调码率。quality_cap 可取自动(0)、1080、720、540；自动从 1080p 档开始，手动档位限制自适应恢复时的最高分辨率，过载时仍可继续下调。GDI 回退会直接把选中的源区域 StretchBlt 到最终推流尺寸 DIB，不再创建完整虚拟桌面 DIB 后做 CPU 裁剪和缩放；单帧超过可用帧预算时立即降 FPS，持续过载时按 1080p、900p、720p、540p、360p 的输出上限降低分辨率。DXGI 的桌面变化等待不会被误判为采集压力。远端键鼠操作后的 1.2 秒内 GDI 从 15 FPS 起步，并仅在 BitBlt 预算充足时逐步提高到最高 30 FPS；过载时会降至最低 5 FPS，静止时降至 2 FPS。有效远端输入会立即唤醒采集线程，因此不会等待完整的空闲帧周期。H.264 在编码前确认待发送槽位可用，槽位满时跳过采集输入而不生成会丢失参考关系的 delta 帧。网络、编码或 GDI 采集压力恢复后，输出质量会保守提升，避免慢链路或慢采集不断堆积增量帧。H.264/JPEG 的帧时间戳使用单调时钟，关键帧按真实经过时间而非初始化 FPS 的帧计数触发，因此降帧后浏览器时间基与关键帧周期仍然正确。新配置使用 PBKDF2-SHA256(210000 次)保存密码哈希；缺少 password_iterations 的历史配置继续按 SHA-256(salt + token) 校验，避免升级后密码失效。
+历史 SHA-256 配置在首次正确认证后会使用新 salt 原子迁移为 PBKDF2-SHA256；迁移写入失败不会拒绝该次已验证连接，后续认证仍会继续尝试。密码配置窗口保存后若旧 Agent 恰好进行认证，迁移会复核磁盘中的密码存储，避免覆盖用户刚保存的新密码。
+首次启动生成随机密码与 salt，计算哈希并写回。双击配置窗口首次生成密码时会立即提示用户保存；服务在无配置窗口的首启场景则创建随机命名、30 秒后自动擦除的只读共享内存，把密码交给当前会话 Tray 展示一次。共享内存只授权给 LocalSystem、管理员与目标 Tray 用户 SID，且 Tray 启动固定使用同一会话；日志不会记录通道名称。密码不会写入 .initial-password 或其他明文文件；遇到旧版本遗留的 .initial-password 会在配置加载时尽力删除。已存在的 config.json 若校验失败，程序不会静默覆盖或随机重置密码；Agent 会等待配置窗口设置新密码后显式保存完成修复，原文件保留以便排查。
+
+采集失败（例如桌面切换中、驱动重置或锁屏桌面暂时不可读）时，CaptureLoop 会先重建一次资源，随后以 250ms 到 5s 的有界指数退避重试，避免黑屏状态按目标 FPS 持续创建 DXGI/GDI 对象；成功采集或确认静态画面后立即恢复正常节奏。
 配置窗口和浏览器口令统一按 UTF-8 字节参与 PBKDF2；图形界面限制密码 UTF-8 编码后不超过
 3072 字节，以适配 JSON 转义后的 WebSocket 首帧 8 KiB 上限。

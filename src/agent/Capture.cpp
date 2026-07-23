@@ -16,17 +16,20 @@ namespace remote_assist {
 
 namespace {
 
-// 每行错开采样相位，避免固定列的细小变化一直漏检。采样比例约为 1/16，
-// 相比完整 4K 帧的缩放/复制开销可忽略。
+// 每行错开采样相位，避免固定列的细小变化一直漏检。调用方同时比对四个相位组，
+// 每组只与自身的历史摘要比较；合计采样约 1/4 像素，仍远低于 GDI BitBlt 与
+// BGRA->NV12 的整帧内存流量，却能在当前交互帧内发现任一相位覆盖的小区域变化。
 uint64_t FingerprintBgraRegion(const uint8_t* source, size_t sourceStrideBytes,
-                               int x, int y, int width, int height) {
+                               int x, int y, int width, int height,
+                               size_t phaseOffsetBytes) {
     constexpr size_t kSampleStrideBytes = 64;
     uint64_t hash = 1469598103934665603ULL;
     const size_t regionBytes = static_cast<size_t>(width) * 4;
     for (int row = 0; row < height; ++row) {
         const uint8_t* sourceRow = source + static_cast<size_t>(y + row) * sourceStrideBytes +
             static_cast<size_t>(x) * 4;
-        const size_t phase = (static_cast<size_t>(row) * 20) % kSampleStrideBytes;
+        const size_t phase = (phaseOffsetBytes + static_cast<size_t>(row) * 20) %
+            kSampleStrideBytes;
         for (size_t offset = phase; offset + sizeof(uint32_t) <= regionBytes;
              offset += kSampleStrideBytes) {
             uint32_t pixel = 0;
@@ -122,8 +125,8 @@ void Capture::ReleaseAll() {
     bits_ = nullptr;
     dibW_ = 0;
     dibH_ = 0;
-    gdiFingerprint_ = 0;
-    hasGdiFingerprint_ = false;
+    gdiFingerprints_.fill(0);
+    hasGdiFingerprint_.fill(false);
     lastGdiFullFrameAt_ = {};
     gdiConsecutiveFailures_ = 0;
     lastGdiFailureLogAt_ = {};
@@ -144,7 +147,9 @@ void Capture::ReleaseFrame(CapturedFrame& frame) {
     }
     frame.mappedPixels = nullptr;
     frame.mappedStrideBytes = 0;
+    frame.borrowedGdiPixels = false;
     frame.nv12Texture.Reset();
+    frame.gpuNv12SubmissionUs = 0;
 }
 
 bool Capture::TakePointerUpdate(PointerUpdate& out) {
@@ -232,7 +237,7 @@ void Capture::RecordGdiCaptureFailure(DWORD error) {
     ++gdiConsecutiveFailures_;
     if (lastGdiFailureLogAt_.time_since_epoch().count() == 0 ||
         now - lastGdiFailureLogAt_ >= std::chrono::seconds(10)) {
-        log::Warn("GDI BitBlt failed: " + std::to_string(error) +
+        log::Warn("GDI screen copy failed: " + std::to_string(error) +
                   " consecutive=" + std::to_string(gdiConsecutiveFailures_));
         lastGdiFailureLogAt_ = now;
     }
@@ -242,7 +247,7 @@ void Capture::RecordGdiCaptureRecovery() {
     if (gdiConsecutiveFailures_ == 0) {
         return;
     }
-    log::Info("GDI BitBlt recovered after " + std::to_string(gdiConsecutiveFailures_) +
+    log::Info("GDI screen copy recovered after " + std::to_string(gdiConsecutiveFailures_) +
               " consecutive failures");
     gdiConsecutiveFailures_ = 0;
     lastGdiFailureLogAt_ = {};
@@ -621,6 +626,8 @@ CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs, bool requi
     // 采集线程串行使用同一个 staging texture。即使调用方因编码异常遗漏释放，也不
     // 能让下一次 Map 保持旧映射；正常路径会在编码后主动调用 ReleaseFrame。
     ReleaseFrame(out);
+    out.cpuCopyOrScaleUs = 0;
+    out.gdiBltUs = 0;
     const int selectedMonitor = selectedMonitor_.load();
     if (selectedMonitor != activeMonitor_) {
         // 切换单屏时重建到对应 adapter/output；“全部屏幕”会优先尝试同 adapter
@@ -651,13 +658,10 @@ CaptureResult Capture::CaptureFrame(CapturedFrame& out, DWORD waitMs, bool requi
         return result;
     }
 
-    // DXGI 访问丢失等异常会在下一帧尝试重建，不把空闲超时误当异常。
-    ResetForDesktop();
-    if (requireFreshFrame) {
-        log::Info("capture: DXGI recovery needs bootstrap frame, using GDI fallback");
-        return CaptureGDI(out, true);
-    }
-    return CaptureResult::kNoChange;
+    // DXGI 访问丢失后的资源重建交给 CaptureLoop 统一调度。这里若每一帧都立即
+    // ResetForDesktop，显卡驱动异常或黑屏时会以目标帧率反复创建 D3D11/DXGI 对象，
+    // 反而放大 CPU、GPU 与日志压力；调用方会先重建一次，再按指数退避重试。
+    return CaptureResult::kFailed;
 }
 
 bool Capture::EnsureVideoProcessor(int sourceWidth, int sourceHeight,
@@ -720,6 +724,7 @@ bool Capture::CreateGpuNv12Frame(ID3D11Texture2D* source, int width, int height,
     if (!gpuOutputEnabled_ || !source || width <= 0 || height <= 0) {
         return false;
     }
+    const auto preparationStartedAt = std::chrono::steady_clock::now();
     const double scale = std::min(1.0, std::min(
         static_cast<double>(maxOutputWidth_) / width,
         static_cast<double>(maxOutputHeight_) / height));
@@ -796,6 +801,9 @@ bool Capture::CreateGpuNv12Frame(ID3D11Texture2D* source, int width, int height,
     out.mappedPixels = nullptr;
     out.mappedStrideBytes = 0;
     out.nv12Texture = std::move(nv12Texture);
+    out.gpuNv12SubmissionUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - preparationStartedAt).count());
     return true;
 }
 
@@ -1043,8 +1051,44 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
     const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     if (vw <= 0 || vh <= 0) return CaptureResult::kFailed;
 
+    // 确定源区域：全部虚拟屏幕或指定显示器。显示器热插拔可能让上一轮快照的
+    // 坐标在本轮短暂过期，因此先裁剪；无交集时安全退回完整虚拟桌面。
+    int ox = 0;
+    int oy = 0;
+    int ow = vw;
+    int oh = vh;
+    const int selectedMonitor = selectedMonitor_.load();
+    const std::vector<MonitorInfo> monitors = MonitorsSnapshot();
+    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors.size())) {
+        const auto& monitor = monitors[selectedMonitor];
+        const long long left = std::max<long long>(0, monitor.x);
+        const long long top = std::max<long long>(0, monitor.y);
+        const long long right = std::min<long long>(
+            vw, static_cast<long long>(monitor.x) + monitor.w);
+        const long long bottom = std::min<long long>(
+            vh, static_cast<long long>(monitor.y) + monitor.h);
+        if (right > left && bottom > top) {
+            ox = static_cast<int>(left);
+            oy = static_cast<int>(top);
+            ow = static_cast<int>(right - left);
+            oh = static_cast<int>(bottom - top);
+        }
+    }
+
+    // 与 DXGI CPU 路径使用相同的等比例输出规则。GDI 直接写最终尺寸的 DIB，
+    // 不再先 BitBlt 整个虚拟桌面、再 CopyRegionToFrame 做 CPU 裁剪/最近邻缩放。
+    const double scale = std::min(1.0, std::min(
+        static_cast<double>(maxOutputWidth_) / ow,
+        static_cast<double>(maxOutputHeight_) / oh));
+    int outputWidth = std::max(1, static_cast<int>(ow * scale));
+    int outputHeight = std::max(1, static_cast<int>(oh * scale));
+    if (outputWidth > 1) outputWidth &= ~1;
+    if (outputHeight > 1) outputHeight &= ~1;
+    if (outputWidth <= 0 || outputHeight <= 0) {
+        return CaptureResult::kFailed;
+    }
+
     // 优先取当前 input desktop 的 DC，锁屏/Winlogon 情况不会误用普通 DISPLAY DC。
-    // 创建/复用 DIB 的尺寸仍然覆盖整个虚拟屏幕。
     if (!gdi_dc_) {
         gdi_dc_ = GetDC(nullptr);
         gdi_dc_from_getdc_ = (gdi_dc_ != nullptr);
@@ -1057,26 +1101,60 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
         mem_dc_ = CreateCompatibleDC(gdi_dc_);
         if (!mem_dc_) return CaptureResult::kFailed;
     }
-    if (!bmp_ || dibW_ != vw || dibH_ != vh) {
-        if (bmp_) { SelectObject(mem_dc_, old_bmp_); DeleteObject(bmp_); bmp_ = nullptr; }
+    if (!bmp_ || dibW_ != outputWidth || dibH_ != outputHeight) {
+        if (bmp_) {
+            SelectObject(mem_dc_, old_bmp_);
+            DeleteObject(bmp_);
+            bmp_ = nullptr;
+            bits_ = nullptr;
+            dibW_ = 0;
+            dibH_ = 0;
+        }
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = vw;
-        bi.bmiHeader.biHeight = -vh;
+        bi.bmiHeader.biWidth = outputWidth;
+        bi.bmiHeader.biHeight = -outputHeight;
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
         bmp_ = CreateDIBSection(mem_dc_, &bi, DIB_RGB_COLORS, &bits_, nullptr, 0);
         if (!bmp_) return CaptureResult::kFailed;
-        old_bmp_ = static_cast<HBITMAP>(SelectObject(mem_dc_, bmp_));
-        dibW_ = vw; dibH_ = vh;
+        const HGDIOBJ oldBitmap = SelectObject(mem_dc_, bmp_);
+        if (!oldBitmap || oldBitmap == HGDI_ERROR) {
+            DeleteObject(bmp_);
+            bmp_ = nullptr;
+            bits_ = nullptr;
+            return CaptureResult::kFailed;
+        }
+        old_bmp_ = static_cast<HBITMAP>(oldBitmap);
+        dibW_ = outputWidth;
+        dibH_ = outputHeight;
+        // DIB 尺寸改变后首帧必须进入编码器，不能复用旧尺寸的采样摘要。
+        hasGdiFingerprint_.fill(false);
+    }
+    if (!bits_) {
+        return CaptureResult::kFailed;
     }
 
     // 使用虚拟桌面原点，避免有负坐标显示器时截取到错误区域。
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    if (!BitBlt(mem_dc_, 0, 0, vw, vh, gdi_dc_, vx, vy, SRCCOPY | CAPTUREBLT)) {
-        // GetDIBits 仅会读回当前 DIB 内容，不能作为屏幕采集失败后的替代方案。
+    const bool sameSize = outputWidth == ow && outputHeight == oh;
+    if (!sameSize) {
+        // COLORONCOLOR 是低延迟的近邻伸缩；远控更应优先降低复制量和首帧时间，
+        // 不使用会额外增加 CPU 的 HALFTONE 高质量缩放。
+        SetStretchBltMode(mem_dc_, COLORONCOLOR);
+    }
+    const auto gdiBltStartedAt = std::chrono::steady_clock::now();
+    const BOOL copied = sameSize
+        ? BitBlt(mem_dc_, 0, 0, outputWidth, outputHeight, gdi_dc_, vx + ox, vy + oy,
+                 SRCCOPY | CAPTUREBLT)
+        : StretchBlt(mem_dc_, 0, 0, outputWidth, outputHeight, gdi_dc_, vx + ox, vy + oy,
+                     ow, oh, SRCCOPY | CAPTUREBLT);
+    out.gdiBltUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - gdiBltStartedAt).count());
+    if (!copied) {
         RecordGdiCaptureFailure(GetLastError());
         return CaptureResult::kFailed;
     }
@@ -1085,29 +1163,39 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
     // 指针即可保持锁屏和多屏回退路径也有相同的浏览器叠加反馈。
     UpdatePointerFromSystem();
 
-    // 确定输出区域:全部虚拟屏幕或指定显示器。
-    int ox = 0, oy = 0, ow = vw, oh = vh;
-    const int selectedMonitor = selectedMonitor_.load();
-    const std::vector<MonitorInfo> monitors = MonitorsSnapshot();
-    if (selectedMonitor >= 0 && selectedMonitor < static_cast<int>(monitors.size())) {
-        const auto& m = monitors[selectedMonitor];
-        ox = m.x; oy = m.y; ow = m.w; oh = m.h;
-    }
-
     const auto* src = static_cast<const uint8_t*>(bits_);
     const auto now = std::chrono::steady_clock::now();
-    const uint64_t fingerprint = FingerprintBgraRegion(src, static_cast<size_t>(vw) * 4,
-                                                       ox, oy, ow, oh);
+    constexpr size_t kSampleStrideBytes = 64;
+    bool fingerprintChanged = false;
+    for (size_t phase = 0; phase < kGdiFingerprintPhaseCount; ++phase) {
+        const uint64_t fingerprint = FingerprintBgraRegion(
+            src, static_cast<size_t>(outputWidth) * 4, 0, 0, outputWidth, outputHeight,
+            phase * (kSampleStrideBytes / kGdiFingerprintPhaseCount));
+        fingerprintChanged = fingerprintChanged || !hasGdiFingerprint_[phase] ||
+            fingerprint != gdiFingerprints_[phase];
+        // 无论本次是否推帧，都更新所有相位的基线。这样真实变化只会触发一张
+        // 编码帧，后续采样不会拿着变化前的其他相位摘要再次误判为新变化。
+        gdiFingerprints_[phase] = fingerprint;
+        hasGdiFingerprint_[phase] = true;
+    }
     const bool refreshDue = lastGdiFullFrameAt_.time_since_epoch().count() == 0 ||
         now - lastGdiFullFrameAt_ >= std::chrono::seconds(1);
-    if (!forceFrame && hasGdiFingerprint_ && fingerprint == gdiFingerprint_ && !refreshDue) {
+    if (!forceFrame && !fingerprintChanged && !refreshDue) {
         return CaptureResult::kNoChange;
     }
-    gdiFingerprint_ = fingerprint;
-    hasGdiFingerprint_ = true;
 
-    // 原始 DIB 已确认有变化（或到达兜底刷新时间）后才裁剪、缩放并分配输出帧。
-    CopyRegionToFrame(src, static_cast<size_t>(vw) * 4, ox, oy, ow, oh, out);
+    // DIB 已是最终尺寸，只需一次顺序复制给编码器。相比旧路径省去完整虚拟桌面
+    // DIB、CPU 裁剪和逐像素缩放，锁屏/跨显卡多屏的内存带宽显著下降。
+    out.width = outputWidth;
+    out.height = outputHeight;
+    // GDI 的最终 DIB 只由本采集线程读写：本轮编码会在下一次 BitBlt 前同步完成，
+    // 因此可直接借用 DIB 给 H.264 的 BGRA->NV12 或 WIC JPEG 输入，省去每帧整张
+    // BGRA 副本。CaptureFrame 下一轮开始和异常路径均会统一 ReleaseFrame 清除借用。
+    out.data.clear();
+    out.mappedPixels = src;
+    out.mappedStrideBytes = static_cast<size_t>(outputWidth) * 4;
+    out.borrowedGdiPixels = true;
+    out.nv12Texture.Reset();
     lastGdiFullFrameAt_ = now;
     width_ = out.width;
     height_ = out.height;
@@ -1117,6 +1205,7 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
 void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                                 int x, int y, int width, int height,
                                 CapturedFrame& out) {
+    const auto copyStartedAt = std::chrono::steady_clock::now();
     const double scale = std::min(1.0, std::min(
         static_cast<double>(maxOutputWidth_) / width,
         static_cast<double>(maxOutputHeight_) / height));
@@ -1131,6 +1220,7 @@ void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
     out.height = outputHeight;
     out.mappedPixels = nullptr;
     out.mappedStrideBytes = 0;
+    out.borrowedGdiPixels = false;
     out.data.resize(static_cast<size_t>(outputWidth) * outputHeight * 4);
 
     if (outputWidth == width && outputHeight == height) {
@@ -1140,6 +1230,9 @@ void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
             std::memcpy(out.data.data() + static_cast<size_t>(row) * width * 4,
                         sourceRow, static_cast<size_t>(width) * 4);
         }
+        out.cpuCopyOrScaleUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - copyStartedAt).count());
         return;
     }
 
@@ -1154,22 +1247,39 @@ void Capture::CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
         scaleMapX_.resize(static_cast<size_t>(outputWidth));
         scaleMapY_.resize(static_cast<size_t>(outputHeight));
         for (int outputX = 0; outputX < outputWidth; ++outputX) {
-            scaleMapX_[outputX] = outputX * width / outputWidth;
+            scaleMapX_[outputX] = static_cast<size_t>(outputX) *
+                static_cast<size_t>(width) / static_cast<size_t>(outputWidth) * 4;
         }
         for (int outputY = 0; outputY < outputHeight; ++outputY) {
             scaleMapY_[outputY] = outputY * height / outputHeight;
         }
     }
+    const size_t regionXBytes = static_cast<size_t>(x) * 4;
+    const bool integralHorizontalScale = width % outputWidth == 0;
+    const size_t sourceStepBytes = integralHorizontalScale
+        ? static_cast<size_t>(width / outputWidth) * 4
+        : 0;
     for (int outputY = 0; outputY < outputHeight; ++outputY) {
         const int sourceY = y + scaleMapY_[outputY];
         uint8_t* destination = out.data.data() + static_cast<size_t>(outputY) * outputWidth * 4;
-        for (int outputX = 0; outputX < outputWidth; ++outputX) {
-            const int sourceX = x + scaleMapX_[outputX];
-            const uint8_t* pixel = source + static_cast<size_t>(sourceY) * sourceStrideBytes +
-                static_cast<size_t>(sourceX) * 4;
-            std::memcpy(destination + static_cast<size_t>(outputX) * 4, pixel, 4);
+        const uint8_t* sourceRow = source + static_cast<size_t>(sourceY) * sourceStrideBytes +
+            regionXBytes;
+        uint8_t* destinationPixel = destination;
+        if (integralHorizontalScale) {
+            const uint8_t* pixel = sourceRow;
+            for (int outputX = 0; outputX < outputWidth;
+                 ++outputX, pixel += sourceStepBytes, destinationPixel += 4) {
+                std::memcpy(destinationPixel, pixel, 4);
+            }
+        } else {
+            for (int outputX = 0; outputX < outputWidth; ++outputX, destinationPixel += 4) {
+                std::memcpy(destinationPixel, sourceRow + scaleMapX_[outputX], 4);
+            }
         }
     }
+    out.cpuCopyOrScaleUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - copyStartedAt).count());
 }
 
 bool Capture::MapNormalizedToVirtual(double x, double y, double& virtualX, double& virtualY) const {

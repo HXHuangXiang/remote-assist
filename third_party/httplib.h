@@ -3886,10 +3886,21 @@ public:
   ~WebSocket();
 
   ReadResult read(std::string &msg);
+  // 在指定的绝对时间预算内读取一条应用消息。Ping/Pong 等控制帧不会重置预算，
+  // 适合服务端限制“连接后必须立即发送认证首帧”这类场景。
+  ReadResult read_with_timeout(std::string &msg,
+                               std::chrono::milliseconds timeout);
+  // 调整后续 read 的空闲超时。服务端可在短认证时限通过后恢复正常会话时限。
+  void set_read_timeout(time_t sec, time_t usec = 0);
   bool send(const std::string &data);
   bool send(const char *data, size_t len);
   void close(CloseStatus status = CloseStatus::Normal,
              const std::string &reason = "");
+  // Immediately interrupt a blocking read/write without performing the WebSocket
+  // close handshake. This is intended for server shutdown code that runs on a
+  // thread other than the connection handler: close() itself reads the peer's
+  // Close response and therefore must not race with read().
+  void abort();
   const Request &request() const;
   bool is_open() const;
 
@@ -3919,6 +3930,9 @@ private:
 
   void start_heartbeat();
   bool send_frame(Opcode op, const char *data, size_t len, bool fin = true);
+  ReadResult read_impl(
+      std::string &msg,
+      const std::chrono::steady_clock::time_point *deadline);
 
   Stream &strm_;
   std::unique_ptr<Stream> owned_strm_;
@@ -20369,13 +20383,46 @@ inline bool WebSocket::send_frame(Opcode op, const char *data, size_t len,
 }
 
 inline ReadResult WebSocket::read(std::string &msg) {
+  return read_impl(msg, nullptr);
+}
+
+inline ReadResult WebSocket::read_with_timeout(
+    std::string &msg, std::chrono::milliseconds timeout) {
+  if (timeout.count() <= 0) { return Fail; }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  return read_impl(msg, &deadline);
+}
+
+inline void WebSocket::set_read_timeout(time_t sec, time_t usec) {
+  strm_.set_read_timeout(sec, usec);
+}
+
+inline ReadResult WebSocket::read_impl(
+    std::string &msg,
+    const std::chrono::steady_clock::time_point *deadline) {
+  // Socket timeout 本身会在每个底层 read 后重新开始。认证阶段若只依赖它，持续
+  // Ping/Pong 的连接仍能无限占用 handler；因此在处理每个 frame 前重算同一绝对
+  // deadline，控制帧和分片都不能延长应用层等待时间。
+  const auto read_frame = [this, deadline](Opcode &opcode,
+                                           std::string &payload, bool &fin) {
+    if (deadline) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+          *deadline - std::chrono::steady_clock::now()).count();
+      if (remaining <= 0) { return false; }
+      const auto sec = static_cast<time_t>(remaining / 1000000);
+      const auto usec = static_cast<time_t>(remaining % 1000000);
+      strm_.set_read_timeout(sec, usec);
+    }
+    return impl::read_websocket_frame(strm_, opcode, payload, fin, is_server_,
+                                      CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH);
+  };
+
   while (!closed_) {
     Opcode opcode;
     std::string payload;
     bool fin;
 
-    if (!impl::read_websocket_frame(strm_, opcode, payload, fin, is_server_,
-                                    CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH)) {
+    if (!read_frame(opcode, payload, fin)) {
       closed_ = true;
       return Fail;
     }
@@ -20412,9 +20459,7 @@ inline ReadResult WebSocket::read(std::string &msg) {
           Opcode cont_opcode;
           std::string cont_payload;
           bool cont_fin;
-          if (!impl::read_websocket_frame(
-                  strm_, cont_opcode, cont_payload, cont_fin, is_server_,
-                  CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH)) {
+          if (!read_frame(cont_opcode, cont_payload, cont_fin)) {
             closed_ = true;
             return Fail;
           }
@@ -20501,6 +20546,16 @@ inline void WebSocket::close(CloseStatus status, const std::string &reason) {
   }
 }
 
+inline void WebSocket::abort() {
+  // This path deliberately does not emit a Close frame or attempt to read the
+  // peer response. An external server-stop thread can call it while the
+  // WebSocket handler is blocked in read(); running the close handshake there
+  // would create two concurrent readers on the same Stream.
+  if (closed_.exchange(true)) { return; }
+  ping_cv_.notify_all();
+  detail::shutdown_socket(strm_.socket());
+}
+
 inline WebSocket::~WebSocket() {
   {
     std::lock_guard<std::mutex> lock(ping_mutex_);
@@ -20522,7 +20577,10 @@ inline void WebSocket::start_heartbeat() {
       // opt-in liveness check controlled by max_missed_pongs_.
       if (max_missed_pongs_ > 0 && unacked_pings_ >= max_missed_pongs_) {
         lock.unlock();
-        close(CloseStatus::GoingAway, "pong timeout");
+        // read() is normally running on the connection handler thread. The
+        // heartbeat runs independently, so a graceful close handshake here
+        // would create a second concurrent reader on the same Stream.
+        abort();
         return;
       }
       lock.unlock();

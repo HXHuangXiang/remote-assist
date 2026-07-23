@@ -1,0 +1,22 @@
+# 统一仓库中的文本行尾，避免 Windows 的 core.autocrlf 把源码改动淹没在无意义
+# 的 LF/CRLF 提示中。MSVC、CMake、浏览器资源均可直接使用 LF；批处理保留 CRLF，
+# 兼容直接双击和 cmd.exe 运行。
+* text=auto
+
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.rc text eol=lf
+*.manifest text eol=lf
+*.bat text eol=crlf

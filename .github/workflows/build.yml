@@ -11,11 +11,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Configure (CMake + VS18 x64)
+      - name: Configure (CMake + VS2022 x64)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force build | Out-Null
-          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 *>&1 |
+          # windows-latest 当前提供的是 Visual Studio 2022。显式使用 VS17，避免
+          # 因未来尚未安装的生成器名称导致配置阶段直接失败。
+          Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 *>&1 |
             Tee-Object -FilePath build/configure.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build (Release)
@@ -24,11 +26,24 @@ jobs:
           cmake --build build --config Release --parallel *>&1 |
             Tee-Object -FilePath build/build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Validate control page and binary size
+      - name: Test pure core logic
         shell: pwsh
         run: |
+          ctest --test-dir build -C Release --output-on-failure *>&1 |
+            Tee-Object -FilePath build/test.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install and validate package
+        shell: pwsh
+        run: |
+          # 不能复用仓库中的 dist/，其中的本地调试脚本不属于发布包。通过 CMake
+          # install 生成最终目录，也能覆盖校验 install() 规则是否遗漏网页资源。
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          cmake --install build --config Release --prefix dist *>&1 |
+            Tee-Object -FilePath build/install.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check web/app.js
-          $exe = Get-Item build/Release/RemoteAssist.exe -ErrorAction Stop
+          $exe = Get-Item dist/RemoteAssist.exe -ErrorAction Stop
+          Get-Item dist/web/index.html, dist/web/app.js, dist/web/app.css -ErrorAction Stop | Out-Null
           $maxBytes = 8MB
           Write-Host "Release executable size: $($exe.Length) bytes"
           if ($exe.Length -ge $maxBytes) {
@@ -37,10 +52,8 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build/Release/RemoteAssist.exe dist/ -Force
-          Copy-Item -Recurse web dist/ -Force
-          Compress-Archive -Path dist/* -DestinationPath RemoteAssist.zip
+          Remove-Item RemoteAssist.zip -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist/* -DestinationPath RemoteAssist.zip -Force
       - name: Upload build diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -49,6 +62,8 @@ jobs:
           path: |
             build/configure.log
             build/build.log
+            build/test.log
+            build/install.log
             build/CMakeFiles/CMakeOutput.log
             build/CMakeFiles/CMakeError.log
           if-no-files-found: warn

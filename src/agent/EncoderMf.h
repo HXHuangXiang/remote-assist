@@ -25,6 +25,14 @@ struct EncodedChunk {
     uint64_t timestampUs = 0;
 };
 
+// CPU H.264 输入路径的分段耗时。MFT 实际编码与 Drain 已由 Agent 的 encode_avg_ms
+// 覆盖；这组数据专门识别 BGRA->NV12 转换和每帧 MF 输入对象创建是否成为回退热点。
+struct EncoderFrameTiming {
+    uint64_t bgraToNv12Us = 0;
+    uint64_t mfInputPreparationUs = 0;
+    uint64_t d3dInputWrapUs = 0;
+};
+
 enum class EncoderMode {
     kJpeg,
     kH264,
@@ -48,6 +56,8 @@ public:
     // BGRA->NV12 转换。失败由调用方重新初始化为已有 CPU 路径。
     bool EncodeD3D11(ID3D11Texture2D* nv12Texture, std::vector<EncodedChunk>& out);
     bool CanEncodeD3D11() const { return d3dInputEnabled_; }
+    // 仅由编码所在的采集线程在 Encode/EncodeD3D11 返回后读取。
+    const EncoderFrameTiming& LastFrameTiming() const { return lastFrameTiming_; }
     std::string CodecString() const;
     // 由采集线程在新控制端、切屏或解码恢复后调用。请求会保持到编码器实际输出
     // IDR 为止，避免把无法独立解码的增量帧作为新流首帧发送。
@@ -55,6 +65,10 @@ public:
     // 在支持 ICodecAPI 的 H.264 MFT 上动态调整目标码率。硬件驱动若仅支持初始化
     // 时设置会返回 false，调用方应安全退回到仅调整采集 FPS。
     bool UpdateBitrate(int bitrateBps);
+    // 当前 H.264 MFT 在首帧恢复窗口内持续不给出 IDR 时，主动切换到已经验证的
+    // JPEG 路径，避免控制端因一直丢弃预测帧而长期黑屏。仅能由拥有 MFT 的采集
+    // 线程调用；下一次重建编码器后仍会重新尝试系统 H.264。
+    bool ForceJpegFallback();
     // H.264 SPS 的 profile_idc/profile_compatibility/level_idc，格式为 0xPPCCLL。
     // 仅由采集线程读取；跨线程下发配置时应由 Agent 保存其副本。
     uint32_t H264CodecProfile() const { return h264CodecProfile_; }
@@ -125,6 +139,7 @@ private:
     std::vector<uint8_t> h264Pps_;
     uint32_t h264CodecProfile_ = 0x42E01E;  // Baseline 3.0 的保守初值。
     bool keyFrameRequested_ = true;
+    EncoderFrameTiming lastFrameTiming_{};
 };
 
 }  // namespace remote_assist

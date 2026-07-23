@@ -17,8 +17,8 @@ rem 不能把普通用户可写目录中的文件注册为 LocalSystem 服务。
 rem RemoteAssist.exe 内置的 ACL 校验；失败时不执行任何 sc 操作。
 "%EXE%" --check-service-install-dir
 if errorlevel 1 (
-  echo 当前目录不适合安装 LocalSystem 服务：其中的 exe、web 或父目录可被非管理员改写。
-  echo 请将整个 dist 目录放到仅管理员和 LocalSystem 可写的本机固定磁盘目录后重试。
+  echo 当前目录不适合安装 LocalSystem 服务：其中资源可被非管理员改写，或 LocalSystem 权限不足。
+  echo 请将整个 dist 目录放到管理员和 LocalSystem 均可访问的本机固定磁盘目录后重试。
   pause
   exit /b 1
 )

@@ -14,7 +14,8 @@ struct ServiceInstallPathValidation {
 
 // 检查 exe、同级 web/ 资源树、已有配置/日志/首次密码提示及到卷根的目录链：拒绝
 // 重解析点、网络/可移动卷、空 DACL、非管理员所有者和可由非管理员身份改写的
-// 访问控制项。首次运行尚不存在的运行产物会保留给正常初始化流程创建。
+// 访问控制项；同时验证 LocalSystem 具备读取映像/网页、创建运行产物及读写已有
+// 配置锁和日志的最小权限。首次运行尚不存在的运行产物会保留给正常初始化流程创建。
 ServiceInstallPathValidation ValidateServiceInstallPath(const std::wstring& exePath);
 
 }  // namespace remote_assist

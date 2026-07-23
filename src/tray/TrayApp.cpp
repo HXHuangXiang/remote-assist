@@ -1,12 +1,11 @@
 #include "tray/TrayApp.h"
 
 #include "common/Config.h"
+#include "common/InitialPasswordChannel.h"
 #include "common/Log.h"
 #include "common/Path.h"
 #include "common/RuntimeNames.h"
 
-#include <fstream>
-#include <iterator>
 #include <string>
 
 #pragma comment(lib, "shell32.lib")
@@ -24,45 +23,39 @@ constexpr UINT kMenuCommandAbout = 1003;
 constexpr UINT kMenuCommandExit = 1004;
 constexpr const wchar_t* kClassName = L"RemoteAssistTrayWindow";
 
-// 读取并删除 .initial-password 文件(由 service 首次生成密码时写入)。
-std::wstring ReadAndDeleteInitialPassword() {
-    const std::wstring configDir = ConfigDir();
-    if (configDir.empty()) {
-        log::Warn("tray cannot resolve configuration directory");
-        return {};
-    }
-    const std::wstring path = configDir + L"\\.initial-password";
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        return {};
-    }
-    const std::string s((std::istreambuf_iterator<char>(f)),
-                        std::istreambuf_iterator<char>());
-    f.close();
-    DeleteFileW(path.c_str());
-    if (s.empty()) {
+// 从 Service 创建的短生命周期共享内存读取 UTF-8 密码。失败仅影响首次密码提示，
+// 不阻止 Tray 图标和设置窗口正常启动。
+std::wstring ReadInitialPassword(const std::wstring& channelName) {
+    std::string utf8Password;
+    if (!ReadInitialPasswordChannel(channelName, utf8Password)) {
         return {};
     }
     const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                           s.data(), static_cast<int>(s.size()),
+                                           utf8Password.data(),
+                                           static_cast<int>(utf8Password.size()),
                                            nullptr, 0);
     if (length <= 0) {
-        log::Warn("initial password hint is not valid UTF-8");
+        log::Warn("initial password channel is not valid UTF-8");
         return {};
     }
-    std::wstring password(static_cast<size_t>(length), L'\0');
+    std::wstring widePassword(static_cast<size_t>(length), L'\0');
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                            s.data(), static_cast<int>(s.size()), password.data(), length) != length) {
-        log::Warn("initial password hint UTF-8 conversion failed");
+                            utf8Password.data(), static_cast<int>(utf8Password.size()),
+                            widePassword.data(), length) != length) {
+        log::Warn("initial password channel UTF-8 conversion failed");
         return {};
     }
-    return password;
+    return widePassword;
 }
 
 }  // namespace
 
 TrayApp::~TrayApp() {
     RemoveIcon();
+    if (!password_.empty()) {
+        SecureZeroMemory(password_.data(), password_.size() * sizeof(wchar_t));
+        password_.clear();
+    }
     if (instanceMutex_) {
         CloseHandle(instanceMutex_);
         instanceMutex_ = nullptr;
@@ -216,15 +209,23 @@ void TrayApp::OpenSetupWindow() {
 
 void TrayApp::ShowPasswordDialog() {
     std::wstring msg;
+    const bool hasInitialPassword = !password_.empty();
     if (password_.empty()) {
         msg = L"首次密码已展示过或非首次启动。选择“打开配置窗口”可设置新密码。";
     } else {
-        const Config cfg = LoadOrCreateConfig();
+        Config cfg;
+        const bool configLoaded = LoadConfigReadOnly(cfg);
         msg = L"访问密码(仅本次显示,请妥善保存):\n\n" + password_ +
-              L"\n\n浏览器打开 http://<本机IP>:" + std::to_wstring(cfg.port) +
-              L"/ 后输入此密码连接。";
+              (configLoaded
+                  ? L"\n\n浏览器打开 http://<本机IP>:" + std::to_wstring(cfg.port) +
+                        L"/ 后输入此密码连接。"
+                  : L"\n\n未能读取当前端口；请打开配置窗口确认端口后连接。");
     }
     MessageBoxW(hwnd_, msg.c_str(), L"RemoteAssist 访问密码", MB_OK | MB_ICONINFORMATION);
+    if (hasInitialPassword) {
+        SecureZeroMemory(password_.data(), password_.size() * sizeof(wchar_t));
+        password_.clear();
+    }
 }
 
 void TrayApp::RemoveIcon() {
@@ -239,8 +240,10 @@ void TrayApp::RemoveIcon() {
     }
 }
 
-int TrayApp::Run() {
-    log::Init(LogDir(), L"tray.log");
+int TrayApp::Run(const std::wstring& initialPasswordChannel) {
+    // Tray 使用 Explorer 的普通用户 token，安全安装目录不授予写权限。日志由
+    // LocalSystem 服务通过受控管道转存到同级 logs/tray.log，避免为了诊断放宽 ACL。
+    log::InitPipeSink(runtime::kTrayLogPipeName);
     log::Info("tray starting");
 
     // 保持 mutex 所有权，供 ServiceHost 在没有受管 tray 子进程时识别外部
@@ -258,7 +261,7 @@ int TrayApp::Run() {
         return 0;
     }
 
-    password_ = ReadAndDeleteInitialPassword();
+    password_ = ReadInitialPassword(initialPasswordChannel);
 
     taskbarCreatedMessage_ = RegisterWindowMessageW(L"TaskbarCreated");
     if (!CreateIcon()) {

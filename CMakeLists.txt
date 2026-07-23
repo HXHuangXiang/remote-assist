@@ -17,8 +17,8 @@ add_compile_definitions(
     _WIN32_WINNT=0x0A00 WINVER=0x0A00
     _CRT_SECURE_NO_WARNINGS
     _CRT_NONSTDC_NO_WARNINGS
-    # 该服务只承载一个控制端。收紧 httplib 的默认资源上限并让 WebSocket
-    # 在服务停止时可在较短时间内退出，而不是使用其 300 秒默认读超时。
+    # 该服务只承载一个控制端。收紧 httplib 的默认资源上限；认证阶段另有
+    # 绝对 2 秒时限，认证完成后恢复 5 秒底层读取与 2 秒 heartbeat。
     CPPHTTPLIB_THREAD_POOL_COUNT=4
     CPPHTTPLIB_THREAD_POOL_MAX_COUNT=8
     CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH=8192
@@ -37,6 +37,7 @@ set(SOURCES
     src/main.cpp
     src/RemoteAssist.rc
     src/common/Config.cpp
+    src/common/InitialPasswordChannel.cpp
     src/common/Log.cpp
     src/common/Path.cpp
     src/common/ServiceInstallSecurity.cpp
@@ -84,3 +85,51 @@ endif()
 # 既满足便携部署，也避免 service 从 bin/ 启动后找不到 share/ 下的网页资源。
 install(TARGETS RemoteAssist RUNTIME DESTINATION .)
 install(DIRECTORY web/ DESTINATION web)
+
+include(CTest)
+if(BUILD_TESTING)
+    # 质量档位与 H.264 发送窗口不依赖 Windows 服务、DXGI 或浏览器，可在 CI 的
+    # 构建机直接验证。复杂桌面路径仍以 Windows 实机回归为准。
+    add_executable(RemoteAssistTests
+        tests/StreamQualityTests.cpp
+    )
+    target_include_directories(RemoteAssistTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    if(MSVC)
+        target_compile_options(RemoteAssistTests PRIVATE
+            /W4 /permissive- /utf-8 /Zc:__cplusplus /Zc:preprocessor
+        )
+        set_property(TARGET RemoteAssistTests PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    else()
+        target_compile_options(RemoteAssistTests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME RemoteAssist.CoreLogic COMMAND RemoteAssistTests)
+
+    # 密码迁移依赖 Windows CNG 和 exe 同目录的原子配置写入。测试目标放到构建
+    # 目录下独立 tests/ 位置，避免创建或清理用户实际部署目录的 config.json。
+    add_executable(RemoteAssistConfigTests
+        tests/ConfigTests.cpp
+        src/common/Config.cpp
+        src/common/Log.cpp
+        src/common/Path.cpp
+    )
+    target_include_directories(RemoteAssistConfigTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    )
+    target_link_libraries(RemoteAssistConfigTests PRIVATE bcrypt)
+    set_target_properties(RemoteAssistConfigTests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    if(MSVC)
+        target_compile_options(RemoteAssistConfigTests PRIVATE
+            /W4 /permissive- /utf-8 /Zc:__cplusplus /Zc:preprocessor
+        )
+        set_property(TARGET RemoteAssistConfigTests PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    else()
+        target_compile_options(RemoteAssistConfigTests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME RemoteAssist.ConfigMigration COMMAND RemoteAssistConfigTests)
+endif()

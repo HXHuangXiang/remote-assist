@@ -6,6 +6,7 @@
 #include <tlhelp32.h>
 #include <userenv.h>
 #include <wtsapi32.h>
+#include <sddl.h>
 
 #include <array>
 #include <vector>
@@ -63,6 +64,57 @@ DWORD FindActiveInteractiveSessionId() {
     }
     WTSFreeMemory(sessions);
     return fallbackSession != kInvalidSessionId ? fallbackSession : consoleSession;
+}
+
+bool GetSessionUserSidString(DWORD sessionId, std::wstring& sidString) {
+    sidString.clear();
+    if (sessionId == kInvalidSessionId) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    HANDLE token = nullptr;
+    if (!WTSQueryUserToken(sessionId, &token)) {
+        log::Warn("WTSQueryUserToken failed for session=" + std::to_string(sessionId) +
+                  ": " + std::to_string(GetLastError()));
+        return false;
+    }
+
+    DWORD tokenUserBytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &tokenUserBytes);
+    const DWORD sizeError = GetLastError();
+    if (tokenUserBytes == 0 || sizeError != ERROR_INSUFFICIENT_BUFFER) {
+        log::Warn("TokenUser size query failed for session=" + std::to_string(sessionId) +
+                  ": " + std::to_string(sizeError));
+        CloseHandle(token);
+        SetLastError(sizeError);
+        return false;
+    }
+    std::vector<BYTE> tokenUserBuffer(tokenUserBytes);
+    if (!GetTokenInformation(token, TokenUser, tokenUserBuffer.data(), tokenUserBytes,
+                             &tokenUserBytes)) {
+        const DWORD error = GetLastError();
+        log::Warn("TokenUser query failed for session=" + std::to_string(sessionId) +
+                  ": " + std::to_string(error));
+        CloseHandle(token);
+        SetLastError(error);
+        return false;
+    }
+
+    const auto* tokenUser = reinterpret_cast<const TOKEN_USER*>(tokenUserBuffer.data());
+    LPWSTR sidText = nullptr;
+    if (!ConvertSidToStringSidW(tokenUser->User.Sid, &sidText)) {
+        const DWORD error = GetLastError();
+        log::Warn("ConvertSidToStringSid failed for session=" + std::to_string(sessionId) +
+                  ": " + std::to_string(error));
+        CloseHandle(token);
+        SetLastError(error);
+        return false;
+    }
+    sidString = sidText;
+    LocalFree(sidText);
+    CloseHandle(token);
+    return !sidString.empty();
 }
 
 // Agent 需要使用真实 winlogon 的 LocalSystem token 才能在锁屏 input desktop 上稳定
@@ -160,7 +212,9 @@ bool LaunchChildWithProcessToken(DWORD srcPid, const std::wstring& commandLine,
         } else {
             CloseHandle(pi.hProcess);
         }
-        log::Info("launched child: " + Utf8FromWide(commandLine));
+        // commandLine 可能携带一次性共享内存名称等敏感的短期凭据；日志只保留
+        // 成功事实，角色和会话由上层调用点记录。
+        log::Info("child process launched");
     } else {
         log::Error("CreateProcessAsUserW failed: " + std::to_string(GetLastError()));
     }
@@ -187,21 +241,35 @@ bool LaunchAgentInConsoleSession(const std::wstring& exePath, HANDLE* processOut
         return false;
     }
     const std::wstring cmd = L"\"" + exePath + L"\" --agent --service-managed";
-    return LaunchChildWithProcessToken(winlogonPid, cmd, L"winsta0\\default", processOut);
+    const bool launched = LaunchChildWithProcessToken(winlogonPid, cmd, L"winsta0\\default",
+                                                       processOut);
+    if (launched) {
+        log::Info("agent launched in session=" + std::to_string(sid));
+    }
+    return launched;
 }
 
-bool LaunchTrayInConsoleSession(const std::wstring& exePath, HANDLE* processOut) {
-    const DWORD sid = FindActiveInteractiveSessionId();
-    if (sid == kInvalidSessionId) {
+bool LaunchTrayInSession(const std::wstring& exePath, DWORD sessionId,
+                         const std::wstring& initialPasswordChannel,
+                         HANDLE* processOut) {
+    if (sessionId == kInvalidSessionId) {
         return false;
     }
-    const DWORD explorerPid = FindProcessInSession(L"explorer.exe", sid);
+    const DWORD explorerPid = FindProcessInSession(L"explorer.exe", sessionId);
     if (!explorerPid) {
         log::Warn("explorer.exe not found in active interactive session, skip tray");
         return false;
     }
-    const std::wstring cmd = L"\"" + exePath + L"\" --tray";
-    return LaunchChildWithProcessToken(explorerPid, cmd, L"winsta0\\default", processOut);
+    std::wstring cmd = L"\"" + exePath + L"\" --tray";
+    if (!initialPasswordChannel.empty()) {
+        cmd += L" --initial-password-channel \"" + initialPasswordChannel + L"\"";
+    }
+    const bool launched = LaunchChildWithProcessToken(explorerPid, cmd, L"winsta0\\default",
+                                                       processOut);
+    if (launched) {
+        log::Info("tray launched in session=" + std::to_string(sessionId));
+    }
+    return launched;
 }
 
 }  // namespace remote_assist

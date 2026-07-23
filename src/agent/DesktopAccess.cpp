@@ -74,19 +74,19 @@ bool DesktopAccess::Bind() {
     return true;
 }
 
-bool DesktopAccess::CheckRebind() {
+DesktopRebindResult DesktopAccess::CheckRebind() {
     const DWORD currentThreadId = GetCurrentThreadId();
     if (h_desk_ && owner_thread_id_ != currentThreadId) {
         log::Error("DesktopAccess rebind requested from a different thread");
-        return false;
+        return DesktopRebindResult::kFailed;
     }
     if (!h_desk_) {
-        return Bind();
+        return Bind() ? DesktopRebindResult::kRebound : DesktopRebindResult::kFailed;
     }
 
     const HDESK now = OpenInputDesktop(0, FALSE, GENERIC_ALL);
     if (!now) {
-        return false;
+        return DesktopRebindResult::kFailed;
     }
 
     // OpenInputDesktop 每次都会返回新的 handle，不能直接比较句柄值；桌面名
@@ -95,12 +95,12 @@ bool DesktopAccess::CheckRebind() {
     const bool sameDesktop = IsSameDesktopObject(h_desk_, now);
     if (sameDesktop) {
         CloseDesktop(now);
-        return false;
+        return DesktopRebindResult::kUnchanged;
     }
     if (!SetThreadDesktop(now)) {
         log::Warn("SetThreadDesktop on rebind failed: " + std::to_string(GetLastError()));
         CloseDesktop(now);
-        return false;
+        return DesktopRebindResult::kFailed;
     }
     if (h_desk_) {
         CloseDesktop(h_desk_);
@@ -108,7 +108,7 @@ bool DesktopAccess::CheckRebind() {
     h_desk_ = now;
     owner_thread_id_ = currentThreadId;
     log::Info("rebound desktop: " + Utf8FromWide(CurrentName()));
-    return true;
+    return DesktopRebindResult::kRebound;
 }
 
 std::wstring DesktopAccess::CurrentName() const {

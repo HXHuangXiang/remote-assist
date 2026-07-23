@@ -15,15 +15,33 @@ namespace remote_assist {
 
 namespace {
 
-// 这些权限足以替换服务映像、网页资源或其 DACL。文件与目录的 FILE_* 位有少量
-// 重叠（例如 FILE_WRITE_DATA/FILE_ADD_FILE），保留并集可同时覆盖两种对象。
-constexpr ACCESS_MASK kDangerousWriteAccess =
+// 服务映像目录、web/、配置和日志中的写权限都可能直接改变 LocalSystem 读取的
+// 内容，因此一律拒绝。祖先目录则不同：Windows 默认根目录有时会允许普通用户
+// “创建子目录/追加数据”，这不能修改已存在且受保护的 RemoteAssist 目录；只有能
+// 删除子项、改变 ACL/所有者或直接写祖先本身的权限才会形成替换风险。
+constexpr ACCESS_MASK kAlwaysDangerousWriteAccess =
     GENERIC_ALL | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | DELETE |
-    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
-    FILE_DELETE_CHILD;
+    FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD;
+constexpr ACCESS_MASK kTargetContentWriteAccess =
+    FILE_WRITE_DATA | FILE_APPEND_DATA;
 
-bool HasDangerousWriteAccess(ACCESS_MASK access) {
-    return (access & kDangerousWriteAccess) != 0;
+// 安装校验除了排除低权限可写，还必须确认真正运行服务的 LocalSystem 可以访问
+// 对应资源。仅校验“所有者是管理员”会放过管理员专属 ACL：图形安装可成功，但
+// LocalSystem 随后无法打开 config/.config.lock 或创建 logs，且日志自身也落不下去。
+constexpr ACCESS_MASK kSystemReadExecuteAccess =
+    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+constexpr ACCESS_MASK kSystemDirectoryCreateAccess =
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+constexpr ACCESS_MASK kSystemReadWriteAccess =
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+constexpr ACCESS_MASK kSystemRuntimeFileAccess =
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE;
+
+bool HasDangerousWriteAccess(ACCESS_MASK access, bool ancestorDirectory) {
+    if ((access & kAlwaysDangerousWriteAccess) != 0) {
+        return true;
+    }
+    return !ancestorDirectory && (access & kTargetContentWriteAccess) != 0;
 }
 
 bool IsSamePath(const std::wstring& left, const std::wstring& right) {
@@ -168,7 +186,44 @@ bool IsStandardAllowedAce(BYTE aceType) {
         aceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE;
 }
 
+bool HasRequiredLocalSystemAccess(PACL dacl, ACCESS_MASK requiredAccess,
+                                  const std::wstring& path, std::wstring& reason) {
+    if (requiredAccess == 0) {
+        return true;
+    }
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> sidBuffer{};
+    PSID systemSid = nullptr;
+    if (!CreateKnownSid(WinLocalSystemSid, sidBuffer, systemSid)) {
+        reason = L"无法创建 LocalSystem SID 用于 ACL 校验。";
+        return false;
+    }
+    TRUSTEE_W trustee{};
+    BuildTrusteeWithSidW(&trustee, systemSid);
+    ACCESS_MASK effectiveRights = 0;
+    if (GetEffectiveRightsFromAclW(dacl, &trustee, &effectiveRights) != ERROR_SUCCESS) {
+        reason = L"无法计算 LocalSystem 的有效 ACL 权限：" + path;
+        return false;
+    }
+
+    // GetEffectiveRightsFromAclW 会保留 DACL 中的 GENERIC_* 位。将两侧映射为
+    // 文件对象的具体访问位后再比较，避免“ACL 写 GENERIC_READ、需求写
+    // FILE_GENERIC_READ”时发生错误拒绝。
+    GENERIC_MAPPING mapping{};
+    mapping.GenericRead = FILE_GENERIC_READ;
+    mapping.GenericWrite = FILE_GENERIC_WRITE;
+    mapping.GenericExecute = FILE_GENERIC_EXECUTE;
+    mapping.GenericAll = FILE_ALL_ACCESS;
+    MapGenericMask(&effectiveRights, &mapping);
+    MapGenericMask(&requiredAccess, &mapping);
+    if ((effectiveRights & requiredAccess) == requiredAccess) {
+        return true;
+    }
+    reason = L"LocalSystem 对服务运行资源权限不足：" + path;
+    return false;
+}
+
 bool ValidateDacl(const std::wstring& path, const InstallerPrincipal& principal,
+                  bool ancestorDirectory, ACCESS_MASK requiredSystemAccess,
                   std::wstring& reason) {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     PSID owner = nullptr;
@@ -195,6 +250,10 @@ bool ValidateDacl(const std::wstring& path, const InstallerPrincipal& principal,
     }
     if (!dacl) {
         reason = L"路径使用空 DACL，所有帐户均可改写：" + path;
+        releaseDescriptor();
+        return false;
+    }
+    if (!HasRequiredLocalSystemAccess(dacl, requiredSystemAccess, path, reason)) {
         releaseDescriptor();
         return false;
     }
@@ -226,7 +285,7 @@ bool ValidateDacl(const std::wstring& path, const InstallerPrincipal& principal,
             releaseDescriptor();
             return false;
         }
-        if (HasDangerousWriteAccess(effectiveRights)) {
+        if (HasDangerousWriteAccess(effectiveRights, ancestorDirectory)) {
             reason = L"普通帐户组“" + AccountNameForSid(sid) +
                 L"”可改写路径：" + path;
             releaseDescriptor();
@@ -253,7 +312,7 @@ bool ValidateDacl(const std::wstring& path, const InstallerPrincipal& principal,
         }
         const ACCESS_MASK mask = *reinterpret_cast<const ACCESS_MASK*>(
             static_cast<const BYTE*>(rawAce) + sizeof(ACE_HEADER));
-        if (!HasDangerousWriteAccess(mask)) {
+        if (!HasDangerousWriteAccess(mask, ancestorDirectory)) {
             continue;
         }
         if (!IsStandardAllowedAce(header->AceType)) {
@@ -278,7 +337,8 @@ bool ValidateDacl(const std::wstring& path, const InstallerPrincipal& principal,
 }
 
 bool ValidateExistingObject(const std::wstring& path, const InstallerPrincipal& principal,
-                            std::wstring& reason) {
+                            std::wstring& reason, bool ancestorDirectory = false,
+                            ACCESS_MASK requiredSystemAccess = 0) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         reason = L"安装所需路径不存在：" + path;
@@ -288,7 +348,7 @@ bool ValidateExistingObject(const std::wstring& path, const InstallerPrincipal& 
         reason = L"安装路径不能包含符号链接或其他重解析点：" + path;
         return false;
     }
-    return ValidateDacl(path, principal, reason);
+    return ValidateDacl(path, principal, ancestorDirectory, requiredSystemAccess, reason);
 }
 
 bool IsMissingPathError(DWORD error) {
@@ -296,8 +356,9 @@ bool IsMissingPathError(DWORD error) {
 }
 
 bool ValidateDirectoryTree(const std::wstring& directory, const wchar_t* resourceName,
-                           const InstallerPrincipal& principal, std::wstring& reason) {
-    if (!ValidateExistingObject(directory, principal, reason)) {
+                           const InstallerPrincipal& principal, ACCESS_MASK requiredSystemAccess,
+                           std::wstring& reason) {
+    if (!ValidateExistingObject(directory, principal, reason, false, requiredSystemAccess)) {
         return false;
     }
     const DWORD attributes = GetFileAttributesW(directory.c_str());
@@ -324,11 +385,13 @@ bool ValidateDirectoryTree(const std::wstring& directory, const wchar_t* resourc
             break;
         }
         if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            if (!ValidateDirectoryTree(child, resourceName, principal, reason)) {
+            if (!ValidateDirectoryTree(child, resourceName, principal, requiredSystemAccess,
+                                       reason)) {
                 valid = false;
                 break;
             }
-        } else if (!ValidateExistingObject(child, principal, reason)) {
+        } else if (!ValidateExistingObject(child, principal, reason, false,
+                                           requiredSystemAccess)) {
             valid = false;
             break;
         }
@@ -346,7 +409,8 @@ bool ValidateDirectoryTree(const std::wstring& directory, const wchar_t* resourc
 // 由正常的配置/日志初始化流程创建。这样既不会阻止全新安装，也能拒绝预置的链接、
 // 目录伪装或低权限可写文件。
 bool ValidateOptionalRegularFile(const std::wstring& path, const wchar_t* resourceName,
-                                 const InstallerPrincipal& principal, std::wstring& reason) {
+                                 const InstallerPrincipal& principal,
+                                 ACCESS_MASK requiredSystemAccess, std::wstring& reason) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         if (IsMissingPathError(GetLastError())) {
@@ -359,11 +423,12 @@ bool ValidateOptionalRegularFile(const std::wstring& path, const wchar_t* resour
         reason = std::wstring(resourceName) + L"不是普通文件：" + path;
         return false;
     }
-    return ValidateExistingObject(path, principal, reason);
+    return ValidateExistingObject(path, principal, reason, false, requiredSystemAccess);
 }
 
 bool ValidateOptionalDirectoryTree(const std::wstring& path, const wchar_t* resourceName,
-                                   const InstallerPrincipal& principal, std::wstring& reason) {
+                                   const InstallerPrincipal& principal,
+                                   ACCESS_MASK requiredSystemAccess, std::wstring& reason) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         if (IsMissingPathError(GetLastError())) {
@@ -376,7 +441,7 @@ bool ValidateOptionalDirectoryTree(const std::wstring& path, const wchar_t* reso
         reason = std::wstring(resourceName) + L"不是目录：" + path;
         return false;
     }
-    return ValidateDirectoryTree(path, resourceName, principal, reason);
+    return ValidateDirectoryTree(path, resourceName, principal, requiredSystemAccess, reason);
 }
 
 }  // namespace
@@ -409,12 +474,27 @@ ServiceInstallPathValidation ValidateServiceInstallPath(const std::wstring& exeP
         return validation;
     }
 
-    // exe 目录到卷根的任一环节可由低权限帐户删除/替换，都会使同级服务映像或
-    // web/ 资源失去可信边界，因此逐层验证。
-    std::wstring current = exeDirectory;
+    // 安装目录本身包含服务映像、web/ 和运行产物，必须按严格文件内容权限验证。
+    // 它之上的祖先目录则只需拒绝“能替换既有子项”的权限，不能把 Windows 默认
+    // 根目录的“允许创建新目录”误判为可改写本安装目录。
+    if (!ValidateExistingObject(exeDirectory, principal, validation.reason, false,
+                                kSystemDirectoryCreateAccess)) {
+        return validation;
+    }
+    const DWORD directoryAttributes = GetFileAttributesW(exeDirectory.c_str());
+    if ((directoryAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        validation.reason = L"RemoteAssist.exe 所在路径不是目录：" + exeDirectory;
+        return validation;
+    }
+
+    std::wstring current = ParentDirectory(exeDirectory);
     const std::wstring root(volumeRoot);
+    if (current.empty()) {
+        validation.reason = L"无法完整验证安装目录的父目录链。";
+        return validation;
+    }
     for (;;) {
-        if (!ValidateExistingObject(current, principal, validation.reason)) {
+        if (!ValidateExistingObject(current, principal, validation.reason, true)) {
             return validation;
         }
         if (IsSamePath(current, root)) {
@@ -432,26 +512,34 @@ ServiceInstallPathValidation ValidateServiceInstallPath(const std::wstring& exeP
         validation.reason = L"RemoteAssist.exe 文件不存在或不是普通文件。";
         return validation;
     }
-    if (!ValidateExistingObject(exePath, principal, validation.reason)) {
+    if (!ValidateExistingObject(exePath, principal, validation.reason, false,
+                                kSystemReadExecuteAccess)) {
         return validation;
     }
     if (!ValidateDirectoryTree(JoinPath(exeDirectory, L"web"), L"网页资源目录",
-                               principal, validation.reason)) {
+                               principal, kSystemReadExecuteAccess, validation.reason)) {
         return validation;
     }
     // 配置、日志和首次密码提示都由 LocalSystem 服务从 exe 同级目录读取或写入。
     // 新安装时这些运行产物尚不存在；若用户已运行过便携模式，则必须在注册高
     // 权限服务前确认它们同样不是链接、目录伪装或低权限可写对象。
     if (!ValidateOptionalRegularFile(JoinPath(exeDirectory, L"config.json"), L"配置文件",
-                                     principal, validation.reason)) {
+                                     principal, kSystemReadExecuteAccess, validation.reason)) {
         return validation;
     }
     if (!ValidateOptionalDirectoryTree(JoinPath(exeDirectory, L"logs"), L"日志目录",
-                                       principal, validation.reason)) {
+                                       principal, kSystemRuntimeFileAccess, validation.reason)) {
+        return validation;
+    }
+    // ConfigFileLock 使用同级 .config.lock 跨 Session 排他。若便携运行遗留了由
+    // 普通用户控制的锁文件，LocalSystem 会在服务启动时被拒绝或永久等待，因此必须
+    // 在注册服务前和 config.json 一样验证其对象类型、重解析点与 ACL。
+    if (!ValidateOptionalRegularFile(JoinPath(exeDirectory, L".config.lock"), L"配置锁文件",
+                                     principal, kSystemReadWriteAccess, validation.reason)) {
         return validation;
     }
     if (!ValidateOptionalRegularFile(JoinPath(exeDirectory, L".initial-password"),
-                                     L"首次密码提示文件", principal, validation.reason)) {
+                                     L"首次密码提示文件", principal, DELETE, validation.reason)) {
         return validation;
     }
 

@@ -141,8 +141,9 @@ bool Input::SendWheel(int delta) {
     return SendInput(1, &in, sizeof(INPUT)) == 1;
 }
 
-void Input::ReleaseAll() {
+bool Input::ReleaseAll() {
     std::lock_guard<std::mutex> lock(g_inputState.mutex);
+    bool allReleased = true;
     for (size_t index = 0; index < g_inputState.keys.size(); ++index) {
         if (!g_inputState.keys[index]) {
             continue;
@@ -151,21 +152,36 @@ void Input::ReleaseAll() {
         const USHORT scancode = static_cast<USHORT>(index & 0x7F);
         if (!SendRawKey(scancode, false, extended)) {
             log::Warn("SendInput key release failed: " + std::to_string(GetLastError()));
+            allReleased = false;
+            continue;
         }
         g_inputState.keys[index] = false;
     }
-    if (g_inputState.leftDown && !SendRawMouseButton(MOUSEEVENTF_LEFTUP)) {
-        log::Warn("SendInput left release failed: " + std::to_string(GetLastError()));
+    if (g_inputState.leftDown) {
+        if (SendRawMouseButton(MOUSEEVENTF_LEFTUP)) {
+            g_inputState.leftDown = false;
+        } else {
+            log::Warn("SendInput left release failed: " + std::to_string(GetLastError()));
+            allReleased = false;
+        }
     }
-    if (g_inputState.rightDown && !SendRawMouseButton(MOUSEEVENTF_RIGHTUP)) {
-        log::Warn("SendInput right release failed: " + std::to_string(GetLastError()));
+    if (g_inputState.rightDown) {
+        if (SendRawMouseButton(MOUSEEVENTF_RIGHTUP)) {
+            g_inputState.rightDown = false;
+        } else {
+            log::Warn("SendInput right release failed: " + std::to_string(GetLastError()));
+            allReleased = false;
+        }
     }
-    if (g_inputState.middleDown && !SendRawMouseButton(MOUSEEVENTF_MIDDLEUP)) {
-        log::Warn("SendInput middle release failed: " + std::to_string(GetLastError()));
+    if (g_inputState.middleDown) {
+        if (SendRawMouseButton(MOUSEEVENTF_MIDDLEUP)) {
+            g_inputState.middleDown = false;
+        } else {
+            log::Warn("SendInput middle release failed: " + std::to_string(GetLastError()));
+            allReleased = false;
+        }
     }
-    g_inputState.leftDown = false;
-    g_inputState.rightDown = false;
-    g_inputState.middleDown = false;
+    return allReleased;
 }
 
 }  // namespace remote_assist

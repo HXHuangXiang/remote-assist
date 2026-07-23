@@ -11,15 +11,23 @@ namespace remote_assist {
 
 namespace {
 
-// 浏览器收到 WebSocket 二进制帧后还要经历图片解码和 canvas 绘制。仅靠 TCP
-// 写成功无法说明用户已经看到新画面。窗口过长会在浏览器偶发卡顿后继续发送
-// 已过期的 P 帧，远端画面会明显落后鼠标/键盘；300ms 足以覆盖正常局域网的一次
-// 解码和 rAF 绘制，同时能更快触发 Agent 的自适应降档。
-constexpr auto kFrameAckTimeout = std::chrono::milliseconds(300);
-constexpr size_t kMaxFramesInFlight = 2;
+// 浏览器收到 WebSocket 二进制帧后还要经历图片解码和 canvas 绘制。H.264 若把
+// 偶发 rAF/解码抖动直接视作链路失效，会不断重建 GOP，体感反而更卡；因此采用
+// 350~1000ms 的自适应确认窗口，首帧使用偏保守的 600ms，随后按真实 ACK 收敛。
+constexpr auto kJpegFrameAckTimeout = std::chrono::milliseconds(300);
 constexpr size_t kMaxPendingTextMessages = 8;
 constexpr auto kAuthThrottleRetention = std::chrono::minutes(10);
 constexpr size_t kMaxAuthThrottleEntries = 64;
+constexpr size_t kMaxConcurrentAuthAttempts = 3;
+// 浏览器在 WebSocket 打开后会立即发送认证 JSON。首帧使用绝对截止时间，避免
+// 空连接或只发 Ping/Pong 的对端长期占住认证工作槽位；认证成功后恢复既有的
+// 5 秒底层读取时限，库级 2 秒 heartbeat 会通过 Pong 保持正常空闲会话。
+constexpr auto kAuthFirstFrameTimeout = std::chrono::seconds(2);
+constexpr time_t kControllerReadTimeoutSeconds = 5;
+
+std::string AuthAddressKey(const std::string& remoteAddr) {
+    return remoteAddr.empty() ? "<unknown>" : remoteAddr;
+}
 
 // WebSocket handler 可能因为第三方回调、内存分配等异常提前离开。连接一旦已
 // 注册到 broadcaster，就必须在所有退出路径移除，避免发送线程持有悬空指针。
@@ -61,31 +69,33 @@ private:
 }  // namespace
 
 // 首帧认证的 scope guard。无论 ws.read、JSON 解析或回调以何种方式提前返回，
-// 都会释放唯一的认证槽位，避免服务永久显示“server busy”。
+// 都会释放来源对应的认证槽位，避免空连接耗尽 httplib 工作线程。
 class HttpWsServer::AuthAttemptGuard {
 public:
-    explicit AuthAttemptGuard(HttpWsServer& server) : server_(server) {}
+    AuthAttemptGuard(HttpWsServer& server, std::string remoteAddr)
+        : server_(server), remoteAddr_(std::move(remoteAddr)) {}
     ~AuthAttemptGuard() {
         if (active_) {
-            server_.EndAuthAttempt();
+            server_.EndAuthAttempt(remoteAddr_);
         }
     }
 
     void Complete() {
         if (active_) {
-            server_.EndAuthAttempt();
+            server_.EndAuthAttempt(remoteAddr_);
             active_ = false;
         }
     }
 
 private:
     HttpWsServer& server_;
+    std::string remoteAddr_;
     bool active_ = true;
 };
 
 // WebSocket 对象由 httplib handler 在栈上持有，不能把裸指针复制到 Stop 之后再
-// 使用。guard 的析构与 CloseActiveSocketForStop 使用同一把锁，因此 Stop 持锁
-// 发送 Close 帧时，handler 不会抢先返回并销毁对象。
+// 使用。guard 的析构与 AbortActiveSocketsForStop 使用同一把锁，因此 Stop 持锁
+// 关闭底层 socket 时，handler 不会抢先返回并销毁对象。
 class HttpWsServer::ActiveWebSocketGuard {
 public:
     ActiveWebSocketGuard(HttpWsServer& server, httplib::ws::WebSocket& ws)
@@ -119,7 +129,7 @@ bool WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
     std::lock_guard<std::mutex> clientLock(clientMu_);
     // 即使旧连接刚进入关闭态，也必须等其 handler 在 Remove 前完成全局按键释放，
     // 否则旧控制者遗留的 Ctrl/鼠标按下会带到新会话。
-    if (client_) {
+    if (client_ || !controllerHandoff_.TryAttach()) {
         return false;
     }
     client_ = ws;
@@ -127,11 +137,17 @@ bool WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
     pendingStreamId_ = 0;
     pendingTimestampUs_ = 0;
     pendingKeyFrame_ = true;
+    pendingH264_ = false;
     pendingText_.clear();
     pendingReplaceableText_.clear();
     preferReplaceableText_ = false;
     inFlightFrames_.clear();
+    h264AckTimeoutWindowMs_ = kH264AckTimeoutInitialMs;
+    h264AckTimeoutInitialized_ = false;
+    h264AckTimeoutMs_.store(h264AckTimeoutWindowMs_, std::memory_order_relaxed);
+    h264ResyncRequested_.store(false, std::memory_order_release);
     frameCv_.notify_all();
+    controllerCv_.notify_all();
     return true;
 }
 
@@ -141,6 +157,7 @@ bool WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
         std::lock_guard<std::mutex> lk(clientMu_);
         if (client_ == ws) {
             client_ = nullptr;
+            controllerHandoff_.Detach();
             removed = true;
         }
     }
@@ -151,13 +168,44 @@ bool WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
         pendingStreamId_ = 0;
         pendingTimestampUs_ = 0;
         pendingKeyFrame_ = true;
+        pendingH264_ = false;
         pendingText_.clear();
         pendingReplaceableText_.clear();
         preferReplaceableText_ = false;
         inFlightFrames_.clear();
+        h264ResyncRequested_.store(false, std::memory_order_release);
         frameCv_.notify_all();
     }
+    controllerCv_.notify_all();
     return removed;
+}
+
+void WsBroadcaster::BeginControllerInputCleanup() {
+    std::lock_guard<std::mutex> lk(clientMu_);
+    controllerHandoff_.BeginInputCleanup();
+}
+
+void WsBroadcaster::CompleteControllerInputCleanup() {
+    std::lock_guard<std::mutex> lk(clientMu_);
+    controllerHandoff_.CompleteInputCleanup();
+}
+
+bool WsBroadcaster::CanAcceptController() {
+    std::lock_guard<std::mutex> lk(clientMu_);
+    return !client_ && controllerHandoff_.CanAccept();
+}
+
+bool WsBroadcaster::IsControllerInputCleanupPending() {
+    std::lock_guard<std::mutex> lk(clientMu_);
+    return controllerHandoff_.IsInputCleanupPending();
+}
+
+bool WsBroadcaster::WaitForActiveController(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(clientMu_);
+    const auto isActive = [this] {
+        return client_ && client_->is_open() && controllerHandoff_.HasActiveController();
+    };
+    return controllerCv_.wait_for(lk, timeout, isActive) && isActive();
 }
 
 FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
@@ -169,11 +217,17 @@ FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
         if (stopping_) {
             return FrameQueueResult::kStopped;
         }
+        // ACK 超时已经宣布旧 GOP 失效时，采集线程可能刚好在一次信用等待中醒来。
+        // 在这里再次拒绝 delta，确保超时后的下一条视频负载只能是新的 IDR。
+        if (H264DeltaRequiresResync(h264, isKeyFrame, false,
+                                    h264ResyncRequested_.load(std::memory_order_acquire))) {
+            return FrameQueueResult::kH264ResyncRequired;
+        }
         if (!pendingFrame_.empty()) {
             // JPEG 帧没有前后依赖，直接替换可把延迟保持在一帧以内。H.264
             // delta 帧则会引用被替换的上一帧，若仍把最新 delta 发给浏览器会
             // 触发解码失败/黑屏。此时清空待发送帧，并让 Agent 请求新的 IDR。
-            if (h264 && !isKeyFrame) {
+            if (H264DeltaRequiresResync(h264, isKeyFrame, true, false)) {
                 pendingFrame_.clear();
                 pendingStreamId_ = 0;
                 pendingTimestampUs_ = 0;
@@ -188,6 +242,7 @@ FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
         pendingFrame_ = std::move(frame);
         pendingStreamId_ = streamId;
         pendingKeyFrame_ = isKeyFrame;
+        pendingH264_ = h264;
         pendingTimestampUs_ = timestampUs;
         queuedFrames_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -195,14 +250,24 @@ FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
     return replaced ? FrameQueueResult::kReplaced : FrameQueueResult::kQueued;
 }
 
+bool WsBroadcaster::ConsumeH264ResyncRequest() {
+    return h264ResyncRequested_.exchange(false, std::memory_order_acq_rel);
+}
+
 bool WsBroadcaster::WaitForH264FrameCredit(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lk(frameMu_);
     const bool ready = frameCv_.wait_for(lk, timeout, [this] {
-        // 不要求 in-flight 小于窗口上限：允许有一张 H.264 delta 在待发送槽位中，
-        // 这样 ACK、网络写和下一次采集能重叠；但绝不允许第二张 delta 覆盖它。
-        return stopping_ || pendingFrame_.empty();
+        // pendingFrame_ 也属于端到端延迟窗口。旧逻辑只限制 in-flight，因而会
+        // 额外保留一张“尚未写入 socket”的 delta，在慢一拍的浏览器上等同于多
+        // 一帧可见延迟。两个槽位已足以让网络写、硬件解码和下一帧编码并行。
+        // ACK 超时要求重建 GOP 时也要立刻退出，交由采集线程先消费重同步请求。
+        const bool resyncRequested = h264ResyncRequested_.load(std::memory_order_acquire);
+        return stopping_ || resyncRequested ||
+            HasH264FrameCredit(!pendingFrame_.empty(), inFlightFrames_.size(), false, false);
     });
-    return ready && !stopping_;
+    return ready && HasH264FrameCredit(!pendingFrame_.empty(), inFlightFrames_.size(),
+                                       h264ResyncRequested_.load(std::memory_order_acquire),
+                                       stopping_);
 }
 
 void WsBroadcaster::BroadcastText(std::string msg, bool replaceable) {
@@ -248,11 +313,22 @@ void WsBroadcaster::AcknowledgeFrame(uint64_t frameId) {
         }
         const auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - it->sentAt).count();
+        const bool h264 = it->h264;
         inFlightFrames_.erase(it);
         acknowledgedFrames_.fetch_add(1, std::memory_order_relaxed);
         ackLatencyUs_.fetch_add(static_cast<uint64_t>(std::max<int64_t>(0, latency)),
                                 std::memory_order_relaxed);
         ackLatencySamples_.fetch_add(1, std::memory_order_relaxed);
+        if (h264) {
+            const uint64_t observedMs = static_cast<uint64_t>(std::max<int64_t>(0, latency)) /
+                1000;
+            // 保留网络与下一次 rAF 的余量。首个真实样本直接收敛，后续样本采用
+            // 1/4 步长平滑，避免一次 GC/关键帧将窗口长期推到上限。
+            h264AckTimeoutWindowMs_ = NextH264AckTimeoutAfterAck(
+                h264AckTimeoutWindowMs_, h264AckTimeoutInitialized_, observedMs);
+            h264AckTimeoutInitialized_ = true;
+            h264AckTimeoutMs_.store(h264AckTimeoutWindowMs_, std::memory_order_relaxed);
+        }
         // sender 和采集线程都可能在等同一个状态变化。只唤醒一个会导致采集线程
         // 抢到通知却因 pending 仍存在继续休眠，sender 则要等到 ACK 超时才会继续。
         frameCv_.notify_all();
@@ -269,6 +345,7 @@ BroadcasterStats WsBroadcaster::SnapshotStats() const {
     stats.ackLatencyUs = ackLatencyUs_.load(std::memory_order_relaxed);
     stats.ackLatencySamples = ackLatencySamples_.load(std::memory_order_relaxed);
     stats.ackTimeouts = ackTimeouts_.load(std::memory_order_relaxed);
+    stats.h264AckTimeoutMs = h264AckTimeoutMs_.load(std::memory_order_relaxed);
     stats.sendFailures = sendFailures_.load(std::memory_order_relaxed);
     stats.h264Resyncs = h264Resyncs_.load(std::memory_order_relaxed);
     return stats;
@@ -276,7 +353,7 @@ BroadcasterStats WsBroadcaster::SnapshotStats() const {
 
 int WsBroadcaster::Count() {
     std::lock_guard<std::mutex> lk(clientMu_);
-    return (client_ && client_->is_open()) ? 1 : 0;
+    return (client_ && client_->is_open() && controllerHandoff_.HasActiveController()) ? 1 : 0;
 }
 
 void WsBroadcaster::Stop() {
@@ -290,10 +367,12 @@ void WsBroadcaster::Stop() {
         pendingStreamId_ = 0;
         pendingTimestampUs_ = 0;
         pendingKeyFrame_ = true;
+        pendingH264_ = false;
         pendingText_.clear();
         pendingReplaceableText_.clear();
         preferReplaceableText_ = false;
         inFlightFrames_.clear();
+        h264ResyncRequested_.store(false, std::memory_order_release);
     }
     frameCv_.notify_all();
     if (senderThread_.joinable()) {
@@ -309,6 +388,7 @@ void WsBroadcaster::SendLoop() {
         uint64_t frameId = 0;
         uint64_t timestampUs = 0;
         bool isKeyFrame = true;
+        bool h264 = false;
         bool sendingFrame = false;
         {
             std::unique_lock<std::mutex> lk(frameMu_);
@@ -319,15 +399,41 @@ void WsBroadcaster::SendLoop() {
                 const auto now = std::chrono::steady_clock::now();
                 const auto expired = std::find_if(inFlightFrames_.begin(), inFlightFrames_.end(),
                     [now](const InFlightFrame& frame) {
-                        return frame.writeCompleted &&
-                            now >= frame.sentAt + kFrameAckTimeout;
+                        return frame.writeCompleted && now >= frame.ackDeadline;
                     });
                 if (expired != inFlightFrames_.end()) {
                     // 即使持续有 cursor 消息，也必须按时释放超时帧窗口；否则高频
                     // 指针移动会让 H.264 信用窗口永久卡在满载状态。
-                    log::Warn("frame ack timed out, releasing one in-flight slot");
+                    const bool h264Timeout = expired->h264;
                     ackTimeouts_.fetch_add(1, std::memory_order_relaxed);
                     inFlightFrames_.erase(expired);
+                    if (h264Timeout) {
+                        // TCP 仍会按顺序交付已经写出的预测帧，但浏览器 300ms 未能
+                        // 绘制时继续发送 P 帧只会放大陈旧画面。清空尚未发出的帧，
+                        // 由采集线程请求新 IDR；已在 socket 缓冲中的旧帧无法撤回，
+                        // 但随后的独立 GOP 可以让浏览器快速丢弃并重新建立参考链。
+                        pendingFrame_.clear();
+                        pendingStreamId_ = 0;
+                        pendingTimestampUs_ = 0;
+                        pendingKeyFrame_ = true;
+                        pendingH264_ = false;
+                        inFlightFrames_.clear();
+                        h264Resyncs_.fetch_add(1, std::memory_order_relaxed);
+                        h264ResyncRequested_.store(true, std::memory_order_release);
+                        // 若首个慢帧尚未来得及返回 ACK，不能一直使用同一个阈值
+                        // 重复打断 GOP。逐次放宽到上限，真实样本回来后再平滑收敛。
+                        const uint32_t previousWindow = h264AckTimeoutWindowMs_;
+                        h264AckTimeoutWindowMs_ =
+                            NextH264AckTimeoutAfterTimeout(previousWindow);
+                        h264AckTimeoutInitialized_ = true;
+                        h264AckTimeoutMs_.store(h264AckTimeoutWindowMs_,
+                                                std::memory_order_relaxed);
+                        log::Warn("H.264 frame ack timed out, requesting IDR resync; ack_window_ms=" +
+                                  std::to_string(h264AckTimeoutWindowMs_));
+                        frameCv_.notify_all();
+                    } else {
+                        log::Warn("frame ack timed out, releasing one in-flight slot");
+                    }
                     continue;
                 }
                 if (!pendingText_.empty()) {
@@ -335,7 +441,7 @@ void WsBroadcaster::SendLoop() {
                     pendingText_.pop_front();
                     break;
                 }
-                const bool canSendFrame = inFlightFrames_.size() < kMaxFramesInFlight &&
+                const bool canSendFrame = inFlightFrames_.size() < kFrameWindowCapacity &&
                     !pendingFrame_.empty();
                 if (!pendingReplaceableText_.empty() &&
                     (!canSendFrame || preferReplaceableText_)) {
@@ -350,13 +456,18 @@ void WsBroadcaster::SendLoop() {
                     pendingStreamId_ = 0;
                     isKeyFrame = pendingKeyFrame_;
                     pendingKeyFrame_ = true;
+                    h264 = pendingH264_;
+                    pendingH264_ = false;
                     timestampUs = pendingTimestampUs_;
                     pendingTimestampUs_ = 0;
                     frameId = nextFrameId_++;
                     // 先预留窗口，二进制负载成功写入后才将 writeCompleted 置为
                     // true 并记录 sentAt。这样网络 send 阻塞不会侵蚀浏览器的
                     // 解码/绘制 ACK 时间预算。
-                    inFlightFrames_.push_back({frameId});
+                    InFlightFrame inFlight;
+                    inFlight.id = frameId;
+                    inFlight.h264 = h264;
+                    inFlightFrames_.push_back(std::move(inFlight));
                     preferReplaceableText_ = true;
                     sendingFrame = true;
                     break;
@@ -381,11 +492,11 @@ void WsBroadcaster::SendLoop() {
                         });
                         continue;
                     }
-                    const auto deadline = sent->sentAt + kFrameAckTimeout;
+                    const auto deadline = sent->ackDeadline;
                     if (frameCv_.wait_until(lk, deadline, [this] {
                         return stopping_ ||
                             !pendingText_.empty() || !pendingReplaceableText_.empty() ||
-                            (inFlightFrames_.size() < kMaxFramesInFlight &&
+                            (inFlightFrames_.size() < kFrameWindowCapacity &&
                              !pendingFrame_.empty());
                         })) {
                         continue;
@@ -395,7 +506,7 @@ void WsBroadcaster::SendLoop() {
                 frameCv_.wait(lk, [this] {
                     return stopping_ ||
                         !pendingText_.empty() || !pendingReplaceableText_.empty() ||
-                        (inFlightFrames_.size() < kMaxFramesInFlight && !pendingFrame_.empty());
+                        (inFlightFrames_.size() < kFrameWindowCapacity && !pendingFrame_.empty());
                 });
             }
         }
@@ -419,6 +530,15 @@ void WsBroadcaster::SendLoop() {
                     sent = client_->send(header) &&
                         client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
                 }
+                if (!sent && client_->is_open()) {
+                    // 视频帧由文本元数据和紧随其后的二进制负载组成。若前者成功、
+                    // 后者失败仍继续复用同一 WebSocket，浏览器可能把下一段负载
+                    // 绑定到旧 frame id，随后 ACK/解码状态都会错位。发送失败时
+                    // 立即中断会话，由现有断连逻辑清空队列并在重连后从 IDR 开始。
+                    // 发送线程与 handler 的 ws.read 并行，不能调用会同步读取 Close
+                    // 响应的 close()，否则会再次竞争同一 socket 的接收方向。
+                    client_->abort();
+                }
             }
         }
         if (sent && sendingFrame) {
@@ -439,6 +559,9 @@ void WsBroadcaster::SendLoop() {
                     } else {
                         it->writeCompleted = true;
                         it->sentAt = writeCompletedAt;
+                        it->ackDeadline = writeCompletedAt + (it->h264
+                            ? std::chrono::milliseconds(h264AckTimeoutWindowMs_)
+                            : kJpegFrameAckTimeout);
                     }
                     frameCv_.notify_all();
                 }
@@ -481,18 +604,23 @@ void HttpWsServer::SetOnControllerDisconnected(OnControllerDisconnected cb) {
     onControllerDisconnected_ = std::move(cb);
 }
 
-bool HttpWsServer::TryBeginAuthAttempt() {
+bool HttpWsServer::TryBeginAuthAttempt(const std::string& remoteAddr) {
     std::lock_guard<std::mutex> lk(authMu_);
-    if (stopping_.load(std::memory_order_acquire) || authAttemptInProgress_) {
+    if (stopping_.load(std::memory_order_acquire) ||
+        authAttemptsByAddress_.size() >= kMaxConcurrentAuthAttempts) {
         return false;
     }
-    authAttemptInProgress_ = true;
+    const std::string key = AuthAddressKey(remoteAddr);
+    if (authAttemptsByAddress_.find(key) != authAttemptsByAddress_.end()) {
+        return false;
+    }
+    authAttemptsByAddress_.emplace(key, 1);
     return true;
 }
 
-void HttpWsServer::EndAuthAttempt() {
+void HttpWsServer::EndAuthAttempt(const std::string& remoteAddr) {
     std::lock_guard<std::mutex> lk(authMu_);
-    authAttemptInProgress_ = false;
+    authAttemptsByAddress_.erase(AuthAddressKey(remoteAddr));
 }
 
 bool HttpWsServer::RegisterActiveSocket(httplib::ws::WebSocket* ws) {
@@ -500,30 +628,33 @@ bool HttpWsServer::RegisterActiveSocket(httplib::ws::WebSocket* ws) {
         return false;
     }
     std::lock_guard<std::mutex> lk(connectionMu_);
-    if (stopping_.load(std::memory_order_acquire) || activeSocket_) {
+    if (stopping_.load(std::memory_order_acquire)) {
         return false;
     }
-    activeSocket_ = ws;
-    return true;
+    return activeSockets_.insert(ws).second;
 }
 
 void HttpWsServer::UnregisterActiveSocket(httplib::ws::WebSocket* ws) {
     std::lock_guard<std::mutex> lk(connectionMu_);
-    if (activeSocket_ == ws) {
-        activeSocket_ = nullptr;
-    }
+    activeSockets_.erase(ws);
 }
 
-void HttpWsServer::CloseActiveSocketForStop() {
+void HttpWsServer::AbortActiveSocketsForStop() {
     std::lock_guard<std::mutex> lk(connectionMu_);
-    if (!activeSocket_ || !activeSocket_->is_open()) {
+    if (activeSockets_.empty()) {
         return;
     }
-    // 正常浏览器会立即回 Close 帧；不响应的对端仍受 WebSocket 读取超时保护。
-    // 先设置 stopping_ 再关闭，确保认证刚成功的 handler 不会把已关闭连接重新
-    // 注册为控制端。
-    log::Info("requesting active WebSocket close for server shutdown");
-    activeSocket_->close(httplib::ws::CloseStatus::GoingAway, "server stopping");
+    // 不能在这里调用 WebSocket::close：handler 线程可能已经在 ws.read()，而
+    // httplib 的 close() 会在发送 Close 帧后同步读取对端的 Close 响应，形成两个
+    // 并发 reader。abort() 仅 shutdown 底层 socket，当前 read 立即失败、handler
+    // 正常走自己的析构收尾；Server 随后会关闭实际 socket。
+    log::Info("aborting " + std::to_string(activeSockets_.size()) +
+              " active WebSocket connection(s) for server shutdown");
+    for (auto* socket : activeSockets_) {
+        if (socket) {
+            socket->abort();
+        }
+    }
 }
 
 bool HttpWsServer::CanAttemptAuth(const std::string& remoteAddr) {
@@ -536,7 +667,7 @@ bool HttpWsServer::CanAttemptAuth(const std::string& remoteAddr) {
             ++it;
         }
     }
-    const std::string key = remoteAddr.empty() ? "<unknown>" : remoteAddr;
+    const std::string key = AuthAddressKey(remoteAddr);
     const auto found = authThrottles_.find(key);
     if (found == authThrottles_.end()) {
         return true;
@@ -547,7 +678,7 @@ bool HttpWsServer::CanAttemptAuth(const std::string& remoteAddr) {
 
 void HttpWsServer::RecordAuthFailure(const std::string& remoteAddr) {
     const auto now = std::chrono::steady_clock::now();
-    const std::string key = remoteAddr.empty() ? "<unknown>" : remoteAddr;
+    const std::string key = AuthAddressKey(remoteAddr);
     std::lock_guard<std::mutex> lk(authMu_);
     if (authThrottles_.size() >= kMaxAuthThrottleEntries &&
         authThrottles_.find(key) == authThrottles_.end()) {
@@ -571,7 +702,7 @@ void HttpWsServer::RecordAuthFailure(const std::string& remoteAddr) {
 
 void HttpWsServer::ResetAuthFailures(const std::string& remoteAddr) {
     std::lock_guard<std::mutex> lk(authMu_);
-    authThrottles_.erase(remoteAddr.empty() ? "<unknown>" : remoteAddr);
+    authThrottles_.erase(AuthAddressKey(remoteAddr));
 }
 
 bool HttpWsServer::Start(const std::string& host, int port) {
@@ -587,17 +718,29 @@ bool HttpWsServer::Start(const std::string& host, int port) {
     svr_.set_start_handler([this] { running_ = true; });
     svr_.WebSocket("/ws", [this](const httplib::Request& req, httplib::ws::WebSocket& ws) {
         const std::string remoteAddr = req.remote_addr;
-        if (broadcaster_.Count() != 0) {
-            ws.send("{\"t\":\"error\",\"msg\":\"controller already connected\"}");
-            ws.close(httplib::ws::CloseStatus::PolicyViolation, "controller already connected");
+        if (!broadcaster_.CanAcceptController()) {
+            const bool cleaningUp = broadcaster_.IsControllerInputCleanupPending();
+            const char* const message = cleaningUp
+                ? "controller input cleanup in progress" : "controller already connected";
+            const std::string error = cleaningUp
+                ? "{\"t\":\"error\",\"code\":\"controller_cleanup\","
+                  "\"msg\":\"controller input cleanup in progress\"}"
+                : "{\"t\":\"error\",\"msg\":\"controller already connected\"}";
+            ws.send(error);
+            ws.close(httplib::ws::CloseStatus::PolicyViolation, message);
             return;
         }
-        if (!TryBeginAuthAttempt()) {
+        if (!CanAttemptAuth(remoteAddr)) {
+            ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"retry later\"}");
+            ws.close(httplib::ws::CloseStatus::PolicyViolation, "retry later");
+            return;
+        }
+        if (!TryBeginAuthAttempt(remoteAddr)) {
             ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"server busy\"}");
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "server busy");
             return;
         }
-        AuthAttemptGuard authAttempt(*this);
+        AuthAttemptGuard authAttempt(*this, remoteAddr);
         ActiveWebSocketGuard socketGuard(*this, ws);
         if (!socketGuard.Registered()) {
             ws.close(httplib::ws::CloseStatus::GoingAway, "server stopping");
@@ -605,15 +748,11 @@ bool HttpWsServer::Start(const std::string& host, int port) {
         }
         // 鉴权:第一帧必须是文本 JSON {"t":"auth","token":"..."}
         std::string msg;
-        const auto r = ws.read(msg);
+        const auto r = ws.read_with_timeout(msg, kAuthFirstFrameTimeout);
         if (r != httplib::ws::Text) {
+            RecordAuthFailure(remoteAddr);
             ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"need auth first\"}");
             ws.close(httplib::ws::CloseStatus::PolicyViolation, "no auth");
-            return;
-        }
-        if (!CanAttemptAuth(remoteAddr)) {
-            ws.send("{\"t\":\"auth\",\"ok\":false,\"reason\":\"retry later\"}");
-            ws.close(httplib::ws::CloseStatus::PolicyViolation, "retry later");
             return;
         }
         bool ok = false;
@@ -639,13 +778,23 @@ bool HttpWsServer::Start(const std::string& host, int port) {
             ws.close(httplib::ws::CloseStatus::GoingAway, "server stopping");
             return;
         }
+        // 认证阶段会把底层读取时限按剩余预算缩短；通过后恢复既有会话时限，由
+        // WebSocket heartbeat 的 Pong 维持正常空闲页面。
+        ws.set_read_timeout(kControllerReadTimeoutSeconds, 0);
         ws.send("{\"t\":\"auth\",\"ok\":true}");
         if (cfgProvider_) {
             ws.send(cfgProvider_());
         }
         if (!broadcaster_.Add(&ws)) {
-            ws.send("{\"t\":\"error\",\"msg\":\"controller already connected\"}");
-            ws.close(httplib::ws::CloseStatus::PolicyViolation, "controller already connected");
+            const bool cleaningUp = broadcaster_.IsControllerInputCleanupPending();
+            const char* const message = cleaningUp
+                ? "controller input cleanup in progress" : "controller already connected";
+            const std::string error = cleaningUp
+                ? "{\"t\":\"error\",\"code\":\"controller_cleanup\","
+                  "\"msg\":\"controller input cleanup in progress\"}"
+                : "{\"t\":\"error\",\"msg\":\"controller already connected\"}";
+            ws.send(error);
+            ws.close(httplib::ws::CloseStatus::PolicyViolation, message);
             return;
         }
         // 在 controller 真正注册前保持认证槽位，避免两个并发握手都收到
@@ -721,9 +870,9 @@ bool HttpWsServer::Start(const std::string& host, int port) {
 
 void HttpWsServer::Stop() {
     stopping_.store(true, std::memory_order_release);
-    // 必须在 svr_.stop/join 之前关闭长连接。httplib 只停止 accept 循环，若 handler
+    // 必须在 svr_.stop/join 之前中断长连接。httplib 只停止 accept 循环，若 handler
     // 仍在 ws.read 中等待浏览器消息，listen 线程销毁线程池时会一直等待该任务。
-    CloseActiveSocketForStop();
+    AbortActiveSocketsForStop();
     svr_.stop();
     if (thread_.joinable()) {
         thread_.join();

@@ -26,6 +26,12 @@ constexpr int kKeyFrameIntervalSeconds = 2;
 constexpr DWORD kMinH264OutputBufferBytes = 512 * 1024;
 constexpr DWORD kMaxH264OutputBufferBytes = 32 * 1024 * 1024;
 
+uint64_t ElapsedMicros(std::chrono::steady_clock::time_point startedAt) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - startedAt).count());
+}
+
 uint8_t ClampToByte(int value) {
     return static_cast<uint8_t>(std::clamp(value, 0, 255));
 }
@@ -200,6 +206,7 @@ bool EncoderMf::Init(int width, int height, int fps, int bitrateBps, ID3D11Devic
     h264Pps_.clear();
     h264CodecProfile_ = 0x42E01E;
     keyFrameRequested_ = true;
+    lastFrameTiming_ = {};
 
     if (InitH264()) {
         configured_ = true;
@@ -249,6 +256,20 @@ bool EncoderMf::UpdateBitrate(int bitrateBps) {
     bitrateBps_ = requestedBitrate;
     log::Info("H.264 target bitrate updated: " + std::to_string(bitrateBps_));
     return true;
+}
+
+bool EncoderMf::ForceJpegFallback() {
+    if (!configured_) {
+        return false;
+    }
+    if (mode_ == EncoderMode::kJpeg) {
+        return true;
+    }
+    log::Warn("forcing JPEG fallback after H.264 keyframe recovery failed");
+    ReleaseH264();
+    configured_ = false;
+    mode_ = EncoderMode::kJpeg;
+    return InitJpeg();
 }
 
 bool EncoderMf::InitH264() {
@@ -776,26 +797,49 @@ bool EncoderMf::EncodeH264(const uint8_t* bgra, size_t bgraStrideBytes,
         return false;
     }
 
+    const auto inputPreparationStartedAt = std::chrono::steady_clock::now();
     Microsoft::WRL::ComPtr<IMFMediaBuffer> inputBuffer;
     HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12Bytes), &inputBuffer);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        lastFrameTiming_.mfInputPreparationUs = ElapsedMicros(inputPreparationStartedAt);
+        return false;
+    }
     BYTE* nv12 = nullptr;
     DWORD maxLength = 0;
-    if (FAILED(inputBuffer->Lock(&nv12, &maxLength, nullptr))) return false;
+    if (FAILED(inputBuffer->Lock(&nv12, &maxLength, nullptr))) {
+        lastFrameTiming_.mfInputPreparationUs = ElapsedMicros(inputPreparationStartedAt);
+        return false;
+    }
+    const auto conversionStartedAt = std::chrono::steady_clock::now();
     ConvertBgraToNv12(bgra, bgraStrideBytes, nv12);
+    lastFrameTiming_.bgraToNv12Us = ElapsedMicros(conversionStartedAt);
     inputBuffer->Unlock();
     inputBuffer->SetCurrentLength(static_cast<DWORD>(nv12Bytes));
 
     Microsoft::WRL::ComPtr<IMFSample> inputSample;
     hr = MFCreateSample(&inputSample);
-    if (FAILED(hr)) return false;
-    if (FAILED(inputSample->AddBuffer(inputBuffer.Get()))) return false;
+    if (FAILED(hr)) {
+        const uint64_t totalPreparationUs = ElapsedMicros(inputPreparationStartedAt);
+        lastFrameTiming_.mfInputPreparationUs = totalPreparationUs > lastFrameTiming_.bgraToNv12Us
+            ? totalPreparationUs - lastFrameTiming_.bgraToNv12Us : 0;
+        return false;
+    }
+    if (FAILED(inputSample->AddBuffer(inputBuffer.Get()))) {
+        const uint64_t totalPreparationUs = ElapsedMicros(inputPreparationStartedAt);
+        lastFrameTiming_.mfInputPreparationUs = totalPreparationUs > lastFrameTiming_.bgraToNv12Us
+            ? totalPreparationUs - lastFrameTiming_.bgraToNv12Us : 0;
+        return false;
+    }
+    const uint64_t totalPreparationUs = ElapsedMicros(inputPreparationStartedAt);
+    lastFrameTiming_.mfInputPreparationUs = totalPreparationUs > lastFrameTiming_.bgraToNv12Us
+        ? totalPreparationUs - lastFrameTiming_.bgraToNv12Us : 0;
     return SubmitH264Sample(inputSample.Get(), out);
 }
 
 bool EncoderMf::EncodeD3D11(ID3D11Texture2D* nv12Texture,
                             std::vector<EncodedChunk>& out) {
     out.clear();
+    lastFrameTiming_ = {};
     if (!configured_ || mode_ != EncoderMode::kH264 || !d3dInputEnabled_ || !nv12Texture) {
         return false;
     }
@@ -806,18 +850,22 @@ bool EncoderMf::EncodeD3D11(ID3D11Texture2D* nv12Texture,
         return false;
     }
 
+    const auto inputWrapStartedAt = std::chrono::steady_clock::now();
     Microsoft::WRL::ComPtr<IMFMediaBuffer> inputBuffer;
     HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Texture, 0, FALSE,
                                            &inputBuffer);
     if (FAILED(hr)) {
+        lastFrameTiming_.d3dInputWrapUs = ElapsedMicros(inputWrapStartedAt);
         log::Warn("H.264 DXGI input buffer creation failed hr=" + std::to_string(hr));
         return false;
     }
     Microsoft::WRL::ComPtr<IMFSample> inputSample;
     hr = MFCreateSample(&inputSample);
     if (FAILED(hr) || FAILED(inputSample->AddBuffer(inputBuffer.Get()))) {
+        lastFrameTiming_.d3dInputWrapUs = ElapsedMicros(inputWrapStartedAt);
         return false;
     }
+    lastFrameTiming_.d3dInputWrapUs = ElapsedMicros(inputWrapStartedAt);
     return SubmitH264Sample(inputSample.Get(), out);
 }
 
@@ -948,6 +996,7 @@ bool EncoderMf::EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes,
 }
 
 bool EncoderMf::Encode(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out) {
+    lastFrameTiming_ = {};
     if (!configured_ || !bgra ||
         bgraStrideBytes < static_cast<size_t>(width_) * 4) {
         return false;
@@ -1011,6 +1060,7 @@ void EncoderMf::Release() {
     lastInputTimestamp100Ns_ = -1;
     lastPeriodicKeyFrameRequest100Ns_ = std::numeric_limits<LONGLONG>::min() / 2;
     mode_ = EncoderMode::kJpeg;
+    lastFrameTiming_ = {};
 }
 
 }  // namespace remote_assist

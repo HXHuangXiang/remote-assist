@@ -20,7 +20,8 @@ public:
 
     // 控制端断开、页面失焦或服务停止时释放仍处于按下状态的按键和鼠标键。
     // 调用方必须已绑定目标 desktop，避免远端因丢失 keyup/mouseup 而长期卡住状态。
-    static void ReleaseAll();
+    // 失败的状态会保留，以便在桌面切换恢复后重试；返回 true 表示所有输入均释放。
+    static bool ReleaseAll();
 };
 
 }  // namespace remote_assist

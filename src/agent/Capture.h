@@ -6,6 +6,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -19,23 +20,38 @@ namespace remote_assist {
 struct CapturedFrame {
     int width = 0;
     int height = 0;
-    // GDI 与缩放后的 DXGI 路径持有完整 CPU 副本；未缩放 DXGI 路径直接借用已映射
-    // staging texture，避免再复制一遍 BGRA。该借用仅在 Capture::ReleaseFrame 前有效。
+    // 缩放后的 DXGI 路径持有完整 CPU 副本；未缩放 DXGI 路径直接借用已映射 staging
+    // texture，GDI 路径则直接借用最终 DIB，避免再复制一遍 BGRA。所有借用均仅在
+    // Capture::ReleaseFrame 前有效。
     std::vector<uint8_t> data;
     const uint8_t* mappedPixels = nullptr;
     size_t mappedStrideBytes = 0;
+    bool borrowedGdiPixels = false;
     // DXGI + 视频处理器路径下直接交给硬件 H.264 MFT 的 NV12 surface。该资源
     // 与 data/mappedPixels 互斥，生命周期同样截至 Capture::ReleaseFrame。
     Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12Texture;
 
-    bool IsDirectDxgi() const { return mappedPixels != nullptr; }
+    // 仅用于 Agent 的十秒聚合诊断。DXGI 直通和 GPU NV12 路径均为零；CPU 回退时
+    // 可把“采集慢”拆分为缩放/复制与 GDI BitBlt，避免只凭总帧耗时猜测。
+    uint64_t cpuCopyOrScaleUs = 0;
+    uint64_t gdiBltUs = 0;
+    // GPU NV12 路径的 CPU 提交耗时，包含视频处理器准备、独立 surface 分配及
+    // VideoProcessorBlt 调用；它不代表 GPU 完整执行时间，但可定位驱动调用或
+    // 每帧资源创建是否已在 CPU 侧成为瓶颈。
+    uint64_t gpuNv12SubmissionUs = 0;
+
+    bool IsDirectDxgi() const { return mappedPixels != nullptr && !borrowedGdiPixels; }
+    bool IsBorrowedGdi() const { return mappedPixels != nullptr && borrowedGdiPixels; }
     bool IsGpuNv12() const { return nv12Texture.Get() != nullptr; }
     bool Empty() const {
-        return IsGpuNv12() || IsDirectDxgi() ? width <= 0 || height <= 0 : data.empty();
+        return IsGpuNv12() || mappedPixels != nullptr ? width <= 0 || height <= 0 : data.empty();
     }
-    const uint8_t* Pixels() const { return IsDirectDxgi() ? mappedPixels : data.data(); }
+    // mappedPixels 同时覆盖 DXGI staging 映射和 GDI 最终 DIB 借用。两者都在
+    // ReleaseFrame 前有效；不能仅按 IsDirectDxgi 判断，否则 GDI 路径清空 data
+    // 后会把空 vector 的地址传给编码器，导致锁屏/回退画面黑屏。
+    const uint8_t* Pixels() const { return mappedPixels ? mappedPixels : data.data(); }
     size_t StrideBytes() const {
-        return IsDirectDxgi() ? mappedStrideBytes : static_cast<size_t>(width) * 4;
+        return mappedPixels ? mappedStrideBytes : static_cast<size_t>(width) * 4;
     }
 };
 
@@ -189,13 +205,18 @@ private:
     HBITMAP old_bmp_ = nullptr;
     void* bits_ = nullptr;
 
-    int dibW_ = 0;   // DIB 宽(虚拟屏幕宽)
-    int dibH_ = 0;   // DIB 高(虚拟屏幕高)
-    // GDI/BitBlt 不提供 DXGI Desktop Duplication 那样的“无变化”通知。对原始
-    // DIB 采样哈希可在静态锁屏/多屏画面时跳过昂贵的缩放与编码；每秒仍强制
-    // 输出一次完整帧，避免极小变化恰好未落入采样点而长期不可见。
-    uint64_t gdiFingerprint_ = 0;
-    bool hasGdiFingerprint_ = false;
+    // GDI DIB 始终是最终推流尺寸，而不是完整虚拟桌面。锁屏/跨显卡回退时由
+    // StretchBlt 直接从选中源区域缩放到这里，避免 4K/多屏下额外保存、裁剪和
+    // CPU 缩放一张完整虚拟桌面图像。
+    int dibW_ = 0;
+    int dibH_ = 0;
+    // GDI 没有 Desktop Duplication 的“无变化”通知。对最终输出 DIB 同时计算
+    // 四组错位采样哈希，并让每组只与自身的上次结果比较。单一固定采样相位会
+    // 稳定漏掉 hover、密码框高亮等小区域变化；四组同时比对不会因建立轮换基线
+    // 或一次真实变化后遗留旧摘要而重复编码相同画面。
+    static constexpr size_t kGdiFingerprintPhaseCount = 4;
+    std::array<uint64_t, kGdiFingerprintPhaseCount> gdiFingerprints_{};
+    std::array<bool, kGdiFingerprintPhaseCount> hasGdiFingerprint_{};
     std::chrono::steady_clock::time_point lastGdiFullFrameAt_{};
     uint64_t gdiConsecutiveFailures_ = 0;
     std::chrono::steady_clock::time_point lastGdiFailureLogAt_{};
@@ -220,12 +241,13 @@ private:
     int maxOutputHeight_ = 1080;
     bool use_gdi_ = false;
 
-    // 缩放时的相对源坐标表。分辨率稳定时重复使用，避免每帧按像素执行整数除法。
+    // 缩放时的相对源坐标表。X 表保存源行内的字节偏移，Y 表保存源行索引；分辨率
+    // 稳定时重复使用，避免每帧按像素执行整数除法和地址乘法。
     int scaleMapSourceWidth_ = 0;
     int scaleMapSourceHeight_ = 0;
     int scaleMapOutputWidth_ = 0;
     int scaleMapOutputHeight_ = 0;
-    std::vector<int> scaleMapX_;
+    std::vector<size_t> scaleMapX_;
     std::vector<int> scaleMapY_;
 };
 

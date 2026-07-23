@@ -36,6 +36,7 @@ enum {
     IDC_HIDE_TRAY,
     IDC_EXIT,
     IDC_PORT_EDIT,
+    IDC_QUALITY_COMBO,
     IDM_TRAY_SHOW = 2001,
     IDM_TRAY_HIDE,
     IDM_TRAY_EXIT,
@@ -43,6 +44,8 @@ enum {
 
 constexpr UINT kTrayCallback = WM_APP + 1;
 constexpr UINT kAsyncOperationCompleted = WM_APP + 2;
+constexpr UINT_PTR kStatusRefreshTimerId = 1;
+constexpr UINT kStatusRefreshIntervalMs = 1000;
 
 static Config g_cfg;
 static HWND g_hwnd = nullptr;
@@ -92,6 +95,32 @@ bool ReadPasswordUtf8(HWND hwnd, std::string& password) {
                                password.data(), utf8Length, nullptr, nullptr) == utf8Length;
 }
 
+// 首次随机密码保存在 Config 的 UTF-8 临时字段中；图形界面展示时必须严格按 UTF-8
+// 转回宽字符，不能依赖当前系统 ANSI 代码页。
+std::wstring WideFromUtf8(const std::string& value) {
+    if (value.empty()) {
+        return {};
+    }
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                                           static_cast<int>(value.size()), nullptr, 0);
+    if (length <= 0) {
+        return {};
+    }
+    std::wstring result(static_cast<size_t>(length), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                            static_cast<int>(value.size()), result.data(), length) != length) {
+        return {};
+    }
+    return result;
+}
+
+void SecureClearString(std::string& value) {
+    if (!value.empty()) {
+        SecureZeroMemory(value.data(), value.size());
+        value.clear();
+    }
+}
+
 struct ServiceResult {
     bool ok = false;
     DWORD error = ERROR_GEN_FAILURE;
@@ -103,6 +132,9 @@ struct InstallServiceResult {
     DWORD firewallError = ERROR_SUCCESS;
     // 安装路径不安全时，向用户说明具体目录而不是只显示笼统的 ACCESS_DENIED。
     std::wstring pathSecurityReason;
+    // 当前目录中的新版本替换已有服务映像时，必须重启正在运行的旧服务，新的
+    // binPath 才会实际生效。
+    bool updatedExistingService = false;
 };
 
 // 服务控制、等待 SCM 状态与防火墙 COM 调用都可能阻塞数秒。它们不能运行在窗口
@@ -348,6 +380,27 @@ static bool ServiceRunning() {
     return running;
 }
 
+// 状态栏需要区分“尚未启动”和“服务已启动后立即以错误码退出”。后者通常是安装目录
+// ACL、配置文件或受管 IPC 初始化失败，若只显示“未运行”会掩盖最有价值的诊断信息。
+static bool QueryInstalledServiceStatus(SERVICE_STATUS_PROCESS& status, DWORD& error) {
+    error = ERROR_SUCCESS;
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) {
+        error = GetLastError();
+        return false;
+    }
+    SC_HANDLE svc = OpenServiceW(scm, runtime::kServiceName, SERVICE_QUERY_STATUS);
+    if (!svc) {
+        error = GetLastError();
+        CloseServiceHandle(scm);
+        return false;
+    }
+    const bool ok = QueryServiceState(svc, status, error);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return ok;
+}
+
 // SCM 报告 RUNNING 只表示服务主进程已进入循环；必须等 agent 成功绑定 HTTP/
 // WebSocket 端口后，控制端才真正可以连接。
 static bool WaitForAgentReady(DWORD timeoutMs) {
@@ -360,6 +413,19 @@ static bool WaitForAgentReady(DWORD timeoutMs) {
     return result == WAIT_OBJECT_0;
 }
 
+// 空闲 Agent 不会持续抓屏，因此该事件未置位通常只表示尚未有控制端触发首帧，
+// 而不是服务故障。它用于把“端口可连接”与“画面管线已验证”明确区分。
+static bool WaitForAgentFrameReady(DWORD timeoutMs) {
+    HANDLE frameReadyEvent = OpenEventW(SYNCHRONIZE, FALSE,
+                                        runtime::kAgentFrameReadyEventName);
+    if (!frameReadyEvent) {
+        return false;
+    }
+    const DWORD result = WaitForSingleObject(frameReadyEvent, timeoutMs);
+    CloseHandle(frameReadyEvent);
+    return result == WAIT_OBJECT_0;
+}
+
 static InstallServiceResult InstallService() {
     const std::wstring exePath = ExePath();
     const ServiceInstallPathValidation pathValidation =
@@ -369,7 +435,8 @@ static InstallServiceResult InstallService() {
         return {ServiceFailure(ERROR_ACCESS_DENIED), ERROR_SUCCESS,
                 pathValidation.reason};
     }
-    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr,
+                                   SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
     if (!scm) {
         const DWORD error = GetLastError();
         log::Error("OpenSCManager failed err=" + std::to_string(error));
@@ -381,29 +448,59 @@ static InstallServiceResult InstallService() {
         SERVICE_WIN32_OWN_PROCESS,
         SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
         binPath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
-    if (svc) {
-        const ServiceResult configured = ConfigureServiceRecovery(svc);
-        if (!configured.ok) {
-            log::Error("ConfigureServiceRecovery failed err=" +
-                       std::to_string(configured.error));
-            DeleteService(svc);
+    bool updatedExistingService = false;
+    if (!svc) {
+        const DWORD createError = GetLastError();
+        if (createError != ERROR_SERVICE_EXISTS) {
+            log::Error("CreateService failed err=" + std::to_string(createError));
+            CloseServiceHandle(scm);
+            return {ServiceFailure(createError)};
+        }
+
+        // 双击新版本后应能直接“安装/更新”，无需先手工卸载服务。仍先完成相同
+        // 的目录 ACL 验证，随后收紧回 RemoteAssist 固定的 LocalSystem 配置。
+        svc = OpenServiceW(scm, runtime::kServiceName,
+                           SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP |
+                               SERVICE_CHANGE_CONFIG | DELETE);
+        if (!svc) {
+            const DWORD error = GetLastError();
+            log::Error("OpenService for update failed err=" + std::to_string(error));
+            CloseServiceHandle(scm);
+            return {ServiceFailure(error)};
+        }
+        if (!ChangeServiceConfigW(svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
+                                  SERVICE_ERROR_NORMAL, binPath.c_str(), nullptr, nullptr,
+                                  nullptr, L"LocalSystem", nullptr, L"RemoteAssist")) {
+            const DWORD error = GetLastError();
+            log::Error("ChangeServiceConfig(update) failed err=" + std::to_string(error));
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
-            return {configured};
+            return {ServiceFailure(error)};
+        }
+        updatedExistingService = true;
+    }
+
+    const ServiceResult configured = ConfigureServiceRecovery(svc);
+    if (!configured.ok) {
+        log::Error("ConfigureServiceRecovery failed err=" +
+                   std::to_string(configured.error));
+        // 只有本轮创建的新服务才回滚；更新已有服务时不能因附加元数据失败误删用户
+        // 已安装的服务配置。
+        if (!updatedExistingService) {
+            DeleteService(svc);
         }
         CloseServiceHandle(svc);
         CloseServiceHandle(scm);
-        DWORD firewallError = ERROR_SUCCESS;
-        if (!ConfigurePrivateFirewallRule(exePath, g_cfg.port, firewallError)) {
-            log::Warn("private firewall rule update failed err=" +
-                      std::to_string(firewallError));
-        }
-        return {ServiceSuccess(), firewallError};
+        return {configured};
     }
-    const DWORD error = GetLastError();
-    log::Error("CreateService failed err=" + std::to_string(error));
+    CloseServiceHandle(svc);
     CloseServiceHandle(scm);
-    return {ServiceFailure(error)};
+    DWORD firewallError = ERROR_SUCCESS;
+    if (!ConfigurePrivateFirewallRule(exePath, g_cfg.port, firewallError)) {
+        log::Warn("private firewall rule update failed err=" +
+                  std::to_string(firewallError));
+    }
+    return {ServiceSuccess(), firewallError, {}, updatedExistingService};
 }
 
 static ServiceResult StartServiceS() {
@@ -531,7 +628,7 @@ static void StartAsyncOperation(HWND hwnd, AsyncOperation operation, bool update
     const wchar_t* status = L"正在执行服务操作...";
     switch (operation) {
     case AsyncOperation::kInstall:
-        status = L"正在安装服务...";
+        status = L"正在安装/更新服务...";
         break;
     case AsyncOperation::kStart:
         status = L"正在启动服务并等待 Agent...";
@@ -551,7 +648,7 @@ static void StartAsyncOperation(HWND hwnd, AsyncOperation operation, bool update
     }
     SetDlgItemTextW(hwnd, IDC_STATUS, status);
     constexpr int kBusyControls[] = {
-        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
+        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_QUALITY_COMBO, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
         IDC_SVC_START, IDC_SVC_STOP, IDC_RUN_AGENT, IDC_HIDE_TRAY, IDC_EXIT,
     };
     for (const int id : kBusyControls) {
@@ -617,9 +714,58 @@ bool ReadPort(HWND hwnd, int& port) {
     return true;
 }
 
+// ComboBox 的顺序与界面文案绑定，而实际持久化值使用 QualityCap 的底层整数；集中
+// 转换避免将控件下标直接写进 config.json，未来调整展示顺序也不会破坏已有配置。
+int QualityCapFromComboSelection(LRESULT selection) {
+    switch (selection) {
+    case 0:
+        return static_cast<int>(QualityCap::kAutomatic);
+    case 1:
+        return static_cast<int>(QualityCap::k1080p);
+    case 2:
+        return static_cast<int>(QualityCap::k720p);
+    case 3:
+        return static_cast<int>(QualityCap::k540p);
+    default:
+        return -1;
+    }
+}
+
+int ComboSelectionForQualityCap(int qualityCap) {
+    switch (static_cast<QualityCap>(qualityCap)) {
+    case QualityCap::kAutomatic:
+        return 0;
+    case QualityCap::k1080p:
+        return 1;
+    case QualityCap::k720p:
+        return 2;
+    case QualityCap::k540p:
+        return 3;
+    }
+    return 0;
+}
+
+bool ReadQualityCap(HWND hwnd, int& qualityCap) {
+    const HWND combo = GetDlgItem(hwnd, IDC_QUALITY_COMBO);
+    if (!combo) {
+        return false;
+    }
+    qualityCap = QualityCapFromComboSelection(SendMessageW(combo, CB_GETCURSEL, 0, 0));
+    if (!IsQualityCapValid(qualityCap)) {
+        MessageBoxW(hwnd, L"请选择有效的画质上限。", L"RemoteAssist",
+                    MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    return true;
+}
+
 bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
     int port = 0;
     if (!ReadPort(hwnd, port)) {
+        return false;
+    }
+    int qualityCap = 0;
+    if (!ReadQualityCap(hwnd, qualityCap)) {
         return false;
     }
 
@@ -632,14 +778,19 @@ bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
     }
     const bool passwordChanged = !password.empty();
     portChanged = g_cfg.port != port;
-    changed = passwordChanged || portChanged;
+    const bool qualityCapChanged = g_cfg.qualityCap != qualityCap;
+    changed = passwordChanged || portChanged || qualityCapChanged;
     if (!changed) {
         return true;
     }
 
     const Config original = g_cfg;
     g_cfg.port = port;
+    g_cfg.qualityCap = qualityCap;
     const bool saved = passwordChanged ? SetPassword(g_cfg, password) : SaveConfig(g_cfg);
+    // PBKDF2 已在 SetPassword 内完成，配置文件只保留哈希；编辑框清空前也要擦除
+    // 这个短生命周期 UTF-8 副本，避免明文在堆中额外停留到函数返回之后。
+    SecureClearString(password);
     if (!saved) {
         g_cfg = original;
         MessageBoxW(hwnd, L"配置保存失败，请检查 exe 目录写权限。", L"RemoteAssist", MB_OK | MB_ICONERROR);
@@ -651,15 +802,31 @@ bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
 
 static void UpdateStatus() {
     const BOOL configValid = !g_cfg.passwordHash.empty() && !g_cfg.salt.empty();
+    SERVICE_STATUS_PROCESS serviceStatus{};
+    DWORD serviceStatusError = ERROR_SUCCESS;
+    const bool serviceStatusKnown =
+        QueryInstalledServiceStatus(serviceStatus, serviceStatusError);
     std::wstring s;
     if (!configValid) {
         s = L"配置文件无效：设置新密码后保存即可修复";
-    } else if (!ServiceExists()) {
+    } else if (!serviceStatusKnown && serviceStatusError == ERROR_SERVICE_DOES_NOT_EXIST) {
         s = L"\u670d\u52a1\u672a\u5b89\u88c5";
-    } else if (ServiceRunning()) {
-        s = WaitForAgentReady(0) ?
-            L"\u670d\u52a1\u8fd0\u884c\u4e2d\uff08Agent \u5df2\u5c31\u7eea\uff09" :
-            L"\u670d\u52a1\u8fd0\u884c\u4e2d\uff08\u7b49\u5f85 Agent\uff09";
+    } else if (!serviceStatusKnown) {
+        s = L"无法读取服务状态（错误 " + std::to_wstring(serviceStatusError) + L"）：" +
+            ErrorText(serviceStatusError);
+    } else if (serviceStatus.dwCurrentState == SERVICE_RUNNING) {
+        if (!WaitForAgentReady(0)) {
+            s = L"服务运行中（等待 Agent 监听）";
+        } else if (WaitForAgentFrameReady(0)) {
+            s = L"服务运行中（画面管线已就绪）";
+        } else {
+            s = L"服务运行中（Agent 已监听，等待首帧验证）";
+        }
+    } else if (serviceStatus.dwCurrentState == SERVICE_STOPPED &&
+               serviceStatus.dwWin32ExitCode != ERROR_SUCCESS) {
+        s = L"服务启动失败（错误 " +
+            std::to_wstring(serviceStatus.dwWin32ExitCode) + L"）：" +
+            ErrorText(serviceStatus.dwWin32ExitCode);
     } else {
         s = L"\u670d\u52a1\u5df2\u5b89\u88c5\u4f46\u672a\u8fd0\u884c";
     }
@@ -669,7 +836,9 @@ static void UpdateStatus() {
     BOOL running = ServiceRunning();
     // 无有效访问密码时即使服务进程可启动，Agent 也会主动退出。禁用安装、启动和
     // 独立 Agent 入口，提示用户先修复配置；停止、卸载仍保留用于恢复已有安装。
-    EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_INSTALL), !installed && configValid);
+    // 已有服务也必须允许“安装/更新”：InstallService 会更新 binPath、启动类型和
+    // 恢复策略。若仍沿用 !installed，用户替换 exe 后根本没有入口让 SCM 指向新版本。
+    EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_INSTALL), configValid);
     EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_UNINSTALL), installed);
     EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_START), installed && !running && configValid);
     EnableWindow(GetDlgItem(g_hwnd, IDC_SVC_STOP), installed && running);
@@ -755,7 +924,7 @@ static void RestoreSetupTrayOwnership() {
 
 static void SetOperationControlsEnabled(HWND hwnd, BOOL enabled) {
     constexpr int kOperationControls[] = {
-        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
+        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_QUALITY_COMBO, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
         IDC_SVC_START, IDC_SVC_STOP, IDC_RUN_AGENT, IDC_HIDE_TRAY, IDC_EXIT,
     };
     for (const int id : kOperationControls) {
@@ -797,11 +966,20 @@ static void HandleAsyncOperationCompleted(HWND hwnd,
         g_installFirewallError = result->install.firewallError;
         g_operationInProgress = false;
         RelinquishTrayOwnership();
-        StartAsyncOperation(hwnd, AsyncOperation::kStart);
+        // ChangeServiceConfig 只修改后续进程的映像路径。更新正在运行的服务时，
+        // 必须先停后启，才能真正加载当前目录下的新 exe；新装或已停止的服务
+        // 则直接 Start，避免无意义地把停止错误展示给用户。
+        const AsyncOperation nextOperation =
+            result->install.updatedExistingService && ServiceRunning()
+                ? AsyncOperation::kRestart
+                : AsyncOperation::kStart;
+        StartAsyncOperation(hwnd, nextOperation);
         return;
     }
 
-    const bool startedAfterInstall = result->operation == AsyncOperation::kStart &&
+    const bool startedAfterInstall =
+        (result->operation == AsyncOperation::kStart ||
+         result->operation == AsyncOperation::kRestart) &&
         g_startAfterInstall;
     const DWORD installFirewallError = g_installFirewallError;
     if (startedAfterInstall) {
@@ -819,7 +997,7 @@ static void HandleAsyncOperationCompleted(HWND hwnd,
         }
         {
             std::wstring message = result->agentReady
-                ? L"服务与 Agent 已启动。浏览器访问 http://<本机IP>:" +
+                ? L"服务与 Agent 已启动并开始监听。浏览器访问 http://<本机IP>:" +
                     std::to_wstring(g_cfg.port) + L"/"
                 : L"服务已启动。Agent 尚未就绪（等待登录桌面或查看 logs\\service.log）。";
             if (startedAfterInstall && installFirewallError != ERROR_SUCCESS) {
@@ -849,17 +1027,31 @@ static void HandleAsyncOperationCompleted(HWND hwnd,
             if (!ServiceRunning()) {
                 RestoreSetupTrayOwnership();
             }
-            MessageBoxW(hwnd,
-                        L"配置已保存，但服务重启失败；新配置会在下次服务启动时生效。",
-                        L"RemoteAssist", MB_OK | MB_ICONWARNING);
-            ShowServiceError(hwnd, L"重启服务", result->service.error);
+            if (startedAfterInstall) {
+                ShowServiceError(hwnd, L"更新后的服务重启", result->service.error);
+            } else {
+                MessageBoxW(hwnd,
+                            L"配置已保存，但服务重启失败；新配置会在下次服务启动时生效。",
+                            L"RemoteAssist", MB_OK | MB_ICONWARNING);
+                ShowServiceError(hwnd, L"重启服务", result->service.error);
+            }
             return;
         }
         {
-            std::wstring message = result->agentReady
-                ? L"配置已保存，服务与 Agent 已重启并应用新密码/端口。"
-                : L"配置已保存，服务已重启；Agent 尚未就绪（查看 logs\\service.log）。";
-            if (result->firewallError != ERROR_SUCCESS) {
+            std::wstring message;
+            if (startedAfterInstall) {
+                message = result->agentReady
+                    ? L"服务已更新并重启，当前版本的 Agent 已开始监听；首帧会在浏览器连接后验证。"
+                    : L"服务已更新并重启；Agent 尚未就绪（查看 logs\\service.log）。";
+            } else {
+                message = result->agentReady
+                    ? L"配置已保存，服务与 Agent 已重启并开始监听；首帧会在浏览器连接后验证。"
+                    : L"配置已保存，服务已重启；Agent 尚未就绪（查看 logs\\service.log）。";
+            }
+            const DWORD firewallError = startedAfterInstall
+                ? installFirewallError
+                : result->firewallError;
+            if (firewallError != ERROR_SUCCESS) {
                 message += L"\n\n未能自动更新专用网络防火墙规则；局域网访问可能被阻止。";
             }
             MessageBoxW(hwnd, message.c_str(), L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
@@ -919,12 +1111,24 @@ static void CreateControls(HWND hwnd) {
 
     mk(0, L"STATIC", L"\u7aef\u53e3:", 20, 55, 50, 20, 0);
     mk(IDC_PORT_EDIT, L"EDIT", L"7980", 70, 53, 60, 24, ES_NUMBER | WS_BORDER);
+    mk(0, L"STATIC", L"\u753b\u8d28\u4e0a\u9650:", 145, 55, 70, 20, 0);
+    HWND qualityCombo = mk(IDC_QUALITY_COMBO, L"COMBOBOX", L"", 215, 52, 135, 160,
+                           CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP | WS_VSCROLL);
+    SendMessageW(qualityCombo, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"\u81ea\u52a8\uff08\u6700\u9ad81080p\uff09"));
+    SendMessageW(qualityCombo, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"\u6700\u9ad81080p"));
+    SendMessageW(qualityCombo, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"\u6700\u9ad8720p"));
+    SendMessageW(qualityCombo, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"\u6700\u9ad8540p"));
+    SendMessageW(qualityCombo, CB_SETCURSEL, 0, 0);
 
     mk(0, L"STATIC", L"\u72b6\u6001:", 20, 90, 50, 20, 0);
     mk(IDC_STATUS, L"STATIC", L"...", 70, 90, 280, 20, 0);
 
     mk(IDC_RUN_AGENT, L"BUTTON", L"\u76f4\u63a5\u8fd0\u884c(\u975e\u670d\u52a1)", 20, 125, 160, 32, BS_PUSHBUTTON);
-    mk(IDC_SVC_INSTALL, L"BUTTON", L"\u5b89\u88c5\u5e76\u542f\u52a8\u670d\u52a1", 200, 125, 150, 32, BS_PUSHBUTTON);
+    mk(IDC_SVC_INSTALL, L"BUTTON", L"\u5b89\u88c5/\u66f4\u65b0\u5e76\u542f\u52a8", 200, 125, 150, 32, BS_PUSHBUTTON);
 
     mk(IDC_SVC_START, L"BUTTON", L"\u542f\u52a8\u670d\u52a1", 20, 170, 110, 32, BS_PUSHBUTTON);
     mk(IDC_SVC_STOP, L"BUTTON", L"\u505c\u6b62\u670d\u52a1", 140, 170, 110, 32, BS_PUSHBUTTON);
@@ -975,9 +1179,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_cfg = LoadOrCreateConfig();
         if (!g_cfg.initialPassword.empty()) {
             SetDlgItemTextA(hwnd, IDC_PW_EDIT, g_cfg.initialPassword.c_str());
+            const std::wstring password = WideFromUtf8(g_cfg.initialPassword);
+            if (!password.empty()) {
+                MessageBoxW(hwnd,
+                            (L"首次访问密码（请立即保存）：\n\n" + password +
+                             L"\n\n安装服务后，浏览器访问 http://<本机IP>:" +
+                             std::to_wstring(g_cfg.port) + L"/ 输入此密码连接。")
+                                .c_str(),
+                            L"RemoteAssist 首次配置", MB_OK | MB_ICONINFORMATION);
+            }
+            // 密码已交给编辑框和提示框；Config 仅保存哈希，清除内存副本避免在
+            // 后续服务操作、日志或异常转储中不必要地延长明文生命周期。
+            SecureClearString(g_cfg.initialPassword);
         }
         SetDlgItemTextA(hwnd, IDC_PORT_EDIT, std::to_string(g_cfg.port).c_str());
+        SendMessageW(GetDlgItem(hwnd, IDC_QUALITY_COMBO), CB_SETCURSEL,
+                     ComboSelectionForQualityCap(g_cfg.qualityCap), 0);
         UpdateStatus();
+        // Agent 的 listener-ready/frame-ready 事件会在配置窗口打开后继续变化。
+        // 用低频轮询刷新状态，避免用户已连接并收到画面但界面仍停留在旧提示。
+        SetTimer(hwnd, kStatusRefreshTimerId, kStatusRefreshIntervalMs, nullptr);
+        return 0;
+
+    case WM_TIMER:
+        if (wp == kStatusRefreshTimerId && !g_operationInProgress) {
+            UpdateStatus();
+        }
         return 0;
 
     case WM_COMMAND:
@@ -1093,6 +1320,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, kStatusRefreshTimerId);
         RemoveTrayIcon();
         if (g_font) {
             DeleteObject(g_font);

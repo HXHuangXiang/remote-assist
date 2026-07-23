@@ -2,6 +2,8 @@
 
 #include <shellapi.h>
 
+#include <string>
+
 #include "agent/Agent.h"
 #include "common/Log.h"
 #include "common/Path.h"
@@ -44,6 +46,45 @@ bool HasArg(int argc, wchar_t* const* argv, const wchar_t* target) {
     return false;
 }
 
+// 图形配置窗口既要在 exe 同级目录写入 config/logs，又要注册 LocalSystem 服务。
+// 如果普通用户先写入这些运行产物，随后服务安装的路径 ACL 校验必然拒绝它们；若
+// 放宽校验又会把高权限服务暴露给普通用户可改写的目录。因此无参数入口统一通过
+// UAC 进入管理员上下文，保证“首次配置 -> 写入产物 -> 安装服务”使用同一安全身份。
+// --agent/--tray/--service 均不会走这里，服务拉起的用户 Tray 不会额外弹 UAC。
+bool IsCurrentProcessElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+    }
+    TOKEN_ELEVATION elevation{};
+    DWORD bytes = 0;
+    const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation,
+                                        sizeof(elevation), &bytes);
+    CloseHandle(token);
+    return ok != FALSE && elevation.TokenIsElevated != 0;
+}
+
+bool RelaunchElevatedSetup() {
+    const std::wstring exePath = remote_assist::ModulePath();
+    if (exePath.empty()) {
+        return false;
+    }
+    const HINSTANCE result = ShellExecuteW(nullptr, L"runas", exePath.c_str(),
+                                           L"--setup-elevated", nullptr, SW_SHOWNORMAL);
+    return reinterpret_cast<INT_PTR>(result) > 32;
+}
+
+// 仅 Service 生成的随机共享内存名称会通过该参数传入 Tray。不能借用 HasArg，
+// 否则释放 CommandLineToArgvW 返回的数组后会留下悬空指针。
+std::wstring ArgValue(int argc, wchar_t* const* argv, const wchar_t* target) {
+    for (int index = 1; index + 1 < argc; ++index) {
+        if (_wcsicmp(argv[index], target) == 0) {
+            return argv[index + 1];
+        }
+    }
+    return {};
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
@@ -58,6 +99,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     const bool trayMode = HasArg(argc, argv, L"--tray");
     const bool serviceManaged = HasArg(argc, argv, L"--service-managed");
     const bool checkServiceInstallPath = HasArg(argc, argv, L"--check-service-install-dir");
+    const bool elevatedSetupMode = HasArg(argc, argv, L"--setup-elevated");
+    const std::wstring initialPasswordChannel =
+        ArgValue(argc, argv, L"--initial-password-channel");
     LocalFree(argv);
 
     if (checkServiceInstallPath) {
@@ -74,17 +118,47 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
     if (trayMode) {
         remote_assist::TrayApp tray;
-        return tray.Run();
+        return tray.Run(initialPasswordChannel);
     }
-    // 无参数(用户双击):单实例检查 + 弹出配置窗口,设密码/安装服务。
-    HANDLE hMutex = CreateMutexW(nullptr, FALSE, L"RemoteAssistSetupInstance");
+    // 无参数(用户双击):先以管理员身份进入配置窗口。这样同级 config/logs 的
+    // 所有者与安装路径 ACL 校验一致；用户取消 UAC 时不创建不安全的半成品配置。
+    if (!elevatedSetupMode && !IsCurrentProcessElevated()) {
+        if (RelaunchElevatedSetup()) {
+            return 0;
+        }
+        MessageBoxW(nullptr,
+                    L"RemoteAssist 需要管理员权限来保存当前目录配置并安装服务。\n"
+                    L"请在 UAC 提示中选择“是”，或使用管理员帐户重新启动。",
+                    L"RemoteAssist", MB_OK | MB_ICONWARNING);
+        return 1;
+    }
+    if (elevatedSetupMode && !IsCurrentProcessElevated()) {
+        MessageBoxW(nullptr, L"配置窗口未获得管理员权限，无法安全继续。",
+                    L"RemoteAssist", MB_OK | MB_ICONWARNING);
+        return 1;
+    }
+
+    // 单实例检查 + 弹出配置窗口,设密码/安装服务。
+    HANDLE hMutex = CreateMutexW(nullptr, FALSE, remote_assist::runtime::kSetupMutexName);
+    if (!hMutex) {
+        MessageBoxW(nullptr,
+                    L"无法创建配置窗口的单实例锁，请确认没有被其他进程占用。",
+                    L"RemoteAssist", MB_OK | MB_ICONERROR);
+        return 1;
+    }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         // 已有实例运行,激活已有窗口后退出。
         HWND hwnd = FindWindowW(L"RemoteAssistSetup", nullptr);
         if (hwnd) {
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
+        } else {
+            // Global mutex 可能由另一个 RDP/控制台会话的配置窗口持有；当前
+            // window station 无法跨会话枚举其 HWND，此时明确告知而非静默退出。
+            MessageBoxW(nullptr, L"RemoteAssist 配置窗口已在其他会话中打开。",
+                        L"RemoteAssist", MB_OK | MB_ICONINFORMATION);
         }
+        CloseHandle(hMutex);
         return 0;
     }
     int ret = remote_assist::RunSetupDialog(hInst);
