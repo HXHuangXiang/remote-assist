@@ -7,6 +7,7 @@
 #include "agent/Agent.h"
 #include "common/Log.h"
 #include "common/Path.h"
+#include "common/RuntimeNames.h"
 #include "common/ServiceInstallSecurity.h"
 #include "service/ServiceHost.h"
 #include "setup/SetupDialog.h"
