@@ -16,7 +16,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <string>
+#include <utility>
 
 #pragma comment(lib, "ole32.lib")
 
@@ -222,6 +225,133 @@ bool ReadJsonString(const nlohmann::json& object, const char* key, std::string& 
     return true;
 }
 
+bool ParseStreamQuality(const std::string& text, StreamQuality& quality) {
+    if (text == "auto") quality = StreamQuality::kAutomatic;
+    else if (text == "original") quality = StreamQuality::kOriginal;
+    else if (text == "1080p") quality = StreamQuality::k1080p;
+    else if (text == "720p") quality = StreamQuality::k720p;
+    else if (text == "540p") quality = StreamQuality::k540p;
+    else if (text == "360p") quality = StreamQuality::k360p;
+    else return false;
+    return true;
+}
+
+// 将脏矩形扩展到固定网格，避免为几个像素分别创建高开销的 JPEG；网格面积才是
+// 实际传输面积，因此以它和网页阈值比较，而非理想的原始脏矩形面积。
+bool BuildJpegPatchTiles(const CapturedFrame& frame, int thresholdPercent,
+                         EncoderMf& encoder, std::vector<JpegTile>& tiles) {
+    tiles.clear();
+    if (!frame.hasDirtyRegions || frame.dirtyRegions.empty() || frame.IsGpuNv12() ||
+        !frame.Pixels() || frame.width <= 0 || frame.height <= 0 ||
+        !IsPatchThresholdValid(thresholdPercent)) {
+        return false;
+    }
+    constexpr int kTileSize = 64;
+    const int columns = (frame.width + kTileSize - 1) / kTileSize;
+    const int rows = (frame.height + kTileSize - 1) / kTileSize;
+    std::vector<uint8_t> changed(static_cast<size_t>(columns) * rows, 0);
+    for (const DirtyRegion& region : frame.dirtyRegions) {
+        const int left = std::clamp(region.x, 0, frame.width);
+        const int top = std::clamp(region.y, 0, frame.height);
+        const int right = std::clamp(region.x + region.width, 0, frame.width);
+        const int bottom = std::clamp(region.y + region.height, 0, frame.height);
+        if (right <= left || bottom <= top) continue;
+        const int firstColumn = left / kTileSize;
+        const int lastColumn = (right - 1) / kTileSize;
+        const int firstRow = top / kTileSize;
+        const int lastRow = (bottom - 1) / kTileSize;
+        for (int row = firstRow; row <= lastRow; ++row) {
+            for (int column = firstColumn; column <= lastColumn; ++column) {
+                changed[static_cast<size_t>(row) * columns + column] = 1;
+            }
+        }
+    }
+    uint64_t changedArea = 0;
+    for (int row = 0; row < rows; ++row) {
+        const int height = std::min(kTileSize, frame.height - row * kTileSize);
+        for (int column = 0; column < columns; ++column) {
+            if (changed[static_cast<size_t>(row) * columns + column] == 0) continue;
+            const int width = std::min(kTileSize, frame.width - column * kTileSize);
+            changedArea += static_cast<uint64_t>(width) * height;
+        }
+    }
+    const uint64_t frameArea = static_cast<uint64_t>(frame.width) * frame.height;
+    if (changedArea == 0 || changedArea * 100 >= frameArea * thresholdPercent) {
+        return false;
+    }
+    // 同一行连续网格合成一个跨度；再将相邻行中跨度相同的区域纵向延伸。这样
+    // 滚动、窗口拖动等连续变化不会生成数百个 64x64 JPEG，但所有边界仍对齐到
+    // 固定网格，覆盖面积也仍是上面用于阈值比较的精确网格并集。
+    struct TileBounds {
+        int firstColumn = 0;
+        int lastColumn = 0;
+        int firstRow = 0;
+        int lastRow = 0;
+    };
+    std::vector<TileBounds> rectangles;
+    std::vector<TileBounds> active;
+    for (int row = 0; row < rows; ++row) {
+        std::vector<TileBounds> current;
+        for (int column = 0; column < columns;) {
+            if (changed[static_cast<size_t>(row) * columns + column] == 0) {
+                ++column;
+                continue;
+            }
+            const int firstColumn = column;
+            while (column < columns &&
+                   changed[static_cast<size_t>(row) * columns + column] != 0) {
+                ++column;
+            }
+            const int lastColumn = column;
+            const auto previous = std::find_if(active.begin(), active.end(),
+                [firstColumn, lastColumn](const TileBounds& bounds) {
+                    return bounds.firstColumn == firstColumn &&
+                        bounds.lastColumn == lastColumn;
+                });
+            if (previous != active.end()) {
+                TileBounds extended = *previous;
+                extended.lastRow = row + 1;
+                current.push_back(extended);
+                active.erase(previous);
+            } else {
+                current.push_back({firstColumn, lastColumn, row, row + 1});
+            }
+        }
+        rectangles.insert(rectangles.end(), active.begin(), active.end());
+        active = std::move(current);
+    }
+    rectangles.insert(rectangles.end(), active.begin(), active.end());
+
+    tiles.reserve(rectangles.size());
+    for (const TileBounds& bounds : rectangles) {
+        const int x = bounds.firstColumn * kTileSize;
+        const int y = bounds.firstRow * kTileSize;
+        const int width = std::min(frame.width, bounds.lastColumn * kTileSize) - x;
+        const int height = std::min(frame.height, bounds.lastRow * kTileSize) - y;
+        if (width <= 0 || height <= 0) {
+            continue;
+        }
+        std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4);
+        for (int tileRow = 0; tileRow < height; ++tileRow) {
+            std::memcpy(pixels.data() + static_cast<size_t>(tileRow) * width * 4,
+                frame.Pixels() + static_cast<size_t>(y + tileRow) * frame.StrideBytes() +
+                static_cast<size_t>(x) * 4, static_cast<size_t>(width) * 4);
+        }
+        JpegTile tile;
+        tile.x = x;
+        tile.y = y;
+        tile.width = width;
+        tile.height = height;
+        if (!encoder.EncodeJpegTile(width, height, pixels.data(),
+                                    static_cast<size_t>(width) * 4, tile.data)) {
+            tiles.clear();
+            return false;
+        }
+        tiles.push_back(std::move(tile));
+    }
+    return !tiles.empty();
+}
+
 }  // namespace
 
 Agent::~Agent() {
@@ -364,8 +494,7 @@ int Agent::Run(bool serviceManaged) {
                   std::to_string(GetLastError()));
     }
     log::Info("agent config port=" + std::to_string(cfg_.port) +
-              " fps=" + std::to_string(cfg_.fps) +
-              " quality_cap=" + std::to_string(cfg_.qualityCap));
+              " fps=" + std::to_string(cfg_.fps));
     streamFps_.store(cfg_.fps);
 
     // 显示器清单在启动网络服务前完成,后续仅由采集线程读取。
@@ -500,9 +629,15 @@ void Agent::CaptureLoop() {
     bool adaptiveBitrateAvailable = true;
     int pendingEncoderBitrateRebuild = 0;
     auto nextEncoderBitrateRebuildAt = nextDesktopCheck;
-    // 该索引是“允许恢复到的最高分辨率”而非最低质量；质量越低索引越大。
-    const int maximumQualityResolutionTier = ResolutionTierForQualityCap(cfg_.qualityCap);
+    // 自动模式从最高档起步并可按压力下调；固定档位锁定分辨率，原始清晰度则
+    // 取消输出上限。网页偏好只保留在当前控制端，不写入 cfg_。
+    StreamQuality activeQuality = StreamQuality::kAutomatic;
+    int maximumQualityResolutionTier = ResolutionTierForStreamQuality(activeQuality);
     int adaptiveResolutionTier = maximumQualityResolutionTier;
+    bool resolutionLocked = false;
+    bool patchCapability = false;
+    int patchThreshold = kDefaultPatchThresholdPercent;
+    uint64_t appliedPreferenceGeneration = 0;
     capture_.SetMaxOutputSize(kStreamResolutionCaps[adaptiveResolutionTier].width,
                               kStreamResolutionCaps[adaptiveResolutionTier].height);
     int congestionWindows = 0;
@@ -573,6 +708,9 @@ void Agent::CaptureLoop() {
     };
 
     auto setResolutionTier = [&](int tier) {
+        if (resolutionLocked) {
+            return;
+        }
         tier = std::clamp(tier, maximumQualityResolutionTier,
                           static_cast<int>(kStreamResolutionCaps.size()) - 1);
         if (tier == adaptiveResolutionTier) {
@@ -590,6 +728,56 @@ void Agent::CaptureLoop() {
         log::Info("adaptive stream cap " + std::to_string(previous.width) + "x" +
                   std::to_string(previous.height) + " -> " +
                   std::to_string(current.width) + "x" + std::to_string(current.height));
+    };
+
+    auto applyStreamPreferences = [&] {
+        const uint64_t generation = streamPreferenceGeneration_.load(std::memory_order_acquire);
+        if (generation == appliedPreferenceGeneration) {
+            return;
+        }
+        appliedPreferenceGeneration = generation;
+        int qualityValue = requestedStreamQuality_.load(std::memory_order_relaxed);
+        if (!IsStreamQualityValid(qualityValue)) {
+            qualityValue = static_cast<int>(StreamQuality::kAutomatic);
+        }
+        const StreamQuality nextQuality = static_cast<StreamQuality>(qualityValue);
+        int nextThreshold = requestedPatchThreshold_.load(std::memory_order_relaxed);
+        if (!IsPatchThresholdValid(nextThreshold)) {
+            nextThreshold = kDefaultPatchThresholdPercent;
+        }
+        const bool nextPatchCapability =
+            requestedPatchCapability_.load(std::memory_order_relaxed);
+        const bool qualityChanged = nextQuality != activeQuality;
+        const bool patchCapabilityChanged = nextPatchCapability != patchCapability;
+        activeQuality = nextQuality;
+        patchThreshold = nextThreshold;
+        patchCapability = nextPatchCapability;
+        capture_.SetPatchCaptureEnabled(patchCapability);
+        if (!qualityChanged && !patchCapabilityChanged) {
+            return;
+        }
+
+        maximumQualityResolutionTier = ResolutionTierForStreamQuality(activeQuality);
+        adaptiveResolutionTier = maximumQualityResolutionTier;
+        resolutionLocked = IsFixedStreamQuality(activeQuality);
+        if (activeQuality == StreamQuality::kOriginal) {
+            capture_.SetMaxOutputSize(std::numeric_limits<int>::max(),
+                                      std::numeric_limits<int>::max());
+        } else {
+            const StreamResolutionCap cap = kStreamResolutionCaps[adaptiveResolutionTier];
+            capture_.SetMaxOutputSize(cap.width, cap.height);
+        }
+        firstFrame_ = true;
+        streamKeyFrameRequired_ = true;
+        resetFramePipelineReady("web stream preference changed");
+        // 即便新旧输出分辨率恰好相同，也要让浏览器丢弃旧异步解码/图块任务；随后
+        // 的首帧会请求独立 IDR，保证网页画布拥有可供局部更新的完整基线。
+        streamId_.fetch_add(1);
+        server_.Broadcaster().BroadcastText(MakeCfgJson());
+        log::Info(std::string("web stream preference quality=") +
+                  StreamQualityName(activeQuality) + " patch=" +
+                  (patchCapability ? "true" : "false") + " threshold=" +
+                  std::to_string(patchThreshold));
     };
 
     // 自适应码率是按“当前控制端”的链路质量得出的。控制端断开后若直接保留低码率，
@@ -628,7 +816,7 @@ void Agent::CaptureLoop() {
             streamFps_.store(adaptiveFps);
         }
         restoreBitrateForNextController();
-        if (adaptiveResolutionTier != maximumQualityResolutionTier) {
+        if (!resolutionLocked && adaptiveResolutionTier != maximumQualityResolutionTier) {
             setResolutionTier(maximumQualityResolutionTier);
         }
         congestionWindows = 0;
@@ -1025,6 +1213,7 @@ void Agent::CaptureLoop() {
         const auto t0 = std::chrono::steady_clock::now();
         logMetricsIfDue(t0);
         adaptFrameRateIfDue(t0);
+        applyStreamPreferences();
 
         // JPEG 回退需要 CPU 全帧压缩，大屏时保守限帧；H.264 模式的压缩由 MFT
         // 承担，不应仅因分辨率达到 1080p 就被无条件锁在 15 FPS，否则既浪费
@@ -1168,6 +1357,24 @@ void Agent::CaptureLoop() {
             return true;
         };
         consumeH264ResyncRequest();
+        const auto consumePatchResyncRequest = [&] {
+            if (!server_.Broadcaster().ConsumePatchResyncRequest()) {
+                return false;
+            }
+            // 局部批次可能已部分绘制，不能继续基于当前 Canvas 叠加。切换流版本
+            // 并强制完整关键帧，让网页丢弃旧的异步 JPEG 解码任务后重新建立基线。
+            firstFrame_ = true;
+            streamKeyFrameRequired_ = true;
+            if (encoder_ && encoder_->IsH264()) {
+                encoder_->RequestKeyFrame();
+            }
+            resetFramePipelineReady("patch batch resync required");
+            streamId_.fetch_add(1);
+            server_.Broadcaster().BroadcastText(MakeCfgJson());
+            log::Warn("patch batch resync consumed, requesting full-frame baseline");
+            return true;
+        };
+        consumePatchResyncRequest();
 
         // H.264 流开始或重同步后必须等独立 IDR。若同一 MFT 在两个恢复窗口中
         // 都没有提供 IDR，继续丢弃 P 帧只会让浏览器永久黑屏：先重建一次 MFT，
@@ -1213,7 +1420,13 @@ void Agent::CaptureLoop() {
         // 窗口占满时不再采集/编码下一张；直接跳过输入帧可保持编码器与浏览器的
         // 参考链连续，也避免多保留一张过时画面。首帧和请求恢复期间仍放行，使
         // 独立 IDR 能及时替换过期画面。
-        if (streamH264_.load() && !streamKeyFrameRequired_ &&
+        const bool needsOrderedPatchCredit = patchCapability && !firstFrame_ &&
+            !streamKeyFrameRequired_;
+        if (needsOrderedPatchCredit && !server_.Broadcaster().WaitForPatchFrameCredit(
+                std::chrono::milliseconds(std::max(1, targetMs)))) {
+            continue;
+        }
+        if (!needsOrderedPatchCredit && streamH264_.load() && !streamKeyFrameRequired_ &&
             !server_.Broadcaster().WaitForH264FrameCredit(
                 std::chrono::milliseconds(std::max(1, targetMs)))) {
             ++metrics.h264CreditWaits;
@@ -1222,7 +1435,7 @@ void Agent::CaptureLoop() {
         }
         // 信用等待期间也可能收到 ACK 超时。先消费请求并在下一轮从 IDR 开始，
         // 防止恰好被唤醒的一张旧 delta 越过发送队列。
-        if (consumeH264ResyncRequest()) {
+        if (consumeH264ResyncRequest() || consumePatchResyncRequest()) {
             continue;
         }
 
@@ -1378,7 +1591,42 @@ void Agent::CaptureLoop() {
             server_.Broadcaster().BroadcastText(MakeCfgJson());
         }
 
-        if (encoderReady_ && !frame.Empty()) {
+        bool patchQueued = false;
+        if (patchCapability && !needsFreshFrame && encoderReady_ && !frame.Empty()) {
+            std::vector<JpegTile> tiles;
+            if (BuildJpegPatchTiles(frame, patchThreshold, *encoder_, tiles)) {
+                uint64_t patchBytes = 0;
+                for (const auto& tile : tiles) {
+                    patchBytes += tile.data.size();
+                }
+                const uint64_t patchTimestampUs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                const FrameQueueResult patchResult = server_.Broadcaster().BroadcastPatch(
+                    std::move(tiles), streamId_.load(), patchTimestampUs);
+                if (patchResult == FrameQueueResult::kQueued) {
+                    patchQueued = true;
+                    ++metrics.encodedFrames;
+                    metrics.encodedBytes += patchBytes;
+                    if (!framePipelineReady) {
+                        framePipelineReady = true;
+                        if (frameReadyEvent_ && !stop_.load()) {
+                            SetEvent(frameReadyEvent_);
+                        }
+                    }
+                } else if (patchResult == FrameQueueResult::kPatchResyncRequired) {
+                    firstFrame_ = true;
+                    streamKeyFrameRequired_ = true;
+                    if (encoder_->IsH264()) {
+                        encoder_->RequestKeyFrame();
+                    }
+                    resetFramePipelineReady("patch queue resync required");
+                    patchQueued = true;
+                }
+            }
+        }
+
+        if (!patchQueued && encoderReady_ && !frame.Empty()) {
             std::vector<EncodedChunk> chunks;
             const auto encodeStartedAt = std::chrono::steady_clock::now();
             const bool wasH264 = streamH264_.load();
@@ -1449,7 +1697,8 @@ void Agent::CaptureLoop() {
                     const bool h264 = encoder_->IsH264();
                     const FrameQueueResult queueResult =
                         server_.Broadcaster().BroadcastBinary(std::move(c.data), streamId_.load(),
-                                                              c.isKey, c.timestampUs, h264);
+                                                              c.isKey, c.timestampUs, h264,
+                                                              patchCapability);
                     if (!framePipelineReady &&
                         (queueResult == FrameQueueResult::kQueued ||
                          queueResult == FrameQueueResult::kReplaced)) {
@@ -1466,6 +1715,16 @@ void Agent::CaptureLoop() {
                         streamKeyFrameRequired_ = true;
                         encoder_->RequestKeyFrame();
                         log::Warn("H.264 pending delta dropped, requesting IDR resync");
+                        break;
+                    }
+                    if (queueResult == FrameQueueResult::kPatchResyncRequired) {
+                        firstFrame_ = true;
+                        streamKeyFrameRequired_ = true;
+                        if (encoder_->IsH264()) {
+                            encoder_->RequestKeyFrame();
+                        }
+                        resetFramePipelineReady("full frame collided with patch batch");
+                        log::Warn("full frame deferred until patch resync baseline");
                         break;
                     }
                 }
@@ -1527,6 +1786,13 @@ std::string Agent::MakeCfgJson() const {
     j["h"] = deskHeight_.load();
     j["fps"] = streamFps_.load();
     j["stream_id"] = streamId_.load();
+    int qualityValue = requestedStreamQuality_.load(std::memory_order_relaxed);
+    if (!IsStreamQualityValid(qualityValue)) {
+        qualityValue = static_cast<int>(StreamQuality::kAutomatic);
+    }
+    j["quality"] = StreamQualityName(static_cast<StreamQuality>(qualityValue));
+    j["patch_threshold"] = requestedPatchThreshold_.load(std::memory_order_relaxed);
+    j["patches"] = requestedPatchCapability_.load(std::memory_order_relaxed);
     auto mons = nlohmann::json::array();
     for (const auto& m : capture_.MonitorsSnapshot()) {
         mons.push_back({{"index", m.index}, {"name", m.name}, {"w", m.w}, {"h", m.h}});
@@ -1597,6 +1863,25 @@ void Agent::OnMessage(const std::string& msg) {
         // 浏览器在 WebCodecs 状态丢失后请求从独立可解码的 IDR 重新开始。
         frameResetRequested_.store(true);
         WakeGdiCaptureLoop();
+        return;
+    }
+    if (t == "stream") {
+        std::string qualityText;
+        int threshold = 0;
+        bool patches = false;
+        StreamQuality quality = StreamQuality::kAutomatic;
+        if (!ReadJsonString(j, "quality", qualityText) ||
+            !ParseStreamQuality(qualityText, quality) ||
+            !ReadJsonIntInRange(j, "patch_threshold", kMinPatchThresholdPercent,
+                                kMaxPatchThresholdPercent, threshold) ||
+            !IsPatchThresholdValid(threshold) || !ReadJsonBool(j, "patches", patches)) {
+            return;
+        }
+        requestedStreamQuality_.store(static_cast<int>(quality), std::memory_order_relaxed);
+        requestedPatchThreshold_.store(threshold, std::memory_order_relaxed);
+        requestedPatchCapability_.store(patches, std::memory_order_relaxed);
+        streamPreferenceGeneration_.fetch_add(1, std::memory_order_release);
+        WakeGdiCaptureLoop(true);
         return;
     }
     if (t == "monitor") {
@@ -1752,6 +2037,13 @@ void Agent::OnControllerDisconnected() {
     // 下一帧从 IDR 开始，并恢复下一位控制者的质量上限。
     frameResetRequested_.store(true);
     qualityResetRequested_.store(true);
+    // 网页偏好属于当前控制端。断开后立刻恢复默认，避免下一位控制端在旧浏览器
+    // 尚未完成鉴权/能力协商时继承原始分辨率或图块协议。
+    requestedStreamQuality_.store(static_cast<int>(StreamQuality::kAutomatic),
+                                  std::memory_order_relaxed);
+    requestedPatchThreshold_.store(kDefaultPatchThresholdPercent, std::memory_order_relaxed);
+    requestedPatchCapability_.store(false, std::memory_order_relaxed);
+    streamPreferenceGeneration_.fetch_add(1, std::memory_order_release);
 }
 
 }  // namespace remote_assist

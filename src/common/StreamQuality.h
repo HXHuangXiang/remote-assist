@@ -1,14 +1,13 @@
 #pragma once
 
-#include "common/Config.h"
-
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace remote_assist {
 
-// 输出档位按索引从高到低排列。Agent 的自适应逻辑可在压力下向更低档位移动，
-// 但恢复时不会越过由 quality_cap 计算出的最高质量档位。
+// 输出档位按索引从高到低排列。自动模式可在压力下向更低档位移动；固定模式
+// 会锁定所选档位，仍允许 Agent 自适应帧率和码率以保证远程操作可用。
 struct StreamResolutionCap {
     int width;
     int height;
@@ -22,21 +21,61 @@ inline constexpr std::array<StreamResolutionCap, 5> kStreamResolutionCaps = {{
     {640, 360},
 }};
 
-// 将用户配置转换为可恢复到的最高质量档位。调用方只会传入已通过 Config 校验的
-// 数值；对意外值仍保守返回最低档，避免无效配置导致输出超过预期上限。
-constexpr int ResolutionTierForQualityCap(int qualityCap) {
-    if (!IsQualityCapValid(qualityCap)) {
-        return static_cast<int>(kStreamResolutionCaps.size()) - 1;
-    }
-    if (qualityCap == static_cast<int>(QualityCap::kAutomatic)) {
+// 网页传入的推流画质模式。original 保持被控端当前采集尺寸，其余固定档位只
+// 限制分辨率；automatic 才允许 Agent 在链路压力下切换分辨率档位。
+enum class StreamQuality : int {
+    kAutomatic = 0,
+    kOriginal = 1,
+    k1080p = 2,
+    k720p = 3,
+    k540p = 4,
+    k360p = 5,
+};
+
+constexpr int kDefaultPatchThresholdPercent = 50;
+constexpr int kMinPatchThresholdPercent = 10;
+constexpr int kMaxPatchThresholdPercent = 90;
+
+constexpr bool IsStreamQualityValid(int quality) {
+    return quality >= static_cast<int>(StreamQuality::kAutomatic) &&
+        quality <= static_cast<int>(StreamQuality::k360p);
+}
+
+constexpr bool IsPatchThresholdValid(int percent) {
+    return percent >= kMinPatchThresholdPercent &&
+        percent <= kMaxPatchThresholdPercent && percent % 5 == 0;
+}
+
+constexpr bool IsFixedStreamQuality(StreamQuality quality) {
+    return quality != StreamQuality::kAutomatic;
+}
+
+constexpr int ResolutionTierForStreamQuality(StreamQuality quality) {
+    switch (quality) {
+    case StreamQuality::kAutomatic:
+    case StreamQuality::kOriginal:
+    case StreamQuality::k1080p:
         return 0;
-    }
-    for (size_t tier = 0; tier < kStreamResolutionCaps.size(); ++tier) {
-        if (kStreamResolutionCaps[tier].height <= qualityCap) {
-            return static_cast<int>(tier);
-        }
+    case StreamQuality::k720p:
+        return 2;
+    case StreamQuality::k540p:
+        return 3;
+    case StreamQuality::k360p:
+        return 4;
     }
     return static_cast<int>(kStreamResolutionCaps.size()) - 1;
+}
+
+inline const char* StreamQualityName(StreamQuality quality) {
+    switch (quality) {
+    case StreamQuality::kAutomatic: return "auto";
+    case StreamQuality::kOriginal: return "original";
+    case StreamQuality::k1080p: return "1080p";
+    case StreamQuality::k720p: return "720p";
+    case StreamQuality::k540p: return "540p";
+    case StreamQuality::k360p: return "360p";
+    }
+    return "auto";
 }
 
 // H.264 发送窗口满一次可能只是浏览器单次 rAF/GC 抖动；连续两个目标帧周期

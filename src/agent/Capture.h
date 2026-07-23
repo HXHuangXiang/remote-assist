@@ -17,6 +17,15 @@
 
 namespace remote_assist {
 
+// 相对于当前推流输出的变化区域。区域仅描述像素变化，不携带借用的帧内存；Agent
+// 会在 ReleaseFrame 前把它们裁成独立 JPEG 图块，避免浏览器接收整张画面。
+struct DirtyRegion {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
 struct CapturedFrame {
     int width = 0;
     int height = 0;
@@ -39,6 +48,10 @@ struct CapturedFrame {
     // VideoProcessorBlt 调用；它不代表 GPU 完整执行时间，但可定位驱动调用或
     // 每帧资源创建是否已在 CPU 侧成为瓶颈。
     uint64_t gpuNv12SubmissionUs = 0;
+    // true 表示 regions 由 DXGI 元数据或 GDI 精确比较得出。false 时调用方必须
+    // 发送完整画面，不能将空数组误认为“没有变化”。
+    bool hasDirtyRegions = false;
+    std::vector<DirtyRegion> dirtyRegions;
 
     bool IsDirectDxgi() const { return mappedPixels != nullptr && !borrowedGdiPixels; }
     bool IsBorrowedGdi() const { return mappedPixels != nullptr && borrowedGdiPixels; }
@@ -113,6 +126,9 @@ public:
     // 仅由采集线程调用。慢链路时降低输出上限可同时缩短缩放、编码和网络发送时间；
     // 源画面宽高均未超过上限时仍保持原始分辨率。
     void SetMaxOutputSize(int width, int height);
+    // 局部图块模式需要可访问的 BGRA 像素和变化区域。开启后 DXGI 会暂不走直接
+    // NV12 surface 输出；完整帧仍由 H.264 MFT 编码，只是输入来自 CPU 映射。
+    void SetPatchCaptureEnabled(bool enabled);
     // H.264 MFT 确认支持同一 D3D11 设备后启用。GDI、缩放和能力不完整的机器
     // 会继续走现有 CPU 帧路径。当前 D3D11 设备已确认失败时，此调用不会再次
     // 打开 GPU 输出，直到 Desktop Duplication 重建出新的 device generation。
@@ -160,6 +176,13 @@ private:
     void CopyRegionToFrame(const uint8_t* source, size_t sourceStrideBytes,
                            int x, int y, int width, int height,
                            CapturedFrame& out);
+    static void SetOutputDirtyRegions(const std::vector<DirtyRegion>& sourceRegions,
+                                      int sourceWidth, int sourceHeight,
+                                      CapturedFrame& out);
+    static std::vector<DirtyRegion> ReadDxgiDirtyRegions(
+        IDXGIOutputDuplication* duplication, const DXGI_OUTDUPL_FRAME_INFO& frameInfo,
+        int offsetX = 0, int offsetY = 0);
+    std::vector<DirtyRegion> DiffGdiTiles(const uint8_t* pixels, int width, int height);
     void ReleaseAll();
     void UpdatePointerFromDesktop(bool visible, int screenX, int screenY);
     void UpdatePointerFromFrame(const DXGI_OUTDUPL_FRAME_INFO& frameInfo);
@@ -188,6 +211,7 @@ private:
     int compositeHeight_ = 0;
     std::vector<DxgiOutputCapture> dxgiOutputs_;
     bool gpuOutputEnabled_ = false;
+    bool patchCaptureEnabled_ = false;
     // 记录当前设备是否已发生过 GPU 路径故障。0 表示尚未初始化 DXGI device；
     // InitDXGI 成功时 generation 单调递增，因此旧设备的失败不会阻断新设备重试。
     uint64_t gpuOutputDisabledGeneration_ = 0;
@@ -218,6 +242,9 @@ private:
     std::array<uint64_t, kGdiFingerprintPhaseCount> gdiFingerprints_{};
     std::array<bool, kGdiFingerprintPhaseCount> hasGdiFingerprint_{};
     std::chrono::steady_clock::time_point lastGdiFullFrameAt_{};
+    // GDI 无法提供系统级脏矩形。保存上一张最终 DIB 后按小图块精确比较，既覆盖
+    // 锁屏/跨显卡回退，也不依赖容易漏掉细小变化的稀疏指纹。
+    std::vector<uint8_t> gdiPreviousFrame_;
     uint64_t gdiConsecutiveFailures_ = 0;
     std::chrono::steady_clock::time_point lastGdiFailureLogAt_{};
 

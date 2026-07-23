@@ -197,6 +197,7 @@ bool EncoderMf::Init(int width, int height, int fps, int bitrateBps, ID3D11Devic
     height_ = height;
     fps_ = std::max(1, fps);
     bitrateBps_ = std::max(100'000, bitrateBps);
+    quality_ = 55;
     d3dDevice_ = d3dDevice;
     frameIndex_ = 0;
     timelineStartedAt_ = std::chrono::steady_clock::now();
@@ -914,10 +915,7 @@ bool EncoderMf::SubmitH264Sample(IMFSample* inputSample, std::vector<EncodedChun
 
 bool EncoderMf::InitJpeg() {
     quality_ = 55;  // 低延迟远控:固定较低质量,减小帧体积。
-    const HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                        IID_PPV_ARGS(&wicFactory_));
-    if (FAILED(hr)) {
-        log::Error("WIC factory failed hr=" + std::to_string(hr));
+    if (!EnsureWicFactory()) {
         return false;
     }
     mode_ = EncoderMode::kJpeg;
@@ -927,8 +925,52 @@ bool EncoderMf::InitJpeg() {
     return true;
 }
 
+bool EncoderMf::EnsureWicFactory() {
+    if (wicFactory_.Get()) {
+        return true;
+    }
+    const HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                        IID_PPV_ARGS(&wicFactory_));
+    if (FAILED(hr)) {
+        log::Error("WIC factory failed hr=" + std::to_string(hr));
+        return false;
+    }
+    return true;
+}
+
 bool EncoderMf::EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes,
                            std::vector<EncodedChunk>& out) {
+    std::vector<uint8_t> jpeg;
+    if (!EncodeJpegImage(width_, height_, bgra, bgraStrideBytes, jpeg)) {
+        return false;
+    }
+    EncodedChunk chunk;
+    chunk.data = std::move(jpeg);
+    chunk.isKey = true;
+    const LONGLONG timestamp100Ns = NextInputTimestamp100Ns();
+    chunk.timestampUs = static_cast<uint64_t>(timestamp100Ns) / 10;
+    lastInputTimestamp100Ns_ = timestamp100Ns;
+    ++frameIndex_;
+    out.clear();
+    out.push_back(std::move(chunk));
+    return true;
+}
+
+bool EncoderMf::EncodeJpegTile(int width, int height, const uint8_t* bgra,
+                                size_t bgraStrideBytes, std::vector<uint8_t>& out) {
+    // H.264 成功初始化时也需要 JPEG 图块，因此不能依赖 InitJpeg 的回退路径。
+    if (quality_ <= 0) {
+        quality_ = 55;
+    }
+    return EncodeJpegImage(width, height, bgra, bgraStrideBytes, out);
+}
+
+bool EncoderMf::EncodeJpegImage(int width, int height, const uint8_t* bgra,
+                                size_t bgraStrideBytes, std::vector<uint8_t>& out) {
+    if (!bgra || width <= 0 || height <= 0 ||
+        bgraStrideBytes < static_cast<size_t>(width) * 4 || !EnsureWicFactory()) {
+        return false;
+    }
     auto* stream = new MemoryStream();
     Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
     HRESULT hr = wicFactory_->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder);
@@ -937,13 +979,13 @@ bool EncoderMf::EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes,
     if (FAILED(hr)) { stream->Release(); return false; }
 
     if (bgraStrideBytes > std::numeric_limits<UINT>::max() ||
-        static_cast<size_t>(height_) > std::numeric_limits<UINT>::max() / bgraStrideBytes) {
+        static_cast<size_t>(height) > std::numeric_limits<UINT>::max() / bgraStrideBytes) {
         stream->Release();
         return false;
     }
     Microsoft::WRL::ComPtr<IWICBitmap> bitmap;
-    hr = wicFactory_->CreateBitmapFromMemory(width_, height_, GUID_WICPixelFormat32bppBGRA,
-        static_cast<UINT>(bgraStrideBytes), static_cast<UINT>(bgraStrideBytes * height_),
+    hr = wicFactory_->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppBGRA,
+        static_cast<UINT>(bgraStrideBytes), static_cast<UINT>(bgraStrideBytes * height),
         const_cast<BYTE*>(bgra), &bitmap);
     if (FAILED(hr)) { stream->Release(); log::Error("WIC bitmap failed hr=" + std::to_string(hr)); return false; }
 
@@ -979,19 +1021,11 @@ bool EncoderMf::EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes,
         return false;
     }
 
-    EncodedChunk chunk;
-    chunk.data = stream->TakeData();
+    out = stream->TakeData();
     stream->Release();
-    if (chunk.data.empty()) {
+    if (out.empty()) {
         return false;
     }
-    chunk.isKey = true;
-    const LONGLONG timestamp100Ns = NextInputTimestamp100Ns();
-    chunk.timestampUs = static_cast<uint64_t>(timestamp100Ns) / 10;
-    lastInputTimestamp100Ns_ = timestamp100Ns;
-    ++frameIndex_;
-    out.clear();
-    out.push_back(std::move(chunk));
     return true;
 }
 

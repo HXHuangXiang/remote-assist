@@ -55,6 +55,10 @@ public:
     // 同一 D3D11 设备上的 NV12 surface 可直接输入硬件 MFT，跳过 CPU 读回和
     // BGRA->NV12 转换。失败由调用方重新初始化为已有 CPU 路径。
     bool EncodeD3D11(ID3D11Texture2D* nv12Texture, std::vector<EncodedChunk>& out);
+    // 局部刷新使用独立 JPEG 图块，不能复用当前 H.264 的帧尺寸状态。该方法只
+    // 编码指定的紧凑 BGRA 图像，不会推进 H.264 的参考帧或时间线。
+    bool EncodeJpegTile(int width, int height, const uint8_t* bgra, size_t bgraStrideBytes,
+                        std::vector<uint8_t>& out);
     bool CanEncodeD3D11() const { return d3dInputEnabled_; }
     // 仅由编码所在的采集线程在 Encode/EncodeD3D11 返回后读取。
     const EncoderFrameTiming& LastFrameTiming() const { return lastFrameTiming_; }
@@ -85,6 +89,9 @@ private:
     bool SubmitH264Sample(IMFSample* inputSample, std::vector<EncodedChunk>& out);
     bool DrainH264(std::vector<EncodedChunk>& out);
     bool EncodeJpeg(const uint8_t* bgra, size_t bgraStrideBytes, std::vector<EncodedChunk>& out);
+    bool EncodeJpegImage(int width, int height, const uint8_t* bgra, size_t bgraStrideBytes,
+                         std::vector<uint8_t>& out);
+    bool EnsureWicFactory();
     DWORD H264OutputBufferTargetSize() const;
     // 采集帧率会被 Agent 根据网络和编码压力动态下调，因此不能继续以初始化时的
     // fps_ 推导 PTS。使用单调时钟为 MFT/WebCodecs 提供真实、严格递增的时间基。

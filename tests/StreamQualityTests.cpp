@@ -1,4 +1,3 @@
-#include "common/Config.h"
 #include "net/ControllerHandoff.h"
 #include "common/StreamQuality.h"
 #include "net/H264FlowControl.h"
@@ -20,42 +19,53 @@ bool Expect(bool condition, const char* message) {
 }  // namespace
 
 int main() {
-    using remote_assist::IsQualityCapValid;
+    using remote_assist::IsPatchThresholdValid;
+    using remote_assist::IsFixedStreamQuality;
+    using remote_assist::IsStreamQualityValid;
     using remote_assist::H264DeltaRequiresResync;
     using remote_assist::HasSustainedH264CreditBackpressure;
     using remote_assist::HasH264FrameCredit;
     using remote_assist::ControllerHandoff;
     using remote_assist::NextH264AckTimeoutAfterAck;
     using remote_assist::NextH264AckTimeoutAfterTimeout;
-    using remote_assist::QualityCap;
-    using remote_assist::ResolutionTierForQualityCap;
+    using remote_assist::ResolutionTierForStreamQuality;
+    using remote_assist::StreamQuality;
     using remote_assist::kStreamResolutionCaps;
 
     bool ok = true;
-    ok &= Expect(IsQualityCapValid(static_cast<int>(QualityCap::kAutomatic)),
-                 "automatic quality cap should be valid");
-    ok &= Expect(IsQualityCapValid(static_cast<int>(QualityCap::k1080p)),
-                 "1080p quality cap should be valid");
-    ok &= Expect(IsQualityCapValid(static_cast<int>(QualityCap::k720p)),
-                 "720p quality cap should be valid");
-    ok &= Expect(IsQualityCapValid(static_cast<int>(QualityCap::k540p)),
-                 "540p quality cap should be valid");
-    ok &= Expect(!IsQualityCapValid(900), "unsupported quality cap should be rejected");
-
-    ok &= Expect(ResolutionTierForQualityCap(static_cast<int>(QualityCap::kAutomatic)) == 0,
+    ok &= Expect(IsStreamQualityValid(static_cast<int>(StreamQuality::kAutomatic)),
+                 "automatic quality should be valid");
+    ok &= Expect(IsStreamQualityValid(static_cast<int>(StreamQuality::kOriginal)),
+                 "original quality should be valid");
+    ok &= Expect(IsStreamQualityValid(static_cast<int>(StreamQuality::k360p)),
+                 "360p quality should be valid");
+    ok &= Expect(!IsStreamQualityValid(99), "unsupported stream quality should be rejected");
+    ok &= Expect(ResolutionTierForStreamQuality(StreamQuality::kAutomatic) == 0,
                  "automatic should begin at 1080p tier");
-    ok &= Expect(ResolutionTierForQualityCap(static_cast<int>(QualityCap::k1080p)) == 0,
-                 "1080p should begin at 1080p tier");
-    ok &= Expect(ResolutionTierForQualityCap(static_cast<int>(QualityCap::k720p)) == 2,
+    ok &= Expect(ResolutionTierForStreamQuality(StreamQuality::kOriginal) == 0,
+                 "original should use the top tier before removing its output cap");
+    ok &= Expect(ResolutionTierForStreamQuality(StreamQuality::k1080p) == 0,
+                 "1080p should select the 1080p tier");
+    ok &= Expect(ResolutionTierForStreamQuality(StreamQuality::k720p) == 2,
                  "720p should skip 1080p and 900p tiers");
-    ok &= Expect(ResolutionTierForQualityCap(static_cast<int>(QualityCap::k540p)) == 3,
-                 "540p should begin at 540p tier");
-    ok &= Expect(ResolutionTierForQualityCap(900) ==
-                     static_cast<int>(kStreamResolutionCaps.size()) - 1,
-                 "unexpected quality cap should fall back to the lowest tier");
-    ok &= Expect(kStreamResolutionCaps[ResolutionTierForQualityCap(
-                     static_cast<int>(QualityCap::k720p))].height == 720,
-                 "720p quality cap should select 720p height");
+    ok &= Expect(ResolutionTierForStreamQuality(StreamQuality::k540p) == 3,
+                 "540p should select the 540p tier");
+    ok &= Expect(ResolutionTierForStreamQuality(StreamQuality::k360p) == 4,
+                 "360p should select the lowest tier");
+    ok &= Expect(!IsFixedStreamQuality(StreamQuality::kAutomatic) &&
+                     IsFixedStreamQuality(StreamQuality::kOriginal) &&
+                     IsFixedStreamQuality(StreamQuality::k1080p) &&
+                     IsFixedStreamQuality(StreamQuality::k360p),
+                 "only automatic quality may adapt its output resolution");
+    ok &= Expect(kStreamResolutionCaps[ResolutionTierForStreamQuality(
+                     StreamQuality::k720p)].height == 720,
+                 "720p quality should select 720p height");
+    ok &= Expect(IsPatchThresholdValid(10) && IsPatchThresholdValid(50) &&
+                     IsPatchThresholdValid(90),
+                 "patch thresholds at supported bounds should be valid");
+    ok &= Expect(!IsPatchThresholdValid(9) && !IsPatchThresholdValid(91) &&
+                     !IsPatchThresholdValid(52),
+                 "patch threshold must use the supported five-percent steps");
 
     ok &= Expect(!H264DeltaRequiresResync(true, true, true, true),
                  "H.264 key frames may replace an obsolete pending frame");

@@ -134,10 +134,13 @@ bool WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
     }
     client_ = ws;
     pendingFrame_.clear();
+    pendingTiles_.clear();
     pendingStreamId_ = 0;
     pendingTimestampUs_ = 0;
     pendingKeyFrame_ = true;
     pendingH264_ = false;
+    pendingPatch_ = false;
+    pendingPatchBaseline_ = false;
     pendingText_.clear();
     pendingReplaceableText_.clear();
     preferReplaceableText_ = false;
@@ -146,6 +149,7 @@ bool WsBroadcaster::Add(httplib::ws::WebSocket* ws) {
     h264AckTimeoutInitialized_ = false;
     h264AckTimeoutMs_.store(h264AckTimeoutWindowMs_, std::memory_order_relaxed);
     h264ResyncRequested_.store(false, std::memory_order_release);
+    patchResyncRequested_.store(false, std::memory_order_release);
     frameCv_.notify_all();
     controllerCv_.notify_all();
     return true;
@@ -165,15 +169,19 @@ bool WsBroadcaster::Remove(httplib::ws::WebSocket* ws) {
         std::lock_guard<std::mutex> lk(frameMu_);
         // 新控制端连接后由采集线程生成首帧；不要把断连前的旧图像带过去。
         pendingFrame_.clear();
+        pendingTiles_.clear();
         pendingStreamId_ = 0;
         pendingTimestampUs_ = 0;
         pendingKeyFrame_ = true;
         pendingH264_ = false;
+        pendingPatch_ = false;
+        pendingPatchBaseline_ = false;
         pendingText_.clear();
         pendingReplaceableText_.clear();
         preferReplaceableText_ = false;
         inFlightFrames_.clear();
         h264ResyncRequested_.store(false, std::memory_order_release);
+        patchResyncRequested_.store(false, std::memory_order_release);
         frameCv_.notify_all();
     }
     controllerCv_.notify_all();
@@ -210,18 +218,33 @@ bool WsBroadcaster::WaitForActiveController(std::chrono::milliseconds timeout) {
 
 FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
                                                 uint64_t streamId, bool isKeyFrame,
-                                                uint64_t timestampUs, bool h264) {
+                                                uint64_t timestampUs, bool h264,
+                                                bool patchBaseline) {
     bool replaced = false;
     {
         std::lock_guard<std::mutex> lk(frameMu_);
         if (stopping_) {
             return FrameQueueResult::kStopped;
         }
+        // 图块超时后只有采集线程完成流版本切换、请求新的完整关键帧后才能恢复。
+        // 否则一张恰好并发入队的普通 JPEG/H.264 帧会越过重同步边界，重新成为
+        // 不可信画布上的“基线”。
+        if (patchResyncRequested_.load(std::memory_order_acquire)) {
+            return FrameQueueResult::kPatchResyncRequired;
+        }
         // ACK 超时已经宣布旧 GOP 失效时，采集线程可能刚好在一次信用等待中醒来。
         // 在这里再次拒绝 delta，确保超时后的下一条视频负载只能是新的 IDR。
         if (H264DeltaRequiresResync(h264, isKeyFrame, false,
                                     h264ResyncRequested_.load(std::memory_order_acquire))) {
             return FrameQueueResult::kH264ResyncRequired;
+        }
+        if (pendingPatch_) {
+            // 图块批次不能被整帧静默覆盖。浏览器可能已经绘制了其中一部分，只有
+            // 新的完整基线才能重新建立一致画面。
+            pendingTiles_.clear();
+            pendingPatch_ = false;
+            patchResyncRequested_.store(true, std::memory_order_release);
+            return FrameQueueResult::kPatchResyncRequired;
         }
         if (!pendingFrame_.empty()) {
             // JPEG 帧没有前后依赖，直接替换可把延迟保持在一帧以内。H.264
@@ -243,6 +266,8 @@ FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
         pendingStreamId_ = streamId;
         pendingKeyFrame_ = isKeyFrame;
         pendingH264_ = h264;
+        pendingPatch_ = false;
+        pendingPatchBaseline_ = patchBaseline;
         pendingTimestampUs_ = timestampUs;
         queuedFrames_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -250,8 +275,44 @@ FrameQueueResult WsBroadcaster::BroadcastBinary(std::vector<uint8_t> frame,
     return replaced ? FrameQueueResult::kReplaced : FrameQueueResult::kQueued;
 }
 
+FrameQueueResult WsBroadcaster::BroadcastPatch(std::vector<JpegTile> tiles,
+                                               uint64_t streamId, uint64_t timestampUs) {
+    if (tiles.empty()) {
+        return FrameQueueResult::kStopped;
+    }
+    {
+        std::lock_guard<std::mutex> lk(frameMu_);
+        if (stopping_) {
+            return FrameQueueResult::kStopped;
+        }
+        if (patchResyncRequested_.load(std::memory_order_acquire)) {
+            return FrameQueueResult::kPatchResyncRequired;
+        }
+        // 局部更新依赖前一张已绘制画面。只要队列或窗口中还有视频更新，当前
+        // 批次就不能覆盖它，否则页面会缺少中间像素而永久不同步。
+        if (!pendingFrame_.empty() || pendingPatch_ || !inFlightFrames_.empty()) {
+            patchResyncRequested_.store(true, std::memory_order_release);
+            return FrameQueueResult::kPatchResyncRequired;
+        }
+        pendingTiles_ = std::move(tiles);
+        pendingStreamId_ = streamId;
+        pendingTimestampUs_ = timestampUs;
+        pendingKeyFrame_ = false;
+        pendingH264_ = false;
+        pendingPatch_ = true;
+        pendingPatchBaseline_ = false;
+        queuedFrames_.fetch_add(1, std::memory_order_relaxed);
+    }
+    frameCv_.notify_one();
+    return FrameQueueResult::kQueued;
+}
+
 bool WsBroadcaster::ConsumeH264ResyncRequest() {
     return h264ResyncRequested_.exchange(false, std::memory_order_acq_rel);
+}
+
+bool WsBroadcaster::ConsumePatchResyncRequest() {
+    return patchResyncRequested_.exchange(false, std::memory_order_acq_rel);
 }
 
 bool WsBroadcaster::WaitForH264FrameCredit(std::chrono::milliseconds timeout) {
@@ -262,12 +323,27 @@ bool WsBroadcaster::WaitForH264FrameCredit(std::chrono::milliseconds timeout) {
         // 一帧可见延迟。两个槽位已足以让网络写、硬件解码和下一帧编码并行。
         // ACK 超时要求重建 GOP 时也要立刻退出，交由采集线程先消费重同步请求。
         const bool resyncRequested = h264ResyncRequested_.load(std::memory_order_acquire);
+        const bool patchInFlight = std::any_of(inFlightFrames_.begin(), inFlightFrames_.end(),
+            [](const InFlightFrame& frame) { return frame.patch; });
         return stopping_ || resyncRequested ||
-            HasH264FrameCredit(!pendingFrame_.empty(), inFlightFrames_.size(), false, false);
+            (!patchInFlight && HasH264FrameCredit(
+                !pendingFrame_.empty() || pendingPatch_, inFlightFrames_.size(), false, false));
     });
-    return ready && HasH264FrameCredit(!pendingFrame_.empty(), inFlightFrames_.size(),
-                                       h264ResyncRequested_.load(std::memory_order_acquire),
-                                       stopping_);
+    const bool patchInFlight = std::any_of(inFlightFrames_.begin(), inFlightFrames_.end(),
+        [](const InFlightFrame& frame) { return frame.patch; });
+    return ready && !patchInFlight && HasH264FrameCredit(
+        !pendingFrame_.empty() || pendingPatch_, inFlightFrames_.size(),
+        h264ResyncRequested_.load(std::memory_order_acquire), stopping_);
+}
+
+bool WsBroadcaster::WaitForPatchFrameCredit(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(frameMu_);
+    const bool ready = frameCv_.wait_for(lk, timeout, [this] {
+        return stopping_ || patchResyncRequested_.load(std::memory_order_acquire) ||
+            (pendingFrame_.empty() && !pendingPatch_ && inFlightFrames_.empty());
+    });
+    return ready && !stopping_ && !patchResyncRequested_.load(std::memory_order_acquire) &&
+        pendingFrame_.empty() && !pendingPatch_ && inFlightFrames_.empty();
 }
 
 void WsBroadcaster::BroadcastText(std::string msg, bool replaceable) {
@@ -364,15 +440,19 @@ void WsBroadcaster::Stop() {
         }
         stopping_ = true;
         pendingFrame_.clear();
+        pendingTiles_.clear();
         pendingStreamId_ = 0;
         pendingTimestampUs_ = 0;
         pendingKeyFrame_ = true;
         pendingH264_ = false;
+        pendingPatch_ = false;
+        pendingPatchBaseline_ = false;
         pendingText_.clear();
         pendingReplaceableText_.clear();
         preferReplaceableText_ = false;
         inFlightFrames_.clear();
         h264ResyncRequested_.store(false, std::memory_order_release);
+        patchResyncRequested_.store(false, std::memory_order_release);
     }
     frameCv_.notify_all();
     if (senderThread_.joinable()) {
@@ -383,12 +463,14 @@ void WsBroadcaster::Stop() {
 void WsBroadcaster::SendLoop() {
     for (;;) {
         std::vector<uint8_t> frame;
+        std::vector<JpegTile> tiles;
         std::string text;
         uint64_t streamId = 0;
         uint64_t frameId = 0;
         uint64_t timestampUs = 0;
         bool isKeyFrame = true;
         bool h264 = false;
+        bool patch = false;
         bool sendingFrame = false;
         {
             std::unique_lock<std::mutex> lk(frameMu_);
@@ -405,18 +487,37 @@ void WsBroadcaster::SendLoop() {
                     // 即使持续有 cursor 消息，也必须按时释放超时帧窗口；否则高频
                     // 指针移动会让 H.264 信用窗口永久卡在满载状态。
                     const bool h264Timeout = expired->h264;
+                    const bool patchTimeout = expired->patch || expired->patchBaseline;
                     ackTimeouts_.fetch_add(1, std::memory_order_relaxed);
                     inFlightFrames_.erase(expired);
-                    if (h264Timeout) {
+                    if (patchTimeout) {
+                        // 图块批次或其完整基线未在时限内完成合成时，继续发送下一批
+                        // 会让浏览器失去中间像素。清空队列并请求新的完整关键帧。
+                        pendingFrame_.clear();
+                        pendingTiles_.clear();
+                        pendingStreamId_ = 0;
+                        pendingTimestampUs_ = 0;
+                        pendingKeyFrame_ = true;
+                        pendingH264_ = false;
+                        pendingPatch_ = false;
+                        pendingPatchBaseline_ = false;
+                        inFlightFrames_.clear();
+                        patchResyncRequested_.store(true, std::memory_order_release);
+                        log::Warn("patch baseline or batch ack timed out, requesting full-frame resync");
+                        frameCv_.notify_all();
+                    } else if (h264Timeout) {
                         // TCP 仍会按顺序交付已经写出的预测帧，但浏览器 300ms 未能
                         // 绘制时继续发送 P 帧只会放大陈旧画面。清空尚未发出的帧，
                         // 由采集线程请求新 IDR；已在 socket 缓冲中的旧帧无法撤回，
                         // 但随后的独立 GOP 可以让浏览器快速丢弃并重新建立参考链。
                         pendingFrame_.clear();
+                        pendingTiles_.clear();
                         pendingStreamId_ = 0;
                         pendingTimestampUs_ = 0;
                         pendingKeyFrame_ = true;
                         pendingH264_ = false;
+                        pendingPatch_ = false;
+                        pendingPatchBaseline_ = false;
                         inFlightFrames_.clear();
                         h264Resyncs_.fetch_add(1, std::memory_order_relaxed);
                         h264ResyncRequested_.store(true, std::memory_order_release);
@@ -441,8 +542,11 @@ void WsBroadcaster::SendLoop() {
                     pendingText_.pop_front();
                     break;
                 }
-                const bool canSendFrame = inFlightFrames_.size() < kFrameWindowCapacity &&
+                const bool hasPendingFrame = pendingPatch_ ? !pendingTiles_.empty() :
                     !pendingFrame_.empty();
+                const bool canSendFrame = hasPendingFrame &&
+                    ((pendingPatch_ || pendingPatchBaseline_) ? inFlightFrames_.empty() :
+                     inFlightFrames_.size() < kFrameWindowCapacity);
                 if (!pendingReplaceableText_.empty() &&
                     (!canSendFrame || preferReplaceableText_)) {
                     text = std::move(pendingReplaceableText_);
@@ -451,13 +555,21 @@ void WsBroadcaster::SendLoop() {
                     break;
                 }
                 if (canSendFrame) {
-                    frame.swap(pendingFrame_);
+                    patch = pendingPatch_;
+                    if (patch) {
+                        tiles.swap(pendingTiles_);
+                    } else {
+                        frame.swap(pendingFrame_);
+                    }
                     streamId = pendingStreamId_;
                     pendingStreamId_ = 0;
                     isKeyFrame = pendingKeyFrame_;
                     pendingKeyFrame_ = true;
                     h264 = pendingH264_;
                     pendingH264_ = false;
+                    const bool patchBaseline = pendingPatchBaseline_;
+                    pendingPatchBaseline_ = false;
+                    pendingPatch_ = false;
                     timestampUs = pendingTimestampUs_;
                     pendingTimestampUs_ = 0;
                     frameId = nextFrameId_++;
@@ -467,6 +579,8 @@ void WsBroadcaster::SendLoop() {
                     InFlightFrame inFlight;
                     inFlight.id = frameId;
                     inFlight.h264 = h264;
+                    inFlight.patch = patch;
+                    inFlight.patchBaseline = patchBaseline;
                     inFlightFrames_.push_back(std::move(inFlight));
                     preferReplaceableText_ = true;
                     sendingFrame = true;
@@ -496,8 +610,11 @@ void WsBroadcaster::SendLoop() {
                     if (frameCv_.wait_until(lk, deadline, [this] {
                         return stopping_ ||
                             !pendingText_.empty() || !pendingReplaceableText_.empty() ||
-                            (inFlightFrames_.size() < kFrameWindowCapacity &&
-                             !pendingFrame_.empty());
+                            (((pendingPatch_ || pendingPatchBaseline_) && inFlightFrames_.empty() &&
+                              (pendingPatch_ ? !pendingTiles_.empty() : !pendingFrame_.empty())) ||
+                             (!pendingPatch_ && !pendingPatchBaseline_ &&
+                              inFlightFrames_.size() < kFrameWindowCapacity &&
+                              !pendingFrame_.empty()));
                         })) {
                         continue;
                     }
@@ -506,7 +623,11 @@ void WsBroadcaster::SendLoop() {
                 frameCv_.wait(lk, [this] {
                     return stopping_ ||
                         !pendingText_.empty() || !pendingReplaceableText_.empty() ||
-                        (inFlightFrames_.size() < kFrameWindowCapacity && !pendingFrame_.empty());
+                        (((pendingPatch_ || pendingPatchBaseline_) && inFlightFrames_.empty() &&
+                          (pendingPatch_ ? !pendingTiles_.empty() : !pendingFrame_.empty())) ||
+                         (!pendingPatch_ && !pendingPatchBaseline_ &&
+                          inFlightFrames_.size() < kFrameWindowCapacity &&
+                          !pendingFrame_.empty()));
                 });
             }
         }
@@ -522,13 +643,30 @@ void WsBroadcaster::SendLoop() {
             if (client_ && client_->is_open()) {
                 if (!sendingFrame) {
                     sent = client_->send(text);
-                } else {
+                } else if (!patch) {
                     const std::string header = "{\"t\":\"frame\",\"id\":" +
                         std::to_string(frameId) + ",\"stream_id\":" + std::to_string(streamId) +
                         ",\"key\":" + (isKeyFrame ? "true" : "false") +
                         ",\"ts\":" + std::to_string(timestampUs) + "}";
                     sent = client_->send(header) &&
                         client_->send(reinterpret_cast<const char*>(frame.data()), frame.size());
+                } else {
+                    const std::string header = "{\"t\":\"patch\",\"id\":" +
+                        std::to_string(frameId) + ",\"stream_id\":" + std::to_string(streamId) +
+                        ",\"count\":" + std::to_string(tiles.size()) + ",\"ts\":" +
+                        std::to_string(timestampUs) + "}";
+                    sent = client_->send(header);
+                    for (size_t index = 0; sent && index < tiles.size(); ++index) {
+                        const JpegTile& tile = tiles[index];
+                        const std::string tileHeader = "{\"t\":\"tile\",\"id\":" +
+                            std::to_string(frameId) + ",\"i\":" + std::to_string(index) +
+                            ",\"x\":" + std::to_string(tile.x) + ",\"y\":" +
+                            std::to_string(tile.y) + ",\"w\":" + std::to_string(tile.width) +
+                            ",\"h\":" + std::to_string(tile.height) + "}";
+                        sent = client_->send(tileHeader) &&
+                            client_->send(reinterpret_cast<const char*>(tile.data.data()),
+                                          tile.data.size());
+                    }
                 }
                 if (!sent && client_->is_open()) {
                     // 视频帧由文本元数据和紧随其后的二进制负载组成。若前者成功、
@@ -559,15 +697,21 @@ void WsBroadcaster::SendLoop() {
                     } else {
                         it->writeCompleted = true;
                         it->sentAt = writeCompletedAt;
-                        it->ackDeadline = writeCompletedAt + (it->h264
-                            ? std::chrono::milliseconds(h264AckTimeoutWindowMs_)
-                            : kJpegFrameAckTimeout);
+                        it->ackDeadline = writeCompletedAt +
+                            ((it->patch || it->patchBaseline) ? std::chrono::milliseconds(1000)
+                             : (it->h264
+                                ? std::chrono::milliseconds(h264AckTimeoutWindowMs_)
+                                : kJpegFrameAckTimeout));
                     }
                     frameCv_.notify_all();
                 }
             }
             sentFrames_.fetch_add(1, std::memory_order_relaxed);
-            sentBytes_.fetch_add(static_cast<uint64_t>(frame.size()), std::memory_order_relaxed);
+            uint64_t sentBytes = static_cast<uint64_t>(frame.size());
+            for (const auto& tile : tiles) {
+                sentBytes += static_cast<uint64_t>(tile.data.size());
+            }
+            sentBytes_.fetch_add(sentBytes, std::memory_order_relaxed);
             if (acknowledgedDuringWrite) {
                 acknowledgedFrames_.fetch_add(1, std::memory_order_relaxed);
             }

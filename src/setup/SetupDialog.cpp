@@ -35,7 +35,6 @@ enum {
     IDC_HIDE_TRAY,
     IDC_EXIT,
     IDC_PORT_EDIT,
-    IDC_QUALITY_COMBO,
     IDM_TRAY_SHOW = 2001,
     IDM_TRAY_HIDE,
     IDM_TRAY_EXIT,
@@ -649,7 +648,7 @@ static void StartAsyncOperation(HWND hwnd, AsyncOperation operation, bool update
     }
     SetDlgItemTextW(hwnd, IDC_STATUS, status);
     constexpr int kBusyControls[] = {
-        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_QUALITY_COMBO, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
+        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
         IDC_SVC_START, IDC_SVC_STOP, IDC_RUN_AGENT, IDC_HIDE_TRAY, IDC_EXIT,
     };
     for (const int id : kBusyControls) {
@@ -715,61 +714,11 @@ bool ReadPort(HWND hwnd, int& port) {
     return true;
 }
 
-// ComboBox 的顺序与界面文案绑定，而实际持久化值使用 QualityCap 的底层整数；集中
-// 转换避免将控件下标直接写进 config.json，未来调整展示顺序也不会破坏已有配置。
-int QualityCapFromComboSelection(LRESULT selection) {
-    switch (selection) {
-    case 0:
-        return static_cast<int>(QualityCap::kAutomatic);
-    case 1:
-        return static_cast<int>(QualityCap::k1080p);
-    case 2:
-        return static_cast<int>(QualityCap::k720p);
-    case 3:
-        return static_cast<int>(QualityCap::k540p);
-    default:
-        return -1;
-    }
-}
-
-int ComboSelectionForQualityCap(int qualityCap) {
-    switch (static_cast<QualityCap>(qualityCap)) {
-    case QualityCap::kAutomatic:
-        return 0;
-    case QualityCap::k1080p:
-        return 1;
-    case QualityCap::k720p:
-        return 2;
-    case QualityCap::k540p:
-        return 3;
-    }
-    return 0;
-}
-
-bool ReadQualityCap(HWND hwnd, int& qualityCap) {
-    const HWND combo = GetDlgItem(hwnd, IDC_QUALITY_COMBO);
-    if (!combo) {
-        return false;
-    }
-    qualityCap = QualityCapFromComboSelection(SendMessageW(combo, CB_GETCURSEL, 0, 0));
-    if (!IsQualityCapValid(qualityCap)) {
-        MessageBoxW(hwnd, L"请选择有效的画质上限。", L"RemoteAssist",
-                    MB_OK | MB_ICONWARNING);
-        return false;
-    }
-    return true;
-}
-
 bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
     int port = 0;
     if (!ReadPort(hwnd, port)) {
         return false;
     }
-    int qualityCap = 0;
-    if (!ReadQualityCap(hwnd, qualityCap)) {
-        return false;
-    }
-
     std::string password;
     if (!ReadPasswordUtf8(hwnd, password)) {
         MessageBoxW(hwnd,
@@ -779,15 +728,13 @@ bool SaveSettingsFromControls(HWND hwnd, bool& changed, bool& portChanged) {
     }
     const bool passwordChanged = !password.empty();
     portChanged = g_cfg.port != port;
-    const bool qualityCapChanged = g_cfg.qualityCap != qualityCap;
-    changed = passwordChanged || portChanged || qualityCapChanged;
+    changed = passwordChanged || portChanged;
     if (!changed) {
         return true;
     }
 
     const Config original = g_cfg;
     g_cfg.port = port;
-    g_cfg.qualityCap = qualityCap;
     const bool saved = passwordChanged ? SetPassword(g_cfg, password) : SaveConfig(g_cfg);
     // PBKDF2 已在 SetPassword 内完成，配置文件只保留哈希；编辑框清空前也要擦除
     // 这个短生命周期 UTF-8 副本，避免明文在堆中额外停留到函数返回之后。
@@ -925,7 +872,7 @@ static void RestoreSetupTrayOwnership() {
 
 static void SetOperationControlsEnabled(HWND hwnd, BOOL enabled) {
     constexpr int kOperationControls[] = {
-        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_QUALITY_COMBO, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
+        IDC_PW_EDIT, IDC_PW_SAVE, IDC_PORT_EDIT, IDC_SVC_INSTALL, IDC_SVC_UNINSTALL,
         IDC_SVC_START, IDC_SVC_STOP, IDC_RUN_AGENT, IDC_HIDE_TRAY, IDC_EXIT,
     };
     for (const int id : kOperationControls) {
@@ -1108,19 +1055,6 @@ static void CreateControls(HWND hwnd) {
 
     mk(0, L"STATIC", L"\u7aef\u53e3:", 28, 88, 72, 28, 0);
     mk(IDC_PORT_EDIT, L"EDIT", L"7980", 100, 84, 110, 38, ES_NUMBER | WS_BORDER);
-    mk(0, L"STATIC", L"\u753b\u8d28\u4e0a\u9650:", 232, 88, 120, 28, 0);
-    HWND qualityCombo = mk(IDC_QUALITY_COMBO, L"COMBOBOX", L"", 352, 82, 228, 200,
-                           CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP | WS_VSCROLL);
-    SendMessageW(qualityCombo, CB_ADDSTRING, 0,
-                 reinterpret_cast<LPARAM>(L"\u81ea\u52a8\uff08\u6700\u9ad81080p\uff09"));
-    SendMessageW(qualityCombo, CB_ADDSTRING, 0,
-                 reinterpret_cast<LPARAM>(L"\u6700\u9ad81080p"));
-    SendMessageW(qualityCombo, CB_ADDSTRING, 0,
-                 reinterpret_cast<LPARAM>(L"\u6700\u9ad8720p"));
-    SendMessageW(qualityCombo, CB_ADDSTRING, 0,
-                 reinterpret_cast<LPARAM>(L"\u6700\u9ad8540p"));
-    SendMessageW(qualityCombo, CB_SETCURSEL, 0, 0);
-
     mk(0, L"STATIC", L"\u72b6\u6001:", 28, 142, 72, 28, 0);
     mk(IDC_STATUS, L"STATIC", L"...", 100, 142, 480, 28, 0);
 
@@ -1190,8 +1124,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SecureClearString(g_cfg.initialPassword);
         }
         SetDlgItemTextA(hwnd, IDC_PORT_EDIT, std::to_string(g_cfg.port).c_str());
-        SendMessageW(GetDlgItem(hwnd, IDC_QUALITY_COMBO), CB_SETCURSEL,
-                     ComboSelectionForQualityCap(g_cfg.qualityCap), 0);
         UpdateStatus();
         // Agent 的 listener-ready/frame-ready 事件会在配置窗口打开后继续变化。
         // 用低频轮询刷新状态，避免用户已连接并收到画面但界面仍停留在旧提示。

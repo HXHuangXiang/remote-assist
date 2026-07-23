@@ -128,6 +128,7 @@ void Capture::ReleaseAll() {
     gdiFingerprints_.fill(0);
     hasGdiFingerprint_.fill(false);
     lastGdiFullFrameAt_ = {};
+    gdiPreviousFrame_.clear();
     gdiConsecutiveFailures_ = 0;
     lastGdiFailureLogAt_ = {};
     pointer_ = {};
@@ -150,6 +151,8 @@ void Capture::ReleaseFrame(CapturedFrame& frame) {
     frame.borrowedGdiPixels = false;
     frame.nv12Texture.Reset();
     frame.gpuNv12SubmissionUs = 0;
+    frame.hasDirtyRegions = false;
+    frame.dirtyRegions.clear();
 }
 
 bool Capture::TakePointerUpdate(PointerUpdate& out) {
@@ -339,6 +342,16 @@ void Capture::SetMaxOutputSize(int width, int height) {
     scaleMapY_.clear();
     log::Info("capture output cap set to " + std::to_string(maxOutputWidth_) + "x" +
               std::to_string(maxOutputHeight_));
+}
+
+void Capture::SetPatchCaptureEnabled(bool enabled) {
+    if (patchCaptureEnabled_ == enabled) {
+        return;
+    }
+    patchCaptureEnabled_ = enabled;
+    // 切换局部模式不能沿用 GDI 上轮的像素基线；下一帧必须先作为完整画面发送。
+    gdiPreviousFrame_.clear();
+    log::Info(std::string("capture patch regions ") + (enabled ? "enabled" : "disabled"));
 }
 
 void Capture::SetGpuOutputEnabled(bool enabled) {
@@ -807,6 +820,137 @@ bool Capture::CreateGpuNv12Frame(ID3D11Texture2D* source, int width, int height,
     return true;
 }
 
+std::vector<DirtyRegion> Capture::ReadDxgiDirtyRegions(
+    IDXGIOutputDuplication* duplication, const DXGI_OUTDUPL_FRAME_INFO& frameInfo,
+    int offsetX, int offsetY) {
+    std::vector<DirtyRegion> regions;
+    if (!duplication) {
+        return regions;
+    }
+    const auto appendRect = [&regions, offsetX, offsetY](const RECT& rect) {
+        const int width = rect.right - rect.left;
+        const int height = rect.bottom - rect.top;
+        if (width > 0 && height > 0) {
+            regions.push_back({rect.left + offsetX, rect.top + offsetY, width, height});
+        }
+    };
+    const auto readDirty = [&](UINT bytes) {
+        if (bytes == 0) {
+            return;
+        }
+        std::vector<RECT> rects(bytes / sizeof(RECT));
+        UINT written = 0;
+        if (SUCCEEDED(duplication->GetFrameDirtyRects(bytes, rects.data(), &written))) {
+            const size_t count = std::min(rects.size(), static_cast<size_t>(written / sizeof(RECT)));
+            for (size_t index = 0; index < count; ++index) {
+                appendRect(rects[index]);
+            }
+        }
+    };
+    const auto readMoves = [&](UINT bytes) {
+        if (bytes == 0) {
+            return;
+        }
+        std::vector<DXGI_OUTDUPL_MOVE_RECT> moves(bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT));
+        UINT written = 0;
+        if (SUCCEEDED(duplication->GetFrameMoveRects(bytes, moves.data(), &written))) {
+            const size_t count = std::min(moves.size(),
+                static_cast<size_t>(written / sizeof(DXGI_OUTDUPL_MOVE_RECT)));
+            for (size_t index = 0; index < count; ++index) {
+                const auto& move = moves[index];
+                appendRect(move.DestinationRect);
+                // 浏览器不实现 DXGI 的“复制旧矩形”操作，保守地把源区域也作为
+                // 变化发送，确保移动后露出的像素不会残留在客户端画布上。
+                const int width = move.DestinationRect.right - move.DestinationRect.left;
+                const int height = move.DestinationRect.bottom - move.DestinationRect.top;
+                const RECT source = {move.SourcePoint.x, move.SourcePoint.y,
+                                     move.SourcePoint.x + width, move.SourcePoint.y + height};
+                appendRect(source);
+            }
+        }
+    };
+
+    UINT dirtyBytes = 0;
+    const HRESULT dirtySizeResult = duplication->GetFrameDirtyRects(0, nullptr, &dirtyBytes);
+    if (SUCCEEDED(dirtySizeResult) || dirtySizeResult == DXGI_ERROR_MORE_DATA) {
+        readDirty(dirtyBytes);
+    }
+    UINT moveBytes = 0;
+    const HRESULT moveSizeResult = duplication->GetFrameMoveRects(0, nullptr, &moveBytes);
+    if (SUCCEEDED(moveSizeResult) || moveSizeResult == DXGI_ERROR_MORE_DATA) {
+        readMoves(moveBytes);
+    }
+    (void)frameInfo;
+    return regions;
+}
+
+void Capture::SetOutputDirtyRegions(const std::vector<DirtyRegion>& sourceRegions,
+                                    int sourceWidth, int sourceHeight, CapturedFrame& out) {
+    out.hasDirtyRegions = true;
+    out.dirtyRegions.clear();
+    if (sourceWidth <= 0 || sourceHeight <= 0 || out.width <= 0 || out.height <= 0) {
+        return;
+    }
+    for (const DirtyRegion& source : sourceRegions) {
+        const int sourceLeft = std::clamp(source.x, 0, sourceWidth);
+        const int sourceTop = std::clamp(source.y, 0, sourceHeight);
+        const int sourceRight = std::clamp(source.x + source.width, 0, sourceWidth);
+        const int sourceBottom = std::clamp(source.y + source.height, 0, sourceHeight);
+        if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) {
+            continue;
+        }
+        const int left = std::clamp(static_cast<int>(
+            static_cast<int64_t>(sourceLeft) * out.width / sourceWidth), 0, out.width);
+        const int top = std::clamp(static_cast<int>(
+            static_cast<int64_t>(sourceTop) * out.height / sourceHeight), 0, out.height);
+        const int right = std::clamp(static_cast<int>(
+            (static_cast<int64_t>(sourceRight) * out.width + sourceWidth - 1) / sourceWidth),
+            0, out.width);
+        const int bottom = std::clamp(static_cast<int>(
+            (static_cast<int64_t>(sourceBottom) * out.height + sourceHeight - 1) / sourceHeight),
+            0, out.height);
+        if (right > left && bottom > top) {
+            out.dirtyRegions.push_back({left, top, right - left, bottom - top});
+        }
+    }
+}
+
+std::vector<DirtyRegion> Capture::DiffGdiTiles(const uint8_t* pixels, int width, int height) {
+    std::vector<DirtyRegion> regions;
+    if (!pixels || width <= 0 || height <= 0) {
+        return regions;
+    }
+    const size_t stride = static_cast<size_t>(width) * 4;
+    const size_t bytes = stride * static_cast<size_t>(height);
+    if (gdiPreviousFrame_.size() != bytes) {
+        gdiPreviousFrame_.assign(pixels, pixels + bytes);
+        regions.push_back({0, 0, width, height});
+        return regions;
+    }
+    constexpr int kTileSize = 64;
+    for (int y = 0; y < height; y += kTileSize) {
+        const int tileHeight = std::min(kTileSize, height - y);
+        for (int x = 0; x < width; x += kTileSize) {
+            const int tileWidth = std::min(kTileSize, width - x);
+            bool changed = false;
+            for (int row = 0; row < tileHeight; ++row) {
+                const size_t offset = static_cast<size_t>(y + row) * stride +
+                    static_cast<size_t>(x) * 4;
+                if (std::memcmp(pixels + offset, gdiPreviousFrame_.data() + offset,
+                                static_cast<size_t>(tileWidth) * 4) != 0) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) {
+                regions.push_back({x, y, tileWidth, tileHeight});
+            }
+        }
+    }
+    std::memcpy(gdiPreviousFrame_.data(), pixels, bytes);
+    return regions;
+}
+
 CaptureResult Capture::CaptureDXGIComposite(CapturedFrame& out, DWORD waitMs) {
     if (!dxgiComposite_ || !composite_.Get() || !compositeRtv_.Get() ||
         dxgiOutputs_.empty() || !ctx_.Get() || !d3d_.Get()) {
@@ -814,6 +958,7 @@ CaptureResult Capture::CaptureDXGIComposite(CapturedFrame& out, DWORD waitMs) {
     }
 
     bool desktopChanged = false;
+    std::vector<DirtyRegion> dirtyRegions;
     for (size_t index = 0; index < dxgiOutputs_.size(); ++index) {
         auto& output = dxgiOutputs_[index];
         DXGI_OUTDUPL_FRAME_INFO frameInfo{};
@@ -838,6 +983,10 @@ CaptureResult Capture::CaptureDXGIComposite(CapturedFrame& out, DWORD waitMs) {
             output.duplication->ReleaseFrame();
             continue;
         }
+
+        const std::vector<DirtyRegion> outputDirty = ReadDxgiDirtyRegions(
+            output.duplication.Get(), frameInfo, output.x, output.y);
+        dirtyRegions.insert(dirtyRegions.end(), outputDirty.begin(), outputDirty.end());
 
         Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
         if (FAILED(resource.As(&texture))) {
@@ -901,9 +1050,11 @@ CaptureResult Capture::CaptureDXGIComposite(CapturedFrame& out, DWORD waitMs) {
                                     output.latestFrame.Get(), 0, nullptr);
     }
 
-    if (CreateGpuNv12Frame(composite_.Get(), compositeWidth_, compositeHeight_, out)) {
+    if (!patchCaptureEnabled_ &&
+        CreateGpuNv12Frame(composite_.Get(), compositeWidth_, compositeHeight_, out)) {
         width_ = out.width;
         height_ = out.height;
+        SetOutputDirtyRegions(dirtyRegions, compositeWidth_, compositeHeight_, out);
         return CaptureResult::kFrame;
     }
 
@@ -948,6 +1099,7 @@ CaptureResult Capture::CaptureDXGIComposite(CapturedFrame& out, DWORD waitMs) {
     }
     width_ = out.width;
     height_ = out.height;
+    SetOutputDirtyRegions(dirtyRegions, compositeWidth_, compositeHeight_, out);
     return CaptureResult::kFrame;
 }
 
@@ -981,6 +1133,9 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
         return CaptureResult::kPointerOnly;
     }
 
+    const std::vector<DirtyRegion> dirtyRegions =
+        ReadDxgiDirtyRegions(dup_.Get(), fi);
+
     Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
     if (FAILED(res.As(&tex))) { dup_->ReleaseFrame(); return CaptureResult::kFailed; }
 
@@ -990,10 +1145,11 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     const int h = static_cast<int>(desc.Height);
     // GPU path 在释放 Desktop Duplication 的当前帧前完成颜色转换，并把自有 NV12
     // surface 交给编码器。它避开了 staging Map、整帧 BGRA 回读和 CPU 色彩转换。
-    if (CreateGpuNv12Frame(tex.Get(), w, h, out)) {
+    if (!patchCaptureEnabled_ && CreateGpuNv12Frame(tex.Get(), w, h, out)) {
         dup_->ReleaseFrame();
         width_ = out.width;
         height_ = out.height;
+        SetOutputDirtyRegions(dirtyRegions, w, h, out);
         return CaptureResult::kFrame;
     }
     D3D11_TEXTURE2D_DESC stagingDesc{};
@@ -1034,6 +1190,7 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
         stagingMapped_ = true;
         width_ = out.width;
         height_ = out.height;
+        SetOutputDirtyRegions(dirtyRegions, w, h, out);
         return CaptureResult::kFrame;
     }
 
@@ -1042,6 +1199,7 @@ CaptureResult Capture::CaptureDXGI(CapturedFrame& out, DWORD waitMs) {
     ctx_->Unmap(staging_.Get(), 0);
     width_ = out.width;
     height_ = out.height;
+    SetOutputDirtyRegions(dirtyRegions, w, h, out);
     return CaptureResult::kFrame;
 }
 
@@ -1131,6 +1289,7 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
         dibH_ = outputHeight;
         // DIB 尺寸改变后首帧必须进入编码器，不能复用旧尺寸的采样摘要。
         hasGdiFingerprint_.fill(false);
+        gdiPreviousFrame_.clear();
     }
     if (!bits_) {
         return CaptureResult::kFailed;
@@ -1165,23 +1324,36 @@ CaptureResult Capture::CaptureGDI(CapturedFrame& out, bool forceFrame) {
 
     const auto* src = static_cast<const uint8_t*>(bits_);
     const auto now = std::chrono::steady_clock::now();
-    constexpr size_t kSampleStrideBytes = 64;
-    bool fingerprintChanged = false;
-    for (size_t phase = 0; phase < kGdiFingerprintPhaseCount; ++phase) {
-        const uint64_t fingerprint = FingerprintBgraRegion(
-            src, static_cast<size_t>(outputWidth) * 4, 0, 0, outputWidth, outputHeight,
-            phase * (kSampleStrideBytes / kGdiFingerprintPhaseCount));
-        fingerprintChanged = fingerprintChanged || !hasGdiFingerprint_[phase] ||
-            fingerprint != gdiFingerprints_[phase];
-        // 无论本次是否推帧，都更新所有相位的基线。这样真实变化只会触发一张
-        // 编码帧，后续采样不会拿着变化前的其他相位摘要再次误判为新变化。
-        gdiFingerprints_[phase] = fingerprint;
-        hasGdiFingerprint_[phase] = true;
-    }
-    const bool refreshDue = lastGdiFullFrameAt_.time_since_epoch().count() == 0 ||
-        now - lastGdiFullFrameAt_ >= std::chrono::seconds(1);
-    if (!forceFrame && !fingerprintChanged && !refreshDue) {
-        return CaptureResult::kNoChange;
+    if (patchCaptureEnabled_) {
+        out.hasDirtyRegions = true;
+        out.dirtyRegions = DiffGdiTiles(src, outputWidth, outputHeight);
+        if (!forceFrame && out.dirtyRegions.empty()) {
+            return CaptureResult::kNoChange;
+        }
+        // 强制首帧/恢复时即使像素比较为空也必须下发完整画面；交给 Agent 根据
+        // firstFrame 标志选择完整编码，因此这里标记整个输出为变化区域。
+        if (forceFrame && out.dirtyRegions.empty()) {
+            out.dirtyRegions.push_back({0, 0, outputWidth, outputHeight});
+        }
+    } else {
+        constexpr size_t kSampleStrideBytes = 64;
+        bool fingerprintChanged = false;
+        for (size_t phase = 0; phase < kGdiFingerprintPhaseCount; ++phase) {
+            const uint64_t fingerprint = FingerprintBgraRegion(
+                src, static_cast<size_t>(outputWidth) * 4, 0, 0, outputWidth, outputHeight,
+                phase * (kSampleStrideBytes / kGdiFingerprintPhaseCount));
+            fingerprintChanged = fingerprintChanged || !hasGdiFingerprint_[phase] ||
+                fingerprint != gdiFingerprints_[phase];
+            // 无论本次是否推帧，都更新所有相位的基线。这样真实变化只会触发一张
+            // 编码帧，后续采样不会拿着变化前的其他相位摘要再次误判为新变化。
+            gdiFingerprints_[phase] = fingerprint;
+            hasGdiFingerprint_[phase] = true;
+        }
+        const bool refreshDue = lastGdiFullFrameAt_.time_since_epoch().count() == 0 ||
+            now - lastGdiFullFrameAt_ >= std::chrono::seconds(1);
+        if (!forceFrame && !fingerprintChanged && !refreshDue) {
+            return CaptureResult::kNoChange;
+        }
     }
 
     // DIB 已是最终尺寸，只需一次顺序复制给编码器。相比旧路径省去完整虚拟桌面

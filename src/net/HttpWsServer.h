@@ -49,7 +49,18 @@ enum class FrameQueueResult {
     kQueued,
     kReplaced,
     kH264ResyncRequired,
+    kPatchResyncRequired,
     kStopped,
+};
+
+// 一个局部更新批次中的 JPEG 图块。坐标相对于当前 cfg 中的输出画面；同一批次
+// 必须全部绘制后才确认，不能像独立 JPEG 整帧那样任意覆盖或跳过。
+struct JpegTile {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> data;
 };
 
 // 维护当前已通过鉴权的 WebSocket 连接,供 agent 编码线程广播 JPEG 帧或文本 JSON。
@@ -77,14 +88,22 @@ public:
     bool WaitForActiveController(std::chrono::milliseconds timeout);
     // 取得编码器生成的帧所有权。JPEG 只保留最新一帧；H.264 不能跳过中间
     // 增量帧，若队列已满则清空待发送帧并要求调用方强制下一张 IDR。
-    // streamId 与配置消息对应，用于浏览器丢弃过期图像。
+    // streamId 与配置消息对应，用于浏览器丢弃过期图像。patchBaseline 表示网页已
+    // 协商图块协议时的完整画布基线，发送与确认必须独占视频窗口。
     FrameQueueResult BroadcastBinary(std::vector<uint8_t> frame, uint64_t streamId,
-                                     bool isKeyFrame, uint64_t timestampUs, bool h264);
+                                     bool isKeyFrame, uint64_t timestampUs, bool h264,
+                                     bool patchBaseline);
+    // 局部更新以一个逻辑批次进入发送队列。发送线程会连续写入 patch、tile 元数据
+    // 及对应二进制 JPEG，期间不插入 cursor 等消息，保证浏览器可顺序合成。
+    FrameQueueResult BroadcastPatch(std::vector<JpegTile> tiles, uint64_t streamId,
+                                    uint64_t timestampUs);
     // H.264 的 delta 帧不能像 JPEG 一样以最新帧覆盖。编码前等待总视频窗口有
     // 空位（已发未确认 + 待发送合计最多两帧），可以直接跳过本轮采集输入而不
     // 产生缺失的参考帧，也避免多保留一张已过时画面而拉高交互延迟。
     // 返回 false 表示等待超时或 broadcaster 正在停止。
     bool WaitForH264FrameCredit(std::chrono::milliseconds timeout);
+    // 图块依赖浏览器现有画布，必须等此前完整帧/图块批次真正被确认后才能继续。
+    bool WaitForPatchFrameCredit(std::chrono::milliseconds timeout);
     // 文本下行与视频帧共用唯一发送线程，避免慢 socket 写操作阻塞采集线程。
     // replaceable=true 用于高频 cursor 位置，只保留最新一条；配置等关键消息
     // 使用默认值，按顺序可靠发送。
@@ -94,6 +113,8 @@ public:
     // H.264 帧确认超时后，发送端会清理旧窗口并请求编码线程从新的独立 IDR 恢复。
     // 返回 true 仅一次；调用方应在同一采集线程内请求关键帧，避免跨线程触碰 MFT。
     bool ConsumeH264ResyncRequest();
+    // 图块批次确认超时或无法安全入队时要求 Agent 下发新的完整基线。
+    bool ConsumePatchResyncRequest();
     BroadcasterStats SnapshotStats() const;
     int Count();
     void Stop();
@@ -113,10 +134,15 @@ private:
     std::mutex frameMu_;
     std::condition_variable frameCv_;
     std::vector<uint8_t> pendingFrame_;
+    std::vector<JpegTile> pendingTiles_;
     uint64_t pendingStreamId_ = 0;
     uint64_t pendingTimestampUs_ = 0;
     bool pendingKeyFrame_ = true;
     bool pendingH264_ = false;
+    bool pendingPatch_ = false;
+    // 网页已声明局部协议时，完整帧不仅是普通视频帧，也是后续图块的画布基线。
+    // 它必须独占发送窗口并在超时后走图块重同步，不能按 JPEG 的普通丢帧逻辑处理。
+    bool pendingPatchBaseline_ = false;
     // 配置等关键文本消息不能被高频 cursor 覆盖；cursor 则独立合并为最新状态。
     // 发送循环在视频与 cursor 间交替，既保持指针低延迟，也不能让鼠标移动饿死视频。
     std::deque<std::string> pendingText_;
@@ -135,6 +161,8 @@ private:
         std::chrono::steady_clock::time_point sentAt{};
         std::chrono::steady_clock::time_point ackDeadline{};
         bool h264 = false;
+        bool patch = false;
+        bool patchBaseline = false;
     };
     // 两帧总窗口允许网络写入、WebCodecs 解码和下一帧传输重叠，避免每帧都完整
     // 等待一轮浏览器 ACK；待发送槽位也计入窗口，慢客户端不会额外积压一帧。
@@ -154,6 +182,7 @@ private:
     std::atomic<uint64_t> sendFailures_{0};
     std::atomic<uint64_t> h264Resyncs_{0};
     std::atomic<bool> h264ResyncRequested_{false};
+    std::atomic<bool> patchResyncRequested_{false};
     // 以下字段均由 frameMu_ 保护。每个 H.264 帧在实际 socket 写完时复制当前
     // 窗口，确保后续样本改变策略不会追溯性缩短已发帧的确认期限。
     uint32_t h264AckTimeoutWindowMs_ = kH264AckTimeoutInitialMs;

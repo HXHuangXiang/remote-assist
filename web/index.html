@@ -11,6 +11,19 @@
   <input id="pw" type="password" placeholder="访问密码" autocomplete="current-password">
   <button id="connect">连接</button>
   <select id="monitor"></select>
+  <label class="stream-setting" for="quality">画质
+    <select id="quality">
+      <option value="auto">自动</option>
+      <option value="original">原始清晰度</option>
+      <option value="1080p">固定 1080p</option>
+      <option value="720p">固定 720p</option>
+      <option value="540p">固定 540p</option>
+      <option value="360p">固定 360p</option>
+    </select>
+  </label>
+  <label class="stream-setting" for="patch-threshold">局部更新 <output id="patch-threshold-value">50%</output>
+    <input id="patch-threshold" type="range" min="10" max="90" step="5" value="50">
+  </label>
   <span id="status">未连接</span>
 </div>
 <div id="screen-wrap">

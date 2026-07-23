@@ -64,6 +64,12 @@ private:
     std::atomic<int> deskWidth_{0};
     std::atomic<int> deskHeight_{0};
     std::atomic<bool> frameResetRequested_{false};
+    // 仅由已鉴权的网页控制端设置；它们不写入 config.json。采集线程通过代次在
+    // 安全边界应用分辨率、图块能力和阈值，避免 WebSocket 工作线程直接碰编码器。
+    std::atomic<int> requestedStreamQuality_{0};
+    std::atomic<int> requestedPatchThreshold_{50};
+    std::atomic<bool> requestedPatchCapability_{false};
+    std::atomic<uint64_t> streamPreferenceGeneration_{0};
     // 锁屏/跨显卡等 GDI 路径每次都要同步读取桌面像素。输入线程记录最近合法远端
     // 操作，采集线程据此仅在交互窗口内保持较高采样率，静止时降低开销。
     std::atomic<uint64_t> lastRemoteInputTick_{0};

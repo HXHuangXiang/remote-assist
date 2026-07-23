@@ -3,11 +3,15 @@ html { font-size: clamp(16px, 1.1vw, 20px); }
 html, body { margin: 0; height: 100%; background: #111; color: #ddd; font-family: system-ui, sans-serif; overflow: hidden; }
 body { display: flex; flex-direction: column; }
 #bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 12px 16px; background: #1a1a1a; flex-shrink: 0; }
-#pw, #connect, #monitor { font: inherit; min-height: 42px; }
+#pw, #connect, #monitor, #quality, #patch-threshold { font: inherit; min-height: 42px; }
 #pw { width: clamp(210px, 18vw, 340px); padding: 8px 12px; background: #222; color: #eee; border: 1px solid #444; border-radius: 5px; }
 #connect { padding: 8px 22px; cursor: pointer; border: 1px solid #444; background: #2a5a2a; color: #eee; border-radius: 5px; }
 #connect:hover { background: #3a6a3a; }
 #monitor { padding: 8px 12px; background: #222; color: #eee; border: 1px solid #444; border-radius: 5px; max-width: 320px; }
+.stream-setting { display: inline-flex; align-items: center; gap: 7px; color: #bbb; white-space: nowrap; }
+#quality { padding: 8px 10px; background: #222; color: #eee; border: 1px solid #444; border-radius: 5px; }
+#patch-threshold { min-height: 0; width: 110px; accent-color: #4b9e4b; }
+#patch-threshold-value { color: #eee; min-width: 3.2em; text-align: right; }
 #status { font-size: 0.9rem; color: #aaa; }
 #screen-wrap { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #000; position: relative; }
 #screen-stack { position: relative; line-height: 0; }
@@ -20,4 +24,6 @@ body { display: flex; flex-direction: column; }
   #bar { gap: 8px; padding: 10px; }
   #pw { flex: 1 1 190px; }
   #monitor { flex: 1 1 210px; max-width: none; }
+  .stream-setting { flex: 1 1 210px; justify-content: space-between; }
+  #patch-threshold { width: min(50vw, 180px); }
 }

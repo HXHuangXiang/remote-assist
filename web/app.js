@@ -6,7 +6,8 @@ let ws = null, cfg = null, authed = false;
 // 上一控制端槽位，新连接会被误判为并发控制端而拒绝。
 let reconnectAfterClose = false;
 let reconnectRetriesRemaining = 0;
-let canvas, ctx, cursorCanvas, cursorCtx, logEl, statusEl, pwEl, monSel;
+let canvas, ctx, cursorCanvas, cursorCtx, logEl, statusEl, pwEl, monSel, qualitySel;
+let patchThresholdEl, patchThresholdValueEl;
 const pressedKeys = new Map();
 const pressedButtons = new Set();
 let lastPointer = { x: 0.5, y: 0.5 };
@@ -29,6 +30,9 @@ const clientStats = {
 };
 let remoteCursor = { visible:false, x:0, y:0 };
 let firstFrameWarningTimer = 0, awaitingFrameSocket = null;
+let activePatch = null, nextTileInfo = null, patchDrawing = false;
+const qualityStorageKey = 'remote-assist.stream-quality';
+const patchThresholdStorageKey = 'remote-assist.patch-threshold';
 // 鉴权成功只代表控制信道可用。必须等解码后的帧实际绘制到 canvas，才能确认视频
 // 通路正常；否则损坏的 H.264/JPEG 负载会把黑屏误报成“已连接”。
 let firstFramePresented = false;
@@ -38,6 +42,51 @@ let drawnCursorBounds = null;
 
 function log(msg) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + msg; console.log(msg); }
 function setStatus(s) { statusEl.textContent = s; }
+
+function normalizePatchThreshold(value) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 10 || number > 90 || number % 5 !== 0) return 50;
+  return number;
+}
+
+function updatePatchThresholdLabel() {
+  if (patchThresholdEl && patchThresholdValueEl) {
+    patchThresholdValueEl.textContent = normalizePatchThreshold(patchThresholdEl.value) + '%';
+  }
+}
+
+function loadStreamPreferences() {
+  if (!qualitySel || !patchThresholdEl) return;
+  try {
+    const quality = localStorage.getItem(qualityStorageKey);
+    if (quality && Array.prototype.some.call(qualitySel.options, function(option) {
+      return option.value === quality;
+    })) qualitySel.value = quality;
+    patchThresholdEl.value = String(normalizePatchThreshold(localStorage.getItem(patchThresholdStorageKey)));
+  } catch (_) {
+    patchThresholdEl.value = '50';
+  }
+  updatePatchThresholdLabel();
+}
+
+function sendStreamPreferences() {
+  if (!qualitySel || !patchThresholdEl) return;
+  const threshold = normalizePatchThreshold(patchThresholdEl.value);
+  patchThresholdEl.value = String(threshold);
+  updatePatchThresholdLabel();
+  send({t:'stream', quality:qualitySel.value || 'auto', patch_threshold:threshold, patches:true});
+}
+
+function saveAndSendStreamPreferences() {
+  if (!qualitySel || !patchThresholdEl) return;
+  const threshold = normalizePatchThreshold(patchThresholdEl.value);
+  patchThresholdEl.value = String(threshold);
+  try {
+    localStorage.setItem(qualityStorageKey, qualitySel.value || 'auto');
+    localStorage.setItem(patchThresholdStorageKey, String(threshold));
+  } catch (_) {}
+  sendStreamPreferences();
+}
 
 function clearFirstFrameWarning() {
   if (firstFrameWarningTimer) window.clearTimeout(firstFrameWarningTimer);
@@ -162,6 +211,9 @@ function handleText(m) {
     if (m.ok) {
       setStatus('已连接，等待远端首帧');
       scheduleFirstFrameWarning(ws);
+      // 只有新页面主动声明图块能力才会触发局部协议；旧缓存页面不会发送该消息，
+      // 服务端将继续使用兼容的整帧传输。
+      sendStreamPreferences();
     } else {
       clearFirstFrameWarning();
       setStatus('鉴权失败');
@@ -175,6 +227,32 @@ function handleText(m) {
   }
   if (m.t === 'cfg') { setupCfg(m); return; }
   if (m.t === 'cursor') { updateRemoteCursor(m); return; }
+  if (m.t === 'patch') {
+    const id = Number(m.id), streamId = Number(m.stream_id), count = Number(m.count);
+    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(streamId) ||
+        streamId < 0 || !Number.isSafeInteger(count) || count < 1 || count > 1024 ||
+        !cfg || streamId !== cfg.stream_id || activePatch || nextTileInfo) {
+      requestKeyFrame();
+      return;
+    }
+    activePatch = { id:id, streamId:streamId, count:count, received:0, parts:[],
+      socket:ws, receivedAt:performance.now(), generation:decodeGeneration };
+    return;
+  }
+  if (m.t === 'tile') {
+    const id = Number(m.id), index = Number(m.i), x = Number(m.x), y = Number(m.y);
+    const width = Number(m.w), height = Number(m.h);
+    if (!activePatch || activePatch.socket !== ws || id !== activePatch.id ||
+        index !== activePatch.received || nextTileInfo || !Number.isSafeInteger(x) ||
+        !Number.isSafeInteger(y) || !Number.isSafeInteger(width) ||
+        !Number.isSafeInteger(height) || width < 1 || height < 1 || x < 0 || y < 0 ||
+        !cfg || x + width > canvas.width || y + height > canvas.height) {
+      failActivePatch('invalid patch tile metadata');
+      return;
+    }
+    nextTileInfo = { x:x, y:y, width:width, height:height, patch:activePatch };
+    return;
+  }
   if (m.t === 'frame') {
     const id = Number(m.id), streamId = Number(m.stream_id), timestamp = Number(m.ts);
     if (Number.isSafeInteger(id) && id > 0 && Number.isSafeInteger(streamId) && streamId >= 0 &&
@@ -488,11 +566,92 @@ function resetFramePipeline(ackActive) {
   }
   pendingFrame = null;
   nextFrameInfo = null;
+  discardActivePatch(ackActive);
   activeFrame = null;
   imgLoading = false;
 }
 
+function discardActivePatch(ackActive) {
+  const patch = activePatch;
+  activePatch = null;
+  nextTileInfo = null;
+  patchDrawing = false;
+  if (patch && ackActive && patch.socket === ws) acknowledgeFrame(patch.id);
+}
+
+function failActivePatch(reason) {
+  const patch = activePatch;
+  if (patch && patch.socket === ws) acknowledgeFrame(patch.id);
+  activePatch = null;
+  nextTileInfo = null;
+  patchDrawing = false;
+  clientStats.dropped++;
+  if (reason) log(reason);
+  requestKeyFrame();
+}
+
+function drawActivePatch() {
+  const patch = activePatch;
+  if (!patch || patchDrawing || patch.parts.length !== patch.count) return;
+  patchDrawing = true;
+  let index = 0;
+  function drawNextTile() {
+    if (activePatch !== patch || patch.generation !== decodeGeneration || ws !== patch.socket ||
+        !cfg || cfg.stream_id !== patch.streamId) {
+      if (activePatch === patch) failActivePatch('patch invalidated before draw');
+      return;
+    }
+    if (index >= patch.parts.length) {
+      acknowledgeFrame(patch.id);
+      recordPresentedFrame({ id:patch.id, receivedAt:patch.receivedAt });
+      activePatch = null;
+      patchDrawing = false;
+      return;
+    }
+    const part = patch.parts[index++];
+    const url = URL.createObjectURL(new Blob([part.data], { type:'image/jpeg' }));
+    const image = new Image();
+    image.onload = function() {
+      URL.revokeObjectURL(url);
+      if (activePatch !== patch || patch.generation !== decodeGeneration || ws !== patch.socket) {
+        if (activePatch === patch) failActivePatch('patch draw state changed');
+        return;
+      }
+      try {
+        ctx.drawImage(image, part.x, part.y, part.width, part.height);
+      } catch (error) {
+        log('patch draw error: ' + error.message);
+        failActivePatch();
+        return;
+      }
+      drawNextTile();
+    };
+    image.onerror = function() {
+      URL.revokeObjectURL(url);
+      failActivePatch('patch JPEG decode failed');
+    };
+    image.src = url;
+  }
+  drawNextTile();
+}
+
 function handleBinary(data) {
+  if (nextTileInfo) {
+    const info = nextTileInfo;
+    nextTileInfo = null;
+    if (!activePatch || info.patch !== activePatch || activePatch.socket !== ws) {
+      failActivePatch('patch binary without active batch');
+      return;
+    }
+    activePatch.parts.push({ x:info.x, y:info.y, width:info.width, height:info.height, data:data });
+    activePatch.received++;
+    if (activePatch.received === activePatch.count) drawActivePatch();
+    return;
+  }
+  if (activePatch) {
+    failActivePatch('unexpected binary during patch batch');
+    return;
+  }
   const info = nextFrameInfo;
   nextFrameInfo = null;
   if (!cfg || !info) return;
@@ -784,9 +943,16 @@ window.addEventListener('DOMContentLoaded', function() {
   statusEl = document.getElementById('status');
   pwEl = document.getElementById('pw');
   monSel = document.getElementById('monitor');
+  qualitySel = document.getElementById('quality');
+  patchThresholdEl = document.getElementById('patch-threshold');
+  patchThresholdValueEl = document.getElementById('patch-threshold-value');
+  loadStreamPreferences();
   document.getElementById('connect').addEventListener('click', connect);
   pwEl.addEventListener('keydown', function(e) { if (e.key === 'Enter') connect(); });
   monSel.addEventListener('change', function() { send({t:'monitor', index: parseInt(monSel.value, 10)}); });
+  qualitySel.addEventListener('change', saveAndSendStreamPreferences);
+  patchThresholdEl.addEventListener('input', updatePatchThresholdLabel);
+  patchThresholdEl.addEventListener('change', saveAndSendStreamPreferences);
   window.addEventListener('resize', fitCanvas);
   window.addEventListener('keydown', function(e) {
     if (!canSendKeyboardInput()) return;

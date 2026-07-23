@@ -248,7 +248,6 @@ bool IsConfigValid(const Config& cfg) {
     return cfg.port >= kMinPort && cfg.port <= kMaxPort &&
            cfg.fps >= kMinFps && cfg.fps <= kMaxFps &&
            cfg.bitrate >= kMinBitrate && cfg.bitrate <= kMaxBitrate &&
-           IsQualityCapValid(cfg.qualityCap) &&
            (cfg.passwordIterations == 0 ||
                (cfg.passwordIterations >= kMinPasswordIterations &&
                 cfg.passwordIterations <= kMaxPasswordIterations)) &&
@@ -279,7 +278,8 @@ bool LoadExistingConfigFile(const std::wstring& path, Config& cfg) {
         cfg.passwordIterations = j.value("password_iterations", 0);
         cfg.bitrate = j.value("bitrate", cfg.bitrate);
         cfg.fps = j.value("fps", cfg.fps);
-        cfg.qualityCap = j.value("quality_cap", cfg.qualityCap);
+        // 0.1.1 及更早版本会保存 quality_cap。画质已改为控制端浏览器的会话
+        // 偏好，保留未知字段的 JSON 可直接载入，下一次保存时自然完成迁移。
         return IsConfigValid(cfg);
     } catch (...) {
         return false;
@@ -299,7 +299,6 @@ bool WriteConfigAtomically(const Config& cfg) {
     j["password_iterations"] = cfg.passwordIterations;
     j["bitrate"] = cfg.bitrate;
     j["fps"] = cfg.fps;
-    j["quality_cap"] = cfg.qualityCap;
 
     const std::wstring path = ConfigFilePath();
     if (path.empty()) {

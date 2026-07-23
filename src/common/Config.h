@@ -4,15 +4,6 @@
 
 namespace remote_assist {
 
-// 用户配置的输出质量上限。自动模式沿用当前自适应策略的最高 1080p 档；指定档位
-// 会限制自适应恢复时的最高分辨率，但网络、编码或采集过载时仍可继续向下调档。
-enum class QualityCap : int {
-    kAutomatic = 0,
-    k1080p = 1080,
-    k720p = 720,
-    k540p = 540,
-};
-
 struct Config {
     int port = 7980;
     std::string passwordHash;
@@ -21,7 +12,6 @@ struct Config {
     int passwordIterations = 0;
     int bitrate = 4'000'000;
     int fps = 30;
-    int qualityCap = static_cast<int>(QualityCap::kAutomatic);
     std::string initialPassword;
 };
 
@@ -43,16 +33,4 @@ bool VerifyPassword(const Config& cfg, const std::string& token);
 // 升级为带新 salt 的当前 PBKDF2-SHA256 参数。升级写入失败不影响本次已成功的认证，
 // 后续认证会再次尝试迁移。
 bool VerifyAndUpgradePassword(Config& cfg, const std::string& token);
-// 配置窗口与配置校验共用，避免 UI 选择项和磁盘配置允许值发生漂移。
-constexpr bool IsQualityCapValid(int qualityCap) {
-    switch (static_cast<QualityCap>(qualityCap)) {
-    case QualityCap::kAutomatic:
-    case QualityCap::k1080p:
-    case QualityCap::k720p:
-    case QualityCap::k540p:
-        return true;
-    }
-    return false;
-}
-
 }  // namespace remote_assist
