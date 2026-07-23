@@ -8,7 +8,9 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # windows-latest 会随 GitHub 镜像滚动升级，已不保证继续提供 VS2022。
+    # 本项目明确使用 Visual Studio 17 2022 生成器，因此固定到对应的 runner。
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
       - name: Configure (CMake + VS2022 x64)
