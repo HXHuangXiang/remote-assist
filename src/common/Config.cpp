@@ -2,6 +2,7 @@
 
 #include "common/Log.h"
 #include "common/Path.h"
+#include "common/StreamQuality.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -27,10 +28,6 @@ namespace {
 
 constexpr int kMinPort = 1;
 constexpr int kMaxPort = 65535;
-constexpr int kMinFps = 1;
-constexpr int kMaxFps = 60;
-constexpr int kMinBitrate = 100'000;
-constexpr int kMaxBitrate = 50'000'000;
 constexpr size_t kMaxPasswordBytes = 3072;
 constexpr int kPasswordIterations = 210'000;
 // 已发布版本曾使用低于当前推荐值的 PBKDF2 参数。读取时必须接受所有正整数
@@ -246,8 +243,7 @@ std::string GenReadablePassword() {
 
 bool IsConfigValid(const Config& cfg) {
     return cfg.port >= kMinPort && cfg.port <= kMaxPort &&
-           cfg.fps >= kMinFps && cfg.fps <= kMaxFps &&
-           cfg.bitrate >= kMinBitrate && cfg.bitrate <= kMaxBitrate &&
+           IsStreamFpsValid(cfg.fps) && IsStreamBitrateValid(cfg.bitrate) &&
            (cfg.passwordIterations == 0 ||
                (cfg.passwordIterations >= kMinPasswordIterations &&
                 cfg.passwordIterations <= kMaxPasswordIterations)) &&

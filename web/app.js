@@ -6,7 +6,7 @@ let ws = null, cfg = null, authed = false;
 // 上一控制端槽位，新连接会被误判为并发控制端而拒绝。
 let reconnectAfterClose = false;
 let reconnectRetriesRemaining = 0;
-let canvas, ctx, logEl, statusEl, pwEl, monSel, qualitySel;
+let canvas, ctx, logEl, statusEl, pwEl, monSel, qualitySel, streamFpsEl, streamBitrateEl;
 let patchThresholdEl, patchThresholdValueEl;
 const pressedKeys = new Map();
 const pressedButtons = new Set();
@@ -33,6 +33,15 @@ let firstFrameWarningTimer = 0, awaitingFrameSocket = null;
 let activePatch = null, nextTileInfo = null, patchDrawing = false;
 const qualityStorageKey = 'remote-assist.stream-quality';
 const patchThresholdStorageKey = 'remote-assist.patch-threshold';
+const streamFpsStorageKey = 'remote-assist.stream-fps';
+const streamBitrateStorageKey = 'remote-assist.stream-bitrate-mbs';
+const defaultStreamFps = 30;
+const defaultStreamBitrateMbs = 0.5;
+const minStreamFps = 1;
+const maxStreamFps = 60;
+const minStreamBitrateMbs = 0.1;
+const maxStreamBitrateMbs = 6.25;
+const streamBitrateStepMbs = 0.05;
 // 鉴权成功只代表控制信道可用。必须等解码后的帧实际绘制到 canvas，才能确认视频
 // 通路正常；否则损坏的 H.264/JPEG 负载会把黑屏误报成“已连接”。
 let firstFramePresented = false;
@@ -56,35 +65,77 @@ function updatePatchThresholdLabel() {
   }
 }
 
+function normalizeStreamFps(value) {
+  if (value === null || value === '') return defaultStreamFps;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return defaultStreamFps;
+  return Math.max(minStreamFps, Math.min(maxStreamFps, Math.round(number)));
+}
+
+function normalizeStreamBitrateMbs(value) {
+  if (value === null || value === '') return defaultStreamBitrateMbs;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return defaultStreamBitrateMbs;
+  const bounded = Math.max(minStreamBitrateMbs, Math.min(maxStreamBitrateMbs, number));
+  // 输入框允许任意十进制文本；发送前收敛到 0.05 MB/s 网格，确保本地显示、
+  // localStorage 与 Agent 收到的 bit/s 值完全一致。
+  return Math.round(bounded / streamBitrateStepMbs) * streamBitrateStepMbs;
+}
+
+function formatStreamBitrateMbs(value) {
+  return String(Number(normalizeStreamBitrateMbs(value).toFixed(2)));
+}
+
+function streamBitrateBps(value) {
+  // 页面按十进制 MB/s 显示，协议使用整数 bit/s，避免跨语言传输浮点码率。
+  return Math.round(normalizeStreamBitrateMbs(value) * 8 * 1000 * 1000);
+}
+
 function loadStreamPreferences() {
-  if (!qualitySel || !patchThresholdEl) return;
+  if (!qualitySel || !patchThresholdEl || !streamFpsEl || !streamBitrateEl) return;
   try {
     const quality = localStorage.getItem(qualityStorageKey);
     if (quality && Array.prototype.some.call(qualitySel.options, function(option) {
       return option.value === quality;
     })) qualitySel.value = quality;
     patchThresholdEl.value = String(normalizePatchThreshold(localStorage.getItem(patchThresholdStorageKey)));
+    streamFpsEl.value = String(normalizeStreamFps(localStorage.getItem(streamFpsStorageKey)));
+    streamBitrateEl.value = formatStreamBitrateMbs(
+      localStorage.getItem(streamBitrateStorageKey));
   } catch (_) {
     patchThresholdEl.value = '50';
+    streamFpsEl.value = String(defaultStreamFps);
+    streamBitrateEl.value = formatStreamBitrateMbs(defaultStreamBitrateMbs);
   }
   updatePatchThresholdLabel();
 }
 
 function sendStreamPreferences() {
-  if (!qualitySel || !patchThresholdEl) return;
+  if (!qualitySel || !patchThresholdEl || !streamFpsEl || !streamBitrateEl) return;
   const threshold = normalizePatchThreshold(patchThresholdEl.value);
+  const fps = normalizeStreamFps(streamFpsEl.value);
+  const bitrateMbs = normalizeStreamBitrateMbs(streamBitrateEl.value);
   patchThresholdEl.value = String(threshold);
+  streamFpsEl.value = String(fps);
+  streamBitrateEl.value = formatStreamBitrateMbs(bitrateMbs);
   updatePatchThresholdLabel();
-  send({t:'stream', quality:qualitySel.value || 'auto', patch_threshold:threshold, patches:true});
+  send({t:'stream', quality:qualitySel.value || 'auto', patch_threshold:threshold, patches:true,
+    fps:fps, bitrate:streamBitrateBps(bitrateMbs)});
 }
 
 function saveAndSendStreamPreferences() {
-  if (!qualitySel || !patchThresholdEl) return;
+  if (!qualitySel || !patchThresholdEl || !streamFpsEl || !streamBitrateEl) return;
   const threshold = normalizePatchThreshold(patchThresholdEl.value);
+  const fps = normalizeStreamFps(streamFpsEl.value);
+  const bitrateMbs = normalizeStreamBitrateMbs(streamBitrateEl.value);
   patchThresholdEl.value = String(threshold);
+  streamFpsEl.value = String(fps);
+  streamBitrateEl.value = formatStreamBitrateMbs(bitrateMbs);
   try {
     localStorage.setItem(qualityStorageKey, qualitySel.value || 'auto');
     localStorage.setItem(patchThresholdStorageKey, String(threshold));
+    localStorage.setItem(streamFpsStorageKey, String(fps));
+    localStorage.setItem(streamBitrateStorageKey, formatStreamBitrateMbs(bitrateMbs));
   } catch (_) {}
   sendStreamPreferences();
 }
@@ -312,8 +363,12 @@ function setupCfg(c) {
   applyRemoteCursorStyle();
   if (c.monitors) populateMonitors(c.monitors, c.selected_monitor);
   if (videoConfigChanged && isH264Codec()) setupH264Decoder(c);
+  const bitrate = Number(c.bitrate);
+  const bitrateText = Number.isSafeInteger(bitrate) && bitrate > 0
+    ? ' ' + String(Number((bitrate / (8 * 1000 * 1000)).toFixed(2))) + ' MB/s'
+    : '';
   log('cfg ' + c.codec + ' ' + c.w + 'x' + c.h + '@' + c.fps +
-    (videoConfigChanged ? ' video-reset' : ' topology-only'));
+    ' FPS' + bitrateText + (videoConfigChanged ? ' video-reset' : ' topology-only'));
 }
 
 function updateRemoteCursor(m) {
@@ -900,6 +955,8 @@ window.addEventListener('DOMContentLoaded', function() {
   pwEl = document.getElementById('pw');
   monSel = document.getElementById('monitor');
   qualitySel = document.getElementById('quality');
+  streamFpsEl = document.getElementById('stream-fps');
+  streamBitrateEl = document.getElementById('stream-bitrate');
   patchThresholdEl = document.getElementById('patch-threshold');
   patchThresholdValueEl = document.getElementById('patch-threshold-value');
   loadStreamPreferences();
@@ -907,6 +964,8 @@ window.addEventListener('DOMContentLoaded', function() {
   pwEl.addEventListener('keydown', function(e) { if (e.key === 'Enter') connect(); });
   monSel.addEventListener('change', function() { send({t:'monitor', index: parseInt(monSel.value, 10)}); });
   qualitySel.addEventListener('change', saveAndSendStreamPreferences);
+  streamFpsEl.addEventListener('change', saveAndSendStreamPreferences);
+  streamBitrateEl.addEventListener('change', saveAndSendStreamPreferences);
   patchThresholdEl.addEventListener('input', updatePatchThresholdLabel);
   patchThresholdEl.addEventListener('change', saveAndSendStreamPreferences);
   window.addEventListener('resize', fitCanvas);

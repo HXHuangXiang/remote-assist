@@ -21,6 +21,23 @@
       <option value="360p">固定 360p</option>
     </select>
   </label>
+  <label class="stream-setting" for="stream-fps">帧率
+    <input id="stream-fps" type="number" min="1" max="60" step="1" value="30" list="stream-fps-presets" inputmode="numeric">
+    <span>FPS</span>
+  </label>
+  <datalist id="stream-fps-presets">
+    <option value="5"></option><option value="10"></option><option value="15"></option>
+    <option value="20"></option><option value="24"></option><option value="30"></option>
+    <option value="45"></option><option value="60"></option>
+  </datalist>
+  <label class="stream-setting" for="stream-bitrate">码率
+    <input id="stream-bitrate" type="number" min="0.1" max="6.25" step="0.05" value="0.5" list="stream-bitrate-presets" inputmode="decimal">
+    <span>MB/s</span>
+  </label>
+  <datalist id="stream-bitrate-presets">
+    <option value="0.25"></option><option value="0.5"></option><option value="1"></option>
+    <option value="2"></option><option value="4"></option><option value="6.25"></option>
+  </datalist>
   <label class="stream-setting" for="patch-threshold">局部更新 <output id="patch-threshold-value">50%</output>
     <input id="patch-threshold" type="range" min="10" max="90" step="5" value="50">
   </label>

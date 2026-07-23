@@ -515,6 +515,7 @@ int Agent::Run(bool serviceManaged) {
     log::Info("agent config port=" + std::to_string(cfg_.port) +
               " fps=" + std::to_string(cfg_.fps));
     streamFps_.store(cfg_.fps);
+    streamBitrate_.store(cfg_.bitrate);
 
     // 显示器清单在启动网络服务前完成,后续仅由采集线程读取。
     capture_.EnumMonitors();
@@ -645,6 +646,9 @@ void Agent::CaptureLoop() {
     BroadcasterStats adaptationStatsBase = broadcasterStatsBase;
     int adaptiveFps = cfg_.fps;
     int adaptiveBitrate = cfg_.bitrate;
+    // 新版网页成对声明 fps/bitrate 时固定传输参数；旧缓存页面不带这两个字段，
+    // 继续使用已有的 ACK/编码负载自适应策略。
+    bool fixedStreamRates = false;
     bool adaptiveBitrateAvailable = true;
     int pendingEncoderBitrateRebuild = 0;
     auto nextEncoderBitrateRebuildAt = nextDesktopCheck;
@@ -661,7 +665,7 @@ void Agent::CaptureLoop() {
                               kStreamResolutionCaps[adaptiveResolutionTier].height);
     int congestionWindows = 0;
     int healthyResolutionWindows = 0;
-    const int maximumGdiInteractiveFpsCap = std::max(kGdiInteractiveFpsMinimumCap,
+    int maximumGdiInteractiveFpsCap = std::max(kGdiInteractiveFpsMinimumCap,
         std::min(kGdiInteractiveFpsMaximumCap, cfg_.fps));
     int gdiInteractiveFpsCap = std::min(kGdiInteractiveFpsInitialCap,
                                         maximumGdiInteractiveFpsCap);
@@ -704,6 +708,22 @@ void Agent::CaptureLoop() {
         if (wasReady) {
             log::Info(std::string("capture pipeline reset: ") + reason);
         }
+    };
+
+    // 帧率变化会修改 H.264 MFT 的输入媒体类型，不能继续复用旧 MFT。码率动态更新
+    // 不被个别硬件 MFT 支持时也走同一条安全重建路径；下一轮会强制抓取完整基线、
+    // 递增 stream_id 并用独立 IDR 重新协商。
+    auto resetEncoderForStreamRateChange = [&](const char* reason) {
+        resetFramePipelineReady(reason);
+        capture_.SetGpuOutputEnabled(false);
+        if (encoder_) {
+            encoder_->Release();
+            encoder_.reset();
+        }
+        encoderReady_ = false;
+        encoderDeviceGeneration = 0;
+        firstFrame_ = true;
+        streamKeyFrameRequired_ = true;
     };
 
     auto effectiveFpsFor = [&](int requestedFps) {
@@ -766,13 +786,79 @@ void Agent::CaptureLoop() {
         }
         const bool nextPatchCapability =
             requestedPatchCapability_.load(std::memory_order_relaxed);
+        bool nextFixedStreamRates =
+            requestedFixedStreamRates_.load(std::memory_order_relaxed);
+        int nextStreamFps = cfg_.fps;
+        int nextStreamBitrate = cfg_.bitrate;
+        if (nextFixedStreamRates) {
+            nextStreamFps = requestedStreamFps_.load(std::memory_order_relaxed);
+            nextStreamBitrate = requestedStreamBitrate_.load(std::memory_order_relaxed);
+            // OnMessage 已严格校验；这里仍做一次防御性校验，避免未来调用方绕过
+            // WebSocket 边界时把无效参数带进采集线程。
+            if (!IsStreamFpsValid(nextStreamFps) ||
+                !IsStreamBitrateValid(nextStreamBitrate)) {
+                nextFixedStreamRates = false;
+                nextStreamFps = cfg_.fps;
+                nextStreamBitrate = cfg_.bitrate;
+            }
+        }
         const bool qualityChanged = nextQuality != activeQuality;
         const bool patchCapabilityChanged = nextPatchCapability != patchCapability;
+        const bool rateModeChanged = nextFixedStreamRates != fixedStreamRates;
+        const bool rateChanged = rateModeChanged ||
+            (nextFixedStreamRates &&
+             (nextStreamFps != adaptiveFps || nextStreamBitrate != adaptiveBitrate));
         activeQuality = nextQuality;
         patchThreshold = nextThreshold;
         patchCapability = nextPatchCapability;
         capture_.SetPatchCaptureEnabled(patchCapability);
+
+        bool rateChangeNeedsEncoderRebuild = false;
+        bool broadcastRateCfg = false;
+        if (rateChanged) {
+            const bool fpsChanged = nextStreamFps != adaptiveFps;
+            const bool bitrateChanged = nextStreamBitrate != adaptiveBitrate;
+            fixedStreamRates = nextFixedStreamRates;
+            adaptiveFps = nextStreamFps;
+            adaptiveBitrate = nextStreamBitrate;
+            streamFps_.store(adaptiveFps);
+            streamBitrate_.store(adaptiveBitrate);
+            maximumGdiInteractiveFpsCap = std::max(kGdiInteractiveFpsMinimumCap,
+                std::min(kGdiInteractiveFpsMaximumCap, adaptiveFps));
+            gdiInteractiveFpsCap = std::min(gdiInteractiveFpsCap,
+                                             maximumGdiInteractiveFpsCap);
+            pendingEncoderBitrateRebuild = 0;
+
+            if (fpsChanged) {
+                adaptiveBitrateAvailable = true;
+                resetEncoderForStreamRateChange("web stream fps changed");
+                rateChangeNeedsEncoderRebuild = true;
+            } else if (bitrateChanged && encoder_ && encoder_->IsH264()) {
+                if (!encoder_->UpdateBitrate(adaptiveBitrate)) {
+                    adaptiveBitrateAvailable = false;
+                    resetEncoderForStreamRateChange("web stream bitrate changed");
+                    rateChangeNeedsEncoderRebuild = true;
+                    log::Info("H.264 MFT does not support requested runtime bitrate; "
+                              "reinitializing encoder");
+                } else {
+                    adaptiveBitrateAvailable = true;
+                }
+            } else {
+                // JPEG 回退或尚未拿到首帧时没有可运行期更新的 H.264 MFT；把目标
+                // 保留到下一次 Init 即可，且无需制造一次无意义的流重协商。
+                adaptiveBitrateAvailable = true;
+            }
+            broadcastRateCfg = !rateChangeNeedsEncoderRebuild;
+            log::Info(std::string(nextFixedStreamRates ? "web fixed stream rates fps=" :
+                                                   "web restored adaptive stream caps fps=") +
+                      std::to_string(adaptiveFps) + " bitrate=" +
+                      std::to_string(adaptiveBitrate));
+        }
+
         if (!qualityChanged && !patchCapabilityChanged) {
+            if (broadcastRateCfg) {
+                server_.Broadcaster().BroadcastText(MakeCfgJson());
+            }
             return;
         }
 
@@ -791,8 +877,10 @@ void Agent::CaptureLoop() {
         resetFramePipelineReady("web stream preference changed");
         // 即便新旧输出分辨率恰好相同，也要让浏览器丢弃旧异步解码/图块任务；随后
         // 的首帧会请求独立 IDR，保证网页画布拥有可供局部更新的完整基线。
-        streamId_.fetch_add(1);
-        server_.Broadcaster().BroadcastText(MakeCfgJson());
+        if (!rateChangeNeedsEncoderRebuild) {
+            streamId_.fetch_add(1);
+            server_.Broadcaster().BroadcastText(MakeCfgJson());
+        }
         log::Info(std::string("web stream preference quality=") +
                   StreamQualityName(activeQuality) + " patch=" +
                   (patchCapability ? "true" : "false") + " threshold=" +
@@ -806,6 +894,7 @@ void Agent::CaptureLoop() {
         // 下面现有逻辑会选择运行期更新或安全地重新初始化编码器。
         pendingEncoderBitrateRebuild = 0;
         if (adaptiveBitrate == cfg_.bitrate) {
+            streamBitrate_.store(adaptiveBitrate);
             return;
         }
         const int previousBitrate = adaptiveBitrate;
@@ -819,6 +908,7 @@ void Agent::CaptureLoop() {
             }
         }
         adaptiveBitrate = cfg_.bitrate;
+        streamBitrate_.store(adaptiveBitrate);
         if (reinitializeEncoder) {
             encoder_->Release();
             encoder_.reset();
@@ -830,10 +920,15 @@ void Agent::CaptureLoop() {
     };
 
     auto restoreQualityForNextController = [&] {
+        fixedStreamRates = false;
         if (adaptiveFps != cfg_.fps) {
             adaptiveFps = cfg_.fps;
             streamFps_.store(adaptiveFps);
         }
+        maximumGdiInteractiveFpsCap = std::max(kGdiInteractiveFpsMinimumCap,
+            std::min(kGdiInteractiveFpsMaximumCap, adaptiveFps));
+        gdiInteractiveFpsCap = std::min(gdiInteractiveFpsCap,
+                                         maximumGdiInteractiveFpsCap);
         restoreBitrateForNextController();
         if (!resolutionLocked && adaptiveResolutionTier != maximumQualityResolutionTier) {
             setResolutionTier(maximumQualityResolutionTier);
@@ -1015,6 +1110,8 @@ void Agent::CaptureLoop() {
                       " client_ws_buffered_max=" + std::to_string(clientMaxWsBuffered) +
                       " stream_fps=" + std::to_string(adaptiveFps) +
                       " stream_bitrate=" + std::to_string(adaptiveBitrate) +
+                      " stream_rate_mode=" +
+                      (fixedStreamRates ? "fixed" : "adaptive") +
                       " stream_cap=" +
                       std::to_string(kStreamResolutionCaps[adaptiveResolutionTier].width) + "x" +
                       std::to_string(kStreamResolutionCaps[adaptiveResolutionTier].height) +
@@ -1027,8 +1124,9 @@ void Agent::CaptureLoop() {
     };
 
     // 发送队列只能安全保留很少的 H.264 增量帧；一旦浏览器绘制确认或本机编码
-    // 追不上，继续以固定 FPS 编码只会反复触发 IDR 重同步。依据一秒窗口的网络
-    // 和真实编码耗时快速降帧，网络/CPU 恢复后再平滑回升到用户配置上限。
+    // 追不上，继续以固定 FPS 编码只会反复触发 IDR 重同步。旧页面依据一秒窗口的
+    // 网络和真实编码耗时自动调节帧率/码率；新版网页明确固定参数时仅保留分辨率和
+    // GDI/JPEG 的必要安全限制，不再改写其选择。
     auto adaptFrameRateIfDue = [&](std::chrono::steady_clock::time_point now) {
         if (now < nextAdaptation) {
             return;
@@ -1111,22 +1209,24 @@ void Agent::CaptureLoop() {
         int nextBitrate = adaptiveBitrate;
         const int minimumBitrate = std::min(cfg_.bitrate,
             std::max(100'000, cfg_.bitrate / 8));
-        if (congested) {
-            // 乘法退避能在高延迟 Wi-Fi 下更快逃离“P 帧挤压 -> IDR”的循环。
-            const int encoderLimitedFps = encoderOverloaded
-                ? std::max(5, currentEffectiveFps * 3 / 4)
-                : adaptiveFps;
-            const int captureLimitedFps = gdiCaptureOverloaded
-                ? std::max(5, currentEffectiveFps * 3 / 4)
-                : adaptiveFps;
-            nextFps = std::max(5, std::min({adaptiveFps * 3 / 4,
-                                             encoderLimitedFps, captureLimitedFps}));
-            nextBitrate = std::max(minimumBitrate, adaptiveBitrate * 3 / 4);
-        } else if (healthy) {
-            // 恢复阶段使用小步上调，避免刚恢复就再次压垮解码/网络窗口。
-            nextFps = std::min(cfg_.fps, adaptiveFps + 2);
-            nextBitrate = std::min(cfg_.bitrate,
-                adaptiveBitrate + std::max(100'000, cfg_.bitrate / 20));
+        if (!fixedStreamRates) {
+            if (congested) {
+                // 乘法退避能在高延迟 Wi-Fi 下更快逃离“P 帧挤压 -> IDR”的循环。
+                const int encoderLimitedFps = encoderOverloaded
+                    ? std::max(5, currentEffectiveFps * 3 / 4)
+                    : adaptiveFps;
+                const int captureLimitedFps = gdiCaptureOverloaded
+                    ? std::max(5, currentEffectiveFps * 3 / 4)
+                    : adaptiveFps;
+                nextFps = std::max(5, std::min({adaptiveFps * 3 / 4,
+                                                 encoderLimitedFps, captureLimitedFps}));
+                nextBitrate = std::max(minimumBitrate, adaptiveBitrate * 3 / 4);
+            } else if (healthy) {
+                // 恢复阶段使用小步上调，避免刚恢复就再次压垮解码/网络窗口。
+                nextFps = std::min(cfg_.fps, adaptiveFps + 2);
+                nextBitrate = std::min(cfg_.bitrate,
+                    adaptiveBitrate + std::max(100'000, cfg_.bitrate / 20));
+            }
         }
 
         if (congested) {
@@ -1153,7 +1253,7 @@ void Agent::CaptureLoop() {
             healthyResolutionWindows = 0;
         }
 
-        if (nextFps != adaptiveFps) {
+        if (!fixedStreamRates && nextFps != adaptiveFps) {
             log::Info("adaptive stream fps " + std::to_string(adaptiveFps) + " -> " +
                       std::to_string(nextFps) + " ack_avg_ms=" +
                       std::to_string(averageAckMs) + " ack_timeout=" +
@@ -1169,10 +1269,11 @@ void Agent::CaptureLoop() {
             adaptiveFps = nextFps;
             streamFps_.store(adaptiveFps);
         }
-        if (nextBitrate != adaptiveBitrate && encoder_ && encoder_->IsH264()) {
+        if (!fixedStreamRates && nextBitrate != adaptiveBitrate && encoder_ && encoder_->IsH264()) {
             if (adaptiveBitrateAvailable) {
                 if (encoder_->UpdateBitrate(nextBitrate)) {
                     adaptiveBitrate = nextBitrate;
+                    streamBitrate_.store(adaptiveBitrate);
                 } else {
                     // 部分 MFT 只能在 SetOutputType 前写入码率。仅降 FPS 会让弱网
                     // 下的单帧体积长期停留在高档位，因此记录目标码率，稍后以受控
@@ -1194,7 +1295,7 @@ void Agent::CaptureLoop() {
                 pendingEncoderBitrateRebuild = 0;
             }
         }
-        if (pendingEncoderBitrateRebuild > 0 &&
+        if (!fixedStreamRates && pendingEncoderBitrateRebuild > 0 &&
             now >= nextEncoderBitrateRebuildAt && encoder_ && encoder_->IsH264()) {
             const int targetBitrate = pendingEncoderBitrateRebuild;
             pendingEncoderBitrateRebuild = 0;
@@ -1212,6 +1313,7 @@ void Agent::CaptureLoop() {
                 streamKeyFrameRequired_ = true;
                 encoderDeviceGeneration = 0;
                 adaptiveBitrate = targetBitrate;
+                streamBitrate_.store(adaptiveBitrate);
                 adaptiveBitrateAvailable = true;
                 nextEncoderBitrateRebuildAt = now + kH264BitrateRebuildInterval;
                 log::Info("reinitializing H.264 encoder for bitrate " +
@@ -1231,8 +1333,13 @@ void Agent::CaptureLoop() {
     while (!stop_.load()) {
         const auto t0 = std::chrono::steady_clock::now();
         logMetricsIfDue(t0);
-        adaptFrameRateIfDue(t0);
+        // 断线后可能在下一轮立刻有新网页完成鉴权。先恢复上一个控制端留下的
+        // 自适应状态，再应用新网页的固定偏好，不能反过来覆盖新设置。
+        if (qualityResetRequested_.exchange(false)) {
+            restoreQualityForNextController();
+        }
         applyStreamPreferences();
+        adaptFrameRateIfDue(t0);
 
         // JPEG 回退需要 CPU 全帧压缩，大屏时保守限帧；H.264 模式的压缩由 MFT
         // 承担，不应仅因分辨率达到 1080p 就被无条件锁在 15 FPS，否则既浪费
@@ -1349,11 +1456,6 @@ void Agent::CaptureLoop() {
             continue;
         }
 
-        // 控制端可能在 CaptureLoop 看到“零客户端”前就快速重连；断连回调仍会请求
-        // 在采集线程安全地恢复上一位控制者留下的自适应质量状态。
-        if (qualityResetRequested_.exchange(false)) {
-            restoreQualityForNextController();
-        }
         if (frameResetRequested_.exchange(false)) {
             firstFrame_ = true;
             streamKeyFrameRequired_ = true;
@@ -1580,7 +1682,7 @@ void Agent::CaptureLoop() {
             encoderReady_ = false;
             capture_.SetGpuOutputEnabled(false);
             encoder_ = std::make_unique<EncoderMf>();
-            if (!encoder_->Init(frame.width, frame.height, cfg_.fps, adaptiveBitrate,
+            if (!encoder_->Init(frame.width, frame.height, adaptiveFps, adaptiveBitrate,
                                 capture_.D3DDevice())) {
                 log::Error("encoder init failed for " + std::to_string(frame.width) +
                            "x" + std::to_string(frame.height));
@@ -1805,6 +1907,7 @@ std::string Agent::MakeCfgJson() const {
     j["w"] = deskWidth_.load();
     j["h"] = deskHeight_.load();
     j["fps"] = streamFps_.load();
+    j["bitrate"] = streamBitrate_.load();
     j["stream_id"] = streamId_.load();
     int qualityValue = requestedStreamQuality_.load(std::memory_order_relaxed);
     if (!IsStreamQualityValid(qualityValue)) {
@@ -1889,6 +1992,8 @@ void Agent::OnMessage(const std::string& msg) {
         std::string qualityText;
         int threshold = 0;
         bool patches = false;
+        int fps = 0;
+        int bitrate = 0;
         StreamQuality quality = StreamQuality::kAutomatic;
         if (!ReadJsonString(j, "quality", qualityText) ||
             !ParseStreamQuality(qualityText, quality) ||
@@ -1897,9 +2002,22 @@ void Agent::OnMessage(const std::string& msg) {
             !IsPatchThresholdValid(threshold) || !ReadJsonBool(j, "patches", patches)) {
             return;
         }
+        const bool hasFps = j.contains("fps");
+        const bool hasBitrate = j.contains("bitrate");
+        // 两个字段必须成对提供。旧缓存网页不会携带它们，继续使用原有的自适应
+        // 逻辑；半个固定设置可能让编码器只更新一个维度，直接拒绝。
+        if (hasFps != hasBitrate ||
+            (hasFps && (!ReadJsonIntInRange(j, "fps", kMinStreamFps, kMaxStreamFps, fps) ||
+                        !ReadJsonIntInRange(j, "bitrate", kMinStreamBitrate,
+                                            kMaxStreamBitrate, bitrate)))) {
+            return;
+        }
         requestedStreamQuality_.store(static_cast<int>(quality), std::memory_order_relaxed);
         requestedPatchThreshold_.store(threshold, std::memory_order_relaxed);
         requestedPatchCapability_.store(patches, std::memory_order_relaxed);
+        requestedFixedStreamRates_.store(hasFps, std::memory_order_relaxed);
+        requestedStreamFps_.store(hasFps ? fps : 0, std::memory_order_relaxed);
+        requestedStreamBitrate_.store(hasFps ? bitrate : 0, std::memory_order_relaxed);
         streamPreferenceGeneration_.fetch_add(1, std::memory_order_release);
         WakeGdiCaptureLoop(true);
         return;
@@ -2063,6 +2181,9 @@ void Agent::OnControllerDisconnected() {
                                   std::memory_order_relaxed);
     requestedPatchThreshold_.store(kDefaultPatchThresholdPercent, std::memory_order_relaxed);
     requestedPatchCapability_.store(false, std::memory_order_relaxed);
+    requestedFixedStreamRates_.store(false, std::memory_order_relaxed);
+    requestedStreamFps_.store(0, std::memory_order_relaxed);
+    requestedStreamBitrate_.store(0, std::memory_order_relaxed);
     streamPreferenceGeneration_.fetch_add(1, std::memory_order_release);
 }
 

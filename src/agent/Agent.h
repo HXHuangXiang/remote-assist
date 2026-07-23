@@ -65,10 +65,16 @@ private:
     std::atomic<int> deskHeight_{0};
     std::atomic<bool> frameResetRequested_{false};
     // 仅由已鉴权的网页控制端设置；它们不写入 config.json。采集线程通过代次在
-    // 安全边界应用分辨率、图块能力和阈值，避免 WebSocket 工作线程直接碰编码器。
+    // 安全边界应用分辨率、图块能力、阈值和固定传输参数，避免 WebSocket 工作线程
+    // 直接碰编码器。
     std::atomic<int> requestedStreamQuality_{0};
     std::atomic<int> requestedPatchThreshold_{50};
     std::atomic<bool> requestedPatchCapability_{false};
+    // 旧缓存页面未携带 fps/bitrate 时保持 false，继续沿用服务端自适应策略；新版
+    // 页面必须成对给出两个值，固定当前控制端的帧率和码率。
+    std::atomic<bool> requestedFixedStreamRates_{false};
+    std::atomic<int> requestedStreamFps_{0};
+    std::atomic<int> requestedStreamBitrate_{0};
     std::atomic<uint64_t> streamPreferenceGeneration_{0};
     // 锁屏/跨显卡等 GDI 路径每次都要同步读取桌面像素。输入线程记录最近合法远端
     // 操作，采集线程据此仅在交互窗口内保持较高采样率，静止时降低开销。
@@ -91,9 +97,10 @@ private:
     std::atomic<bool> streamH264_{false};
     // 从 SPS 提取的 avc1.PPCCLL，供 WebSocket 线程安全生成浏览器解码配置。
     std::atomic<uint32_t> streamH264Profile_{0x42E01E};
-    // cfg_.fps 是用户配置的上限。采集线程按浏览器 ACK 与 H.264 重同步状态动态下调，
-    // 防止慢链路堆满两帧窗口后反复丢弃增量帧。
+    // cfg 消息可从 WebSocket 线程生成，因此把采集线程实际采用的传输参数保存为原子
+    // 快照。固定网页设置时 fps/bitrate 为所选值；旧页面继续由自适应逻辑下调。
     std::atomic<int> streamFps_{30};
+    std::atomic<int> streamBitrate_{4'000'000};
     // 浏览器每 5 秒上报一次呈现侧增量指标；CaptureLoop 用 exchange 取走并写入同一
     // 条 stream metrics，便于区分“编码慢”和“浏览器解码/绘制慢”。
     std::atomic<uint64_t> clientDrawnFrames_{0};

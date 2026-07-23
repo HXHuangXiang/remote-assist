@@ -35,6 +35,12 @@ enum class StreamQuality : int {
 constexpr int kDefaultPatchThresholdPercent = 50;
 constexpr int kMinPatchThresholdPercent = 10;
 constexpr int kMaxPatchThresholdPercent = 90;
+// 网页控制端可以在固定模式下选择的帧率与码率范围。码率统一使用 bit/s，网页负责
+// 将显示的 MB/s 转换后再传输，避免协议端出现浮点误差。
+constexpr int kMinStreamFps = 1;
+constexpr int kMaxStreamFps = 60;
+constexpr int kMinStreamBitrate = 100'000;
+constexpr int kMaxStreamBitrate = 50'000'000;
 
 constexpr bool IsStreamQualityValid(int quality) {
     return quality >= static_cast<int>(StreamQuality::kAutomatic) &&
@@ -44,6 +50,14 @@ constexpr bool IsStreamQualityValid(int quality) {
 constexpr bool IsPatchThresholdValid(int percent) {
     return percent >= kMinPatchThresholdPercent &&
         percent <= kMaxPatchThresholdPercent && percent % 5 == 0;
+}
+
+constexpr bool IsStreamFpsValid(int fps) {
+    return fps >= kMinStreamFps && fps <= kMaxStreamFps;
+}
+
+constexpr bool IsStreamBitrateValid(int bitrate) {
+    return bitrate >= kMinStreamBitrate && bitrate <= kMaxStreamBitrate;
 }
 
 constexpr bool IsFixedStreamQuality(StreamQuality quality) {
